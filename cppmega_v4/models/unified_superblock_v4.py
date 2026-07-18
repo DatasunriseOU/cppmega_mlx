@@ -723,6 +723,22 @@ class _BuiltBlock:
 _DOC_ID_KW_KINDS = {"gdn", "kda"}     # accept doc_ids via *kwargs
 _TOKEN_ID_POS_KINDS = {"engram"}      # take token_ids positional
 
+# Most V4 bricks return only their contribution and are wrapped by the
+# superblock residual add. These bricks already own that residual internally;
+# adding their output again would turn an identity-at-init block into ``2*x``.
+_FULL_RESIDUAL_OUTPUT_KINDS = frozenset({
+    "attention",
+    "mlp",
+    "mla",
+    "mla_absorb",
+    "abs_pos_embed",
+    "per_layer_embed",
+    "embedding_table",
+    "rmsnorm",
+    "layernorm",
+    "residual",
+})
+
 
 def _build_one(spec: BlockSpec, hidden_size: int) -> _BuiltBlock:
     builder = BLOCK_BUILDERS.get(spec.kind)
@@ -827,7 +843,10 @@ class UnifiedSuperblockV4(nn.Module):
                 delta = b.module(h, doc_ids=document_ids)
             else:
                 delta = b.module(h)
-            h = h + delta
+            if b.kind in _FULL_RESIDUAL_OUTPUT_KINDS:
+                h = delta
+            else:
+                h = h + delta
         return h
 
     def kinds(self) -> list[str]:

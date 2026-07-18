@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, MutableMapping, Sequence
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict
-import io
 import json
 import math
 import os
@@ -87,10 +86,8 @@ from cppmega_mlx.runtime.path_c_fusion_schedules import (  # noqa: E402
     DESCRIPTOR_ROW_DISPATCH_LAUNCHER_CHUNKS,
     DESCRIPTOR_ROWS_PER_KERNEL_LAUNCH,
     PATH_C_DESCRIPTOR_SCHEDULE_GENERATOR,
-    make_path_c_descriptor_schedule_template,
     make_path_c_descriptor_stage_schedule_template,
     merge_path_c_physical_abi_for_prim_funcs,
-    path_c_descriptor_stage_prim_funcs,
     path_c_fusion_schedule_spec,
     plan_path_c_descriptor_stage_groups,
     plan_path_c_direct_fusion_chain_for_region,
@@ -157,7 +154,6 @@ from scripts._nvfp4_route import (  # noqa: E402
     NVFP4_CARRIER_DTYPE,
     NVFP4_DTYPE,
     NVFP4_E2E_TRAINING_BLOCKER_TYPE,
-    Nvfp4TrainingRouteUnavailable,
     nvfp4_route_requested,
     nvfp4_training_route_payload,
     nvfp4_training_route_unavailable_reason,
@@ -295,6 +291,17 @@ FP8_PATH_C_KERNEL_POLICY_ENV = {
 }
 FP8_PATH_B_KERNEL_POLICY_ENV = {
     "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_b",
+}
+# The ordinary hybrid-tiny M0.4 smoke is a correctness receipt, not a custom
+# kernel benchmark.  Keep its Mamba3/M2RNN/Sparse-MLA dispatch deterministic so
+# an inherited AUTO policy cannot load the TileLang/TVM Metal backend while a
+# tiny subprocess is already competing with another local run.  Explicit Path
+# C and FP8 routes bypass this scope below and retain their requested policy.
+HYBRID_TINY_REFERENCE_KERNEL_POLICY_ENV = {
+    "CPPMEGA_KERNEL_PATH": "ref",
+    "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO": "ref",
+    "CPPMEGA_KERNEL_PATH__M2RNN": "ref",
+    "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "ref",
 }
 SPARSE_MLA_FP8_ROUTE_ENV = "CPPMEGA_SPARSE_MLA_FP8_ROUTE"
 SPARSE_MLA_FP8_BWD_ENV = "CPPMEGA_SPARSE_MLA_FP8_BWD"
@@ -1376,26 +1383,63 @@ def fp8_path_b_kernel_policy(
 
 
 @contextmanager
-def fp8_path_c_stdio_suppressed(
+def hybrid_tiny_reference_kernel_policy(
     args: argparse.Namespace | TrainHybridTinyConfig,
 ):
-    if not fp8_path_c_route_requested(args):
+    """Pin the plain tiny correctness route to pure MLX reference kernels.
+
+    This scope is intentionally narrow.  A caller that explicitly requests
+    Path C through the kernel-policy environment or an FP8 route keeps that
+    policy and therefore still fails loudly if its custom backend is broken.
+    The default tiny smoke must not inherit an ambient AUTO policy merely
+    because a TileLang development checkout is present in the process.
+    """
+
+    model_profile = str(getattr(args, "model_profile", "")).strip()
+    explicit_custom_route = (
+        fp8_path_b_route_requested(args)
+        or fp8_path_c_route_requested(args)
+        or path_c_kernel_policy_requested()
+    )
+    if model_profile != TrainHybridTinyConfig.model_profile or explicit_custom_route:
         yield
         return
 
-    saved_stdout_fd = os.dup(1)
-    saved_stderr_fd = os.dup(2)
+    previous = {
+        key: os.environ.get(key)
+        for key in HYBRID_TINY_REFERENCE_KERNEL_POLICY_ENV
+    }
+    os.environ.update(HYBRID_TINY_REFERENCE_KERNEL_POLICY_ENV)
     try:
-        with open(os.devnull, "w", encoding="utf-8") as devnull:
-            os.dup2(devnull.fileno(), 1)
-            os.dup2(devnull.fileno(), 2)
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                yield
+        yield
     finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def json_protocol_stdio():
+    """Keep diagnostics off stdout while a CLI receipt is being computed.
+
+    TileLang's tqdm logging handler writes warnings through ``sys.stdout`` and
+    native compiler code may write directly to file descriptor 1. Redirect both
+    forms to stderr so JSON remains the only stdout protocol payload. Diagnostics
+    are intentionally preserved; this is not an error-suppression context.
+    """
+
+    saved_stdout_fd = os.dup(1)
+    try:
+        sys.stdout.flush()
+        os.dup2(2, 1)
+        with redirect_stdout(sys.stderr):
+            yield
+    finally:
+        sys.stdout.flush()
         os.dup2(saved_stdout_fd, 1)
-        os.dup2(saved_stderr_fd, 2)
         os.close(saved_stdout_fd)
-        os.close(saved_stderr_fd)
 
 
 def precision_route_payload(
@@ -2924,6 +2968,7 @@ def fp8_path_c_training_route_payload(
     fused_train_block_training_runtime: Any | None = None,
     path_c_fusion_fn: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    planner_was_supplied = path_c_fusion_fn is not None
     if path_c_fusion_fn is None:
         path_c_fusion_fn = path_c_fusion_payload
     requested = path_c_training_route_requested(args)
@@ -2934,30 +2979,49 @@ def fp8_path_c_training_route_payload(
         fp8_producer_configured or not fp8_producer_required
     )
     sequence_length = path_c_training_sequence_length(args)
-    try:
-        path_c_fusion = dict(
-            path_c_fusion_fn(
-                model=model,
-                compile_receipt_path=compile_receipt_path,
-                bank_buffers=bank_buffers,
-                bank_buffer_owner=bank_buffer_owner,
-                bank_owner=bank_owner,
-                fused_artifact=fused_artifact,
-                direct_chain_artifacts=direct_chain_artifacts,
-                direct_chain_logical_buffers=direct_chain_logical_buffers,
-                direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
-                direct_chain_logical_owner=direct_chain_logical_owner,
-                direct_chain_training_runtime=direct_chain_training_runtime,
-                fused_train_block_training_runtime=fused_train_block_training_runtime,
-                sequence_length=sequence_length,
-            )
-        )
-    except Exception as exc:
-        path_c_fusion = _path_c_fusion_planner_unavailable_payload(
-            args=args,
+    if (
+        fp8_producer_required
+        and not fp8_producer_configured
+        and not planner_was_supplied
+    ):
+        path_c_fusion = _producer_missing_path_c_fusion_payload(
+            args,
             sequence_length=sequence_length or 0,
-            exception=exc,
+            reason=str(
+                producer["reason"]
+                or "fp8_path_c producer is not configured"
+            ),
         )
+    elif not requested and not planner_was_supplied:
+        path_c_fusion = _not_requested_path_c_fusion_payload(
+            args,
+            sequence_length=sequence_length or 0,
+        )
+    else:
+        try:
+            path_c_fusion = dict(
+                path_c_fusion_fn(
+                    model=model,
+                    compile_receipt_path=compile_receipt_path,
+                    bank_buffers=bank_buffers,
+                    bank_buffer_owner=bank_buffer_owner,
+                    bank_owner=bank_owner,
+                    fused_artifact=fused_artifact,
+                    direct_chain_artifacts=direct_chain_artifacts,
+                    direct_chain_logical_buffers=direct_chain_logical_buffers,
+                    direct_chain_logical_buffer_owner=direct_chain_logical_buffer_owner,
+                    direct_chain_logical_owner=direct_chain_logical_owner,
+                    direct_chain_training_runtime=direct_chain_training_runtime,
+                    fused_train_block_training_runtime=fused_train_block_training_runtime,
+                    sequence_length=sequence_length,
+                )
+            )
+        except Exception as exc:
+            path_c_fusion = _path_c_fusion_planner_unavailable_payload(
+                args=args,
+                sequence_length=sequence_length or 0,
+                exception=exc,
+            )
     runtime_training_binding = path_c_fusion.get("runtime_training_binding", {})
     single_fused_train_block_standalone_dispatch_available = bool(
         isinstance(runtime_training_binding, dict)
@@ -3757,11 +3821,6 @@ def _build_path_c_fused_suffix_loss_fn_for_model(
     required_inputs = ("target_ids", "target_mask", "loss", "ntokens")
     if not all(name in abi_map for name in required_inputs):
         return None
-    suffix_input_abi = getattr(
-        prim_func,
-        "_cppmega_path_c_train_step_suffix_loss_input_abi",
-        {},
-    )
     output_abi = getattr(
         prim_func,
         "_cppmega_path_c_train_step_output_abi",
@@ -11598,6 +11657,158 @@ def path_c_fusion_payload(
     }
 
 
+def _not_requested_path_c_fusion_payload(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+    *,
+    sequence_length: int,
+) -> dict[str, Any]:
+    """Return metadata without importing/planning the inactive Path C graph."""
+
+    profile_name = str(getattr(args, "model_profile", ""))
+    return {
+        "mode": selected_path_c_fusion_mode().value,
+        "status": "not_requested",
+        "reason": "Path C training route was not requested",
+        "region_name": None,
+        "backend": "tilelang",
+        "compiler": "tilelang.engine.fusion",
+        "fusion_kind": "model_route_path_c",
+        "sequence_length": sequence_length,
+        "runtime_training_binding": {"status": "not_requested"},
+        "fused_train_block_training_runtime_contract": {
+            "status": "not_requested",
+            "training_runtime_available": False,
+        },
+        "direct_chained_fusion": {
+            "status": "not_requested",
+            "runtime_binding": {"status": "not_requested"},
+            "training_runtime_contract": {
+                "status": "not_requested",
+                "training_runtime_available": False,
+            },
+        },
+        "graph_construction": {
+            "builder": "PathCFusionScheduleOptimizer",
+            "input_model": profile_name,
+            "route_symbols": [],
+            "region_source": "not_requested",
+            "selected_model_region": None,
+            "selected_model_region_op_signature": [],
+            "selected_model_region_schedule_id": None,
+            "preset_only": False,
+        },
+        "model_route_candidates": {
+            "profile": profile_name,
+            "route_symbols": [],
+            "region_source": "not_requested",
+            "selection_policy": "largest_supported_contiguous_route_segment",
+            "selected_candidate": None,
+            "candidate_regions": [],
+        },
+        "production_compile_receipt": {
+            "status": "not_evaluated",
+            "verified": False,
+            "reason": "Path C route not requested",
+        },
+        "production_matrix_profile_receipt": {
+            "status": "not_evaluated",
+            "verified": False,
+            "reason": "Path C route not requested",
+        },
+        "zero_copy_required": True,
+    }
+
+
+def _producer_missing_path_c_fusion_payload(
+    args: argparse.Namespace | TrainHybridTinyConfig,
+    *,
+    sequence_length: int,
+    reason: str,
+) -> dict[str, Any]:
+    """Return a receipt-only Path C payload without invoking TileLang.
+
+    The producer gate runs before model construction.  Calling the normal
+    planner from that blocked path can import and lower a Metal schedule even
+    though no training route can consume it.  Keep the route visible in the
+    receipt, but make the dependency boundary explicit and metadata-only.
+    """
+
+    payload = _not_requested_path_c_fusion_payload(
+        args,
+        sequence_length=sequence_length,
+    )
+    profile_name = str(getattr(args, "model_profile", ""))
+    blocked_status = FP8_PATH_C_PRODUCER_MISSING_STATUS
+    payload.update(
+        {
+            "status": blocked_status,
+            "reason": reason,
+            "region_name": None,
+            "sequence_length": sequence_length,
+            "runtime_training_binding": {
+                "status": blocked_status,
+                "runtime_uses_fused_train_block": False,
+                "runtime_binding_ready": False,
+                "physical_abi_binding_ready": False,
+                "provided_bank_buffers": [],
+                "required_bank_buffers": [],
+                "no_hidden_allocation_policy": True,
+                "reason": reason,
+            },
+            "fused_train_block_training_runtime_contract": {
+                "status": blocked_status,
+                "training_runtime_available": False,
+                "runtime_installed": False,
+                "critical_path_ready": False,
+                "reason": reason,
+            },
+            "direct_chained_fusion": {
+                "status": blocked_status,
+                "runtime_binding": {
+                    "status": blocked_status,
+                    "runtime_uses_direct_fusion_chain": False,
+                    "logical_tensor_binding_ready": False,
+                    "direct_chain_artifacts_bound": False,
+                    "reason": reason,
+                },
+                "training_runtime_contract": {
+                    "status": blocked_status,
+                    "training_runtime_available": False,
+                    "critical_path_ready": False,
+                    "reason": reason,
+                },
+            },
+            "graph_construction": {
+                **payload["graph_construction"],
+                "input_model": profile_name,
+                "region_source": "producer_missing",
+            },
+            "model_route_candidates": {
+                **payload["model_route_candidates"],
+                "profile": profile_name,
+                "region_source": "producer_missing",
+            },
+            "schedule_blockers": [
+                {
+                    "kind": blocked_status,
+                    "reason": reason,
+                }
+            ],
+            "production_compile_receipt": {
+                "status": "not_evaluated",
+                "verified": False,
+                "reason": reason,
+            },
+            "production_matrix_profile_receipt": {
+                "status": "not_evaluated",
+                "verified": False,
+                "reason": reason,
+            },
+        }
+    )
+    return payload
+
+
 def path_c_model_route_candidates_payload() -> dict[str, Any]:
     """Return Path C fusion candidate regions derived from local_gb10_quarter."""
 
@@ -12628,7 +12839,6 @@ def _run_existing_training(
         with (
             fp8_path_b_kernel_policy(args),
             fp8_path_c_kernel_policy(args),
-            fp8_path_c_stdio_suppressed(args),
         ):
             return local_gb10_route_fn(
                 args,
@@ -12650,9 +12860,9 @@ def _run_existing_training(
     memory_before = metal_memory_payload()
     try:
         with (
+            hybrid_tiny_reference_kernel_policy(config),
             fp8_path_b_kernel_policy(args),
             fp8_path_c_kernel_policy(args),
-            fp8_path_c_stdio_suppressed(args),
         ):
             if args.dry_run_json:
                 train_payload = dry_run_payload_fn(
@@ -15114,7 +15324,8 @@ def json_ready(value: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    receipt, exit_code = run_receipt(args)
+    with json_protocol_stdio():
+        receipt, exit_code = run_receipt(args)
     write_json(args.output, receipt)
     if args.json or args.dry_run_json or exit_code != 0:
         print(json.dumps(receipt, indent=2, sort_keys=True))

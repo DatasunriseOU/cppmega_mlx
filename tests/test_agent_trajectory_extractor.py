@@ -13,6 +13,7 @@ Validates against SYNTHETIC-but-faithful fixtures (mirroring the real Claude
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from cppmega_mlx.data.agent_trajectory import (
     ACTION_TEST,
     AgentTransition,
     SessionRef,
+    agent_transitions_to_trajectory_packet,
     classify_cpp,
     enumerate_local_sessions,
     extract_all,
@@ -30,6 +32,11 @@ from cppmega_mlx.data.agent_trajectory import (
     walk_claude,
     walk_codex,
 )
+
+
+class _ByteTokenizer:
+    def encode(self, text: str) -> list[int]:
+        return [1 + (byte % 63) for byte in text.encode("utf-8")]
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +244,56 @@ def test_codex_no_fabricated_reward_on_non_build_test():
             assert t.reward is None
 
 
+def test_walk_codex_rejects_malformed_action_arguments() -> None:
+    events = json.loads(json.dumps(_codex_cpp_session()))
+    events[2]["payload"]["arguments"] = "{"
+    with pytest.raises(ValueError, match="invalid exec_command arguments"):
+        list(walk_codex(events, "sid", "/repo"))
+
+
+def test_walk_codex_rejects_missing_command_action() -> None:
+    events = json.loads(json.dumps(_codex_cpp_session()))
+    events[2]["payload"]["arguments"] = json.dumps({"workdir": "/repo"})
+    with pytest.raises(ValueError, match="missing a non-empty cmd"):
+        list(walk_codex(events, "sid", "/repo"))
+
+
+def test_agent_transitions_convert_to_typed_trajectory_packet() -> None:
+    transitions = list(
+        walk_codex(
+            _codex_cpp_session(),
+            "019ddead-codex-cpp",
+            "/Volumes/external/sources/tilelang",
+        )
+    )
+    packet = agent_transitions_to_trajectory_packet(transitions, _ByteTokenizer())
+
+    assert packet.horizon == len(transitions)
+    assert packet.metadata["session_id"] == "019ddead-codex-cpp"
+    for source, encoded in zip(transitions, packet.transitions, strict=True):
+        assert encoded.obs.ndim == 1
+        assert encoded.action.ndim == 1
+        assert encoded.next_obs.ndim == 1
+        assert encoded.action.shape[0] > 0
+        assert encoded.metadata["action_kind"] == source.action_kind
+
+
+def test_agent_packet_conversion_rejects_misaligned_steps() -> None:
+    transitions = list(walk_codex(_codex_cpp_session(), "sid", "/repo"))
+    with pytest.raises(ValueError, match="expected contiguous step_idx=1"):
+        agent_transitions_to_trajectory_packet(
+            [transitions[0], transitions[2]], _ByteTokenizer()
+        )
+
+
+def test_agent_packet_conversion_rejects_missing_result() -> None:
+    transition = next(iter(walk_codex(_codex_cpp_session(), "sid", "/repo")))
+    with pytest.raises(ValueError, match="result: text must be non-empty"):
+        agent_transitions_to_trajectory_packet(
+            [replace(transition, result_text="")], _ByteTokenizer()
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Filtering via extract_session / extract_all (synthetic temp files)
 # --------------------------------------------------------------------------- #
@@ -288,9 +345,28 @@ def test_agent_transition_rejects_fabricated_reward():
     with pytest.raises(ValueError):
         AgentTransition(
             session_id="s", source="codex", repo="/x", step_idx=0,
-            obs_text="o", action_kind="read", action_payload="{}",
+            obs_text="o", action_kind="read", action_payload='{"tool":"Read"}',
             result_text="r", exit_code=0, is_build=False, is_test=False,
             reward=1.0, edit_diff=None,
+        )
+
+
+def test_agent_transition_rejects_missing_typed_action() -> None:
+    with pytest.raises(ValueError, match="non-empty 'tool'"):
+        AgentTransition(
+            session_id="s",
+            source="codex",
+            repo="/x",
+            step_idx=0,
+            obs_text="o",
+            action_kind="read",
+            action_payload="{}",
+            result_text="r",
+            exit_code=0,
+            is_build=False,
+            is_test=False,
+            reward=None,
+            edit_diff=None,
         )
 
 

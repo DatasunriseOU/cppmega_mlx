@@ -31,6 +31,7 @@ Source: /Users/dave/sources/parquet/data-cpp_all/data-cpp_all.tar.zst
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import re
@@ -39,17 +40,40 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
+from types import ModuleType
+
+_MODULE_ROOT = Path(__file__).resolve().parents[1]
+if str(_MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MODULE_ROOT))
+
+
+def _load_local_symbol_identity() -> ModuleType:
+    module_path = _MODULE_ROOT / "cppmega_mlx" / "data" / "symbol_identity.py"
+    module = importlib.import_module("cppmega_mlx.data.symbol_identity")
+    loaded_path = Path(getattr(module, "__file__", "")).resolve()
+    if loaded_path != module_path.resolve():
+        raise ImportError(
+            "cppmega_mlx.data.symbol_identity resolved outside this checkout: "
+            f"loaded={loaded_path} expected={module_path}"
+        )
+    return module
+
+
+_symbol_identity = _load_local_symbol_identity()
+SymbolIdentityError = _symbol_identity.SymbolIdentityError
+require_project_identity = _symbol_identity.require_project_identity
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
 # --------------------------------------------------------------------------- #
-MLX_ROOT = Path("/Volumes/external/sources/cppmega.mlx")
-VENV_PYTHON = MLX_ROOT / ".venv" / "bin" / "python"
+MLX_ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = Path(sys.executable)
 TOKENIZER_PATH = MLX_ROOT / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
 
 INDEX_PROJECT = MLX_ROOT / "tools" / "clang_indexer" / "index_project.py"
@@ -62,10 +86,13 @@ TAR_MEMBER_ROOT = "cpp_all"
 
 OUTPUT_ROOT = MLX_ROOT / "outputs" / "reindexed"
 MANIFEST_PATH = OUTPUT_ROOT / "_done.json"
+DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
 # Tokenize at the model's full context so packing decides the final lengths.
 TOKENIZE_BUDGET = 65536
 DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
+DEFAULT_CODE_INDEX_TIMEOUT_S = 4 * 60 * 60
+DEFAULT_CODE_INDEX_STALL_TIMEOUT_S = 10 * 60
 
 # Directories never worth indexing (VCS / build artifacts). index_project has its
 # own excludes; we additionally avoid extracting .git to keep staging small for
@@ -73,6 +100,66 @@ DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
 # NOT strip it there.
 SOURCE_EXTRA_EXCLUDE = ".git,.svn,node_modules,build,_build,cmake-build-debug"
 EXCLUDE_PARTS = frozenset(SOURCE_EXTRA_EXCLUDE.split(","))
+_PUBLICATION_LOCK = threading.Lock()
+
+
+def load_project_identity_map(repo_list: Path) -> dict[str, str]:
+    if not repo_list.exists():
+        raise FileNotFoundError(f"repo identity map does not exist: {repo_list}")
+    with repo_list.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    entries = data.get("repos")
+    if not isinstance(entries, list):
+        raise SymbolIdentityError(f"{repo_list}: expected a repos list")
+    identities: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise SymbolIdentityError(f"{repo_list}: repos[{index}] must be an object")
+        name = entry.get("name") or entry.get("bare_name")
+        project_identity = entry.get("project_identity")
+        owner_repo = entry.get("owner_repo")
+        if not isinstance(name, str) or not name:
+            continue
+        if project_identity is None:
+            project_identity = owner_repo
+        project_id = require_project_identity(
+            project_identity,
+            source=f"{repo_list}:repos[{index}].project_identity",
+        )
+        if owner_repo is not None:
+            github_project_id = require_project_identity(
+                owner_repo,
+                source=f"{repo_list}:repos[{index}].owner_repo",
+            )
+            if github_project_id != project_id:
+                raise SymbolIdentityError(
+                    f"{repo_list}: repos[{index}] has conflicting project_identity "
+                    f"{project_id!r} and owner_repo {github_project_id!r}"
+                )
+        previous = identities.get(name)
+        if previous is not None and previous != project_id:
+            raise SymbolIdentityError(
+                f"{repo_list}: bare repo {name!r} maps to both "
+                f"{previous!r} and {project_id!r}"
+            )
+        identities[name] = project_id
+    return identities
+
+
+def resolve_project_identity(repo: str, repo_list: Path | None) -> str:
+    if "/" in repo:
+        return require_project_identity(repo, source="streaming repo")
+    if repo_list is None:
+        raise SymbolIdentityError(
+            f"repo {repo!r} has no canonical project identity; provide --repo-list"
+        )
+    identities = load_project_identity_map(repo_list)
+    try:
+        return identities[repo]
+    except KeyError as exc:
+        raise SymbolIdentityError(
+            f"{repo_list}: no canonical project identity for bare repo {repo!r}"
+        ) from exc
 
 
 def _route_by_fit_impl():
@@ -297,65 +384,6 @@ def _subprocess_env() -> dict:
     return env
 
 
-def _parse_ps_time_seconds(value: str) -> float | None:
-    """Parse ps TIME values like MM:SS.cc, HH:MM:SS.cc, or DD-HH:MM:SS.cc."""
-    raw = value.strip()
-    if not raw:
-        return None
-    days = 0
-    if "-" in raw:
-        day_raw, raw = raw.split("-", 1)
-        try:
-            days = int(day_raw)
-        except ValueError:
-            return None
-    parts = raw.split(":")
-    try:
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    return float(days * 86400 + hours * 3600 + minutes * 60) + seconds
-
-
-def _process_group_cpu_seconds(pgid: int) -> float | None:
-    """Return cumulative CPU seconds for a process group, when ps supports it."""
-    try:
-        output = subprocess.check_output(
-            ["ps", "-axo", "pgid=,time="],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    total = 0.0
-    seen = False
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 2:
-            continue
-        try:
-            row_pgid = int(fields[0])
-        except ValueError:
-            continue
-        if row_pgid != pgid:
-            continue
-        seconds = _parse_ps_time_seconds(fields[1])
-        if seconds is None:
-            continue
-        total += seconds
-        seen = True
-    return total if seen else None
-
-
 def run_checked(
     repo: str,
     stage: str,
@@ -409,7 +437,6 @@ def run_checked(
             deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
             last_activity = time.monotonic()
             last_signature: tuple[int, int] | None = None
-            last_cpu_seconds: float | None = None
             while proc.poll() is None:
                 now = time.monotonic()
                 if deadline is not None and now > deadline:
@@ -425,18 +452,12 @@ def run_checked(
                     if signature != last_signature:
                         last_signature = signature
                         last_activity = now
-                cpu_seconds = _process_group_cpu_seconds(proc.pid)
-                if cpu_seconds is not None and cpu_seconds != last_cpu_seconds:
-                    last_cpu_seconds = cpu_seconds
-                    last_activity = now
                 if now - last_activity > stall_timeout:
-                    terminate_process(
-                        f"no log/CPU progress for {stall_timeout}s"
-                    )
+                    terminate_process(f"no log progress for {stall_timeout}s")
                     raise RepoFailure(
                         repo,
                         stage,
-                        f"stalled after {stall_timeout}s without log or CPU progress",
+                        f"stalled after {stall_timeout}s without log progress",
                     )
                 time.sleep(1.0)
             stdout_data, _ = proc.communicate(timeout=1)
@@ -494,12 +515,31 @@ class Manifest:
     def is_done(self, key: str) -> bool:
         return key in self.done
 
+    def mark_started(self, key: str) -> None:
+        """Invalidate stale terminal state before starting a new attempt."""
+        changed = self.done.pop(key, None) is not None
+        changed = self.failed.pop(key, None) is not None or changed
+        if changed:
+            self.save()
+
+    def mark_started_prefix(self, prefix: str) -> None:
+        """Invalidate all stale range states for a logical parent item."""
+        done_keys = [key for key in self.done if key.startswith(prefix)]
+        failed_keys = [key for key in self.failed if key.startswith(prefix)]
+        for key in done_keys:
+            self.done.pop(key)
+        for key in failed_keys:
+            self.failed.pop(key)
+        if done_keys or failed_keys:
+            self.save()
+
     def mark_done(self, key: str, info: dict) -> None:
         self.done[key] = info
         self.failed.pop(key, None)
         self.save()
 
     def mark_failed(self, key: str, stage: str, detail: str) -> None:
+        self.done.pop(key, None)
         self.failed[key] = {
             "stage": stage,
             "detail": detail[:2000],
@@ -723,6 +763,8 @@ def stream_repo_subtrees(
     finally:
         try:
             tar.close()
+        except SymbolIdentityError:
+            raise
         except Exception:
             pass
         if zstd.poll() is None:
@@ -793,6 +835,7 @@ def populate_source_cache(
 # --------------------------------------------------------------------------- #
 def stage_index_source(
     repo: str,
+    project_id: str,
     repo_dir: Path,
     work: Path,
     dedup_db: Path | None = None,
@@ -815,10 +858,14 @@ def stage_index_source(
     linking inside index_project (depth-1 pulls tagged crosslib:<repo>). None ->
     behavior unchanged.
     """
+    project_id = require_project_identity(
+        project_id, source=f"stage_index_source({repo})"
+    )
     enriched = work / f"{repo}.enriched.jsonl"
     cmd = [
         VENV_PYTHON, INDEX_PROJECT,
         "--project-dir", repo_dir,
+        "--project-id", project_id,
         "--output", enriched,
         "--enriched",
         "--max-tokens", str(TOKENIZE_BUDGET),
@@ -826,6 +873,7 @@ def stage_index_source(
         "--tokenizer-path", TOKENIZER_PATH,
         "--memory-limit-gb", str(memory_limit_gb),
         "--parse-workers", str(max(1, int(parse_workers))),
+        "--skip-invalid-domain-inputs",
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
@@ -877,7 +925,9 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         repo_list: Path | None = None,
                         memory_limit_gb: float = 10.0,
                         analysis_cache_entries: int = 128,
-                        allow_empty: bool = False) -> Path | None:
+                        allow_empty: bool = False,
+                        *,
+                        project_id: str) -> Path | None:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
     A commit is an ATOMIC change-unit: process_commits dedups whole commit DOCS
@@ -895,6 +945,10 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         "--format", "both",
         "--memory-limit-gb", str(memory_limit_gb),
         "--analysis-cache-entries", str(max(0, int(analysis_cache_entries))),
+        "--project-id", require_project_identity(
+            project_id,
+            source=f"stage_index_commits({repo})",
+        ),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
@@ -927,23 +981,36 @@ def stage_materialize(
     enriched: Path,
     work: Path,
     memory_limit_gb: float = 10.0,
+    *,
+    project_id: str | None = None,
 ) -> Path:
-    """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file)."""
+    """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file).
+
+    ``project_id`` is keyword-only so adding canonical identity cannot shift the
+    long-standing ``(repo, enriched, work, memory_limit_gb)`` stage ABI. Sources
+    that omit it must carry canonical repo identity in every input row; the
+    materializer validates that contract fail-closed.
+    """
     tok = work / f"{repo}.tok.parquet"
+    cmd = [
+        VENV_PYTHON, MATERIALIZER,
+        "--input-file", enriched,
+        "--output-file", tok,
+        "--tokenizer-path", TOKENIZER_PATH,
+        "--materialize-tokenized-enriched",
+        "--overflow-policy", "drop",
+        "--size", _budget_size_label(TOKENIZE_BUDGET),
+        "--memory-limit-gb", str(memory_limit_gb),
+    ]
+    if project_id is not None:
+        project_id = require_project_identity(
+            project_id, source=f"stage_materialize({repo})"
+        )
+        cmd += ["--default-repo", project_id]
     run_checked(
         repo,
         "materialize",
-        [
-            VENV_PYTHON, MATERIALIZER,
-            "--input-file", enriched,
-            "--output-file", tok,
-            "--tokenizer-path", TOKENIZER_PATH,
-            "--materialize-tokenized-enriched",
-            "--overflow-policy", "drop",
-            "--size", _budget_size_label(TOKENIZE_BUDGET),
-            "--memory-limit-gb", str(memory_limit_gb),
-            "--default-repo", repo,
-        ],
+        cmd,
         log_path=work / f"{repo}.materialize.log",
     )
     if not tok.exists() or tok.stat().st_size == 0:
@@ -977,18 +1044,151 @@ def stage_pack(repo: str, tok: Path, target_length: int, work: Path) -> Path:
     return packed
 
 
-def append_output(repo: str, packed: Path, target_length: int) -> dict:
-    """Place packed parquet at outputs/reindexed/<L>/<repo>.parquet.
+def _replace_publication_path(source: Path, destination: Path) -> None:
+    os.replace(source, destination)
 
-    Per-repo files are the append unit (one file per repo per length); this keeps
-    resume trivial and avoids rewriting a growing combined file. Returns row/token
-    stats read back from the written file.
-    """
-    out_dir = OUTPUT_ROOT / str(target_length)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / f"{repo}.parquet"
-    shutil.copyfile(packed, dest)
-    return _parquet_stats(dest, target_length)
+
+@contextmanager
+def _publication_lock(output_root: Path):
+    import fcntl
+
+    lock_path = output_root / ".publish.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _PUBLICATION_LOCK, lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def publish_bucket_outputs_atomically(
+    publication_key: str,
+    packed_by_length: dict[int, Path],
+    *,
+    output_root: Path,
+    filename: str,
+    prepare_staged: Callable[[Path], None] | None = None,
+    stats_reader: Callable[[Path, int], dict] | None = None,
+    remove_lengths: Sequence[int] = (),
+) -> dict[str, dict]:
+    """Failure-atomically publish one logical item across all routed buckets."""
+    if not packed_by_length:
+        raise ValueError(f"[{publication_key}] no bucket outputs to publish")
+    if Path(filename).name != filename:
+        raise ValueError(f"[{publication_key}] invalid output filename: {filename!r}")
+
+    read_stats = stats_reader or _parquet_stats
+    transaction_id = f"{os.getpid()}.{time.time_ns()}"
+    transaction_root = output_root / ".transactions" / transaction_id
+    transaction_root.mkdir(parents=True, exist_ok=False)
+    destinations: dict[int, Path] = {}
+    staged: dict[int, Path] = {}
+    stats: dict[str, dict] = {}
+
+    try:
+        publication_lengths = sorted(
+            set(packed_by_length) | {int(length) for length in remove_lengths}
+        )
+        for target_length in publication_lengths:
+            out_dir = output_root / str(target_length)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            destinations[target_length] = out_dir / filename
+        for target_length, packed in sorted(packed_by_length.items()):
+            destination = destinations[target_length]
+            staged_path = transaction_root / "staged" / str(target_length) / filename
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            staged[target_length] = staged_path
+            shutil.copyfile(packed, staged_path)
+            if prepare_staged is not None:
+                prepare_staged(staged_path)
+            stats[str(target_length)] = read_stats(staged_path, target_length)
+    except BaseException:
+        shutil.rmtree(transaction_root, ignore_errors=True)
+        raise
+
+    backups: dict[int, Path] = {}
+    published: list[int] = []
+    rollback_incomplete = False
+    try:
+        with _publication_lock(output_root):
+            try:
+                for target_length, destination in sorted(destinations.items()):
+                    if not destination.exists():
+                        continue
+                    backup = (
+                        transaction_root
+                        / "backups"
+                        / str(target_length)
+                        / filename
+                    )
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    _replace_publication_path(destination, backup)
+                    backups[target_length] = backup
+
+                for target_length, staged_path in sorted(staged.items()):
+                    destination = destinations[target_length]
+                    _replace_publication_path(staged_path, destination)
+                    published.append(target_length)
+            except BaseException as publication_error:
+                rollback_errors: list[str] = []
+                for target_length in reversed(published):
+                    destination = destinations[target_length]
+                    try:
+                        destination.unlink(missing_ok=True)
+                    except Exception as exc:
+                        rollback_errors.append(f"remove {destination}: {exc}")
+                for target_length, backup in reversed(tuple(backups.items())):
+                    try:
+                        _replace_publication_path(
+                            backup, destinations[target_length]
+                        )
+                    except Exception as exc:
+                        rollback_errors.append(
+                            f"restore {destinations[target_length]}: {exc}"
+                        )
+                if rollback_errors:
+                    rollback_incomplete = True
+                    raise RuntimeError(
+                        f"[{publication_key}] bucket publication failed and rollback "
+                        f"was incomplete; recovery files remain in {transaction_root}: "
+                        f"{'; '.join(rollback_errors)}"
+                    ) from publication_error
+                raise
+    finally:
+        if not rollback_incomplete:
+            shutil.rmtree(transaction_root)
+
+    return stats
+
+
+def publish_outputs(
+    repo: str,
+    packed_by_length: dict[int, Path],
+    target_lengths: Sequence[int] | None = None,
+) -> dict[str, dict]:
+    all_lengths = set(packed_by_length if target_lengths is None else target_lengths)
+    try:
+        return publish_bucket_outputs_atomically(
+            repo,
+            packed_by_length,
+            output_root=OUTPUT_ROOT,
+            filename=f"{repo}.parquet",
+            remove_lengths=sorted(all_lengths - set(packed_by_length)),
+        )
+    except RepoFailure:
+        raise
+    except Exception as exc:
+        raise RepoFailure(
+            repo,
+            "publish",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def append_output(repo: str, packed: Path, target_length: int) -> dict:
+    """Publish one packed parquet through the atomic bucket publisher."""
+    return publish_outputs(repo, {target_length: packed})[str(target_length)]
 
 
 def _parquet_stats(path: Path, target_length: int) -> dict:
@@ -1032,6 +1232,7 @@ def process_one_repo(
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
     *,
+    project_id: str,
     promote_dedup_on_success: bool = True,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
@@ -1046,6 +1247,9 @@ def process_one_repo(
     exactly one bucket -- never replicated across 1024/2048/4096.
     """
     work = work_root / repo
+    project_id = require_project_identity(
+        project_id, source=f"process_one_repo({repo})"
+    )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
     stage_id = code_stage_id(repo) if dedup_db is not None else None
@@ -1057,7 +1261,7 @@ def process_one_repo(
         started = time.monotonic()
         try:
             enriched = stage_index_source(
-                repo, repo_dir, work, dedup_db, dedup_near,
+                repo, project_id, repo_dir, work, dedup_db, dedup_near,
                 stage_id, stage_db, global_symbol_index, memory_limit_gb,
                 parse_workers, index_timeout_s, index_stall_timeout_s,
             )
@@ -1070,7 +1274,13 @@ def process_one_repo(
             ) from exc
         timings["index_project_s"] = round(time.monotonic() - started, 6)
         started = time.monotonic()
-        tok = stage_materialize(repo, enriched, work, memory_limit_gb)
+        tok = stage_materialize(
+            repo=repo,
+            enriched=enriched,
+            work=work,
+            memory_limit_gb=memory_limit_gb,
+            project_id=project_id,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1081,11 +1291,11 @@ def process_one_repo(
             raise RepoFailure(repo, "route_by_fit", f"no docs routed for {repo}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(repo, route_parquet, L, work)
-            per_length[str(L)] = append_output(repo, packed, L)
+            packed_by_length[L] = stage_pack(repo, route_parquet, L, work)
+        per_length = publish_outputs(repo, packed_by_length, lengths_sorted)
         timings["pack_s"] = round(time.monotonic() - started, 6)
         if promote_dedup_on_success:
             timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
@@ -1109,8 +1319,13 @@ def process_one_commit_source(
     dedup_near: bool = True,
     memory_limit_gb: float = 10.0,
     analysis_cache_entries: int = 128,
+    *,
+    project_id: str,
 ) -> dict:
     work = work_root / key
+    project_id = require_project_identity(
+        project_id, source=f"process_one_commit_source({key})"
+    )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
     stage_id = commit_stage_id(key) if dedup_db is not None else None
@@ -1125,12 +1340,19 @@ def process_one_commit_source(
             stage_db,
             memory_limit_gb=memory_limit_gb,
             analysis_cache_entries=analysis_cache_entries,
+            project_id=project_id,
         )
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:
             return {"source": "commits", "lengths": {}, "stage_timings_s": timings}
         started = time.monotonic()
-        tok = stage_materialize(key, enriched, work, memory_limit_gb)
+        tok = stage_materialize(
+            repo=key,
+            enriched=enriched,
+            work=work,
+            memory_limit_gb=memory_limit_gb,
+            project_id=project_id,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1141,11 +1363,11 @@ def process_one_commit_source(
             raise RepoFailure(key, "route_by_fit", f"no docs routed for {key}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(key, route_parquet, L, work)
-            per_length[str(L)] = append_output(key, packed, L)
+            packed_by_length[L] = stage_pack(key, route_parquet, L, work)
+        per_length = publish_outputs(key, packed_by_length, lengths_sorted)
         timings["pack_s"] = round(time.monotonic() - started, 6)
         timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
         promoted = True
@@ -1196,6 +1418,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "When set, the CODE stage threads it into index_project so "
                         "unresolved base-lib callees are pulled in as bounded "
                         "depth-1 deps tagged crosslib:<repo>. DEFAULT off.")
+    p.add_argument(
+        "--repo-list",
+        default=str(DEFAULT_REPO_LIST),
+        help="repo_list.json mapping bare extraction names to canonical project "
+        f"identities. Default {DEFAULT_REPO_LIST}.",
+    )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
                         "commit processors (default 10.0).")
@@ -1206,13 +1434,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--parse-workers", type=int, default=2,
                    help="Parse workers passed to index_project for the code stage "
                         "(default 2; keep this low when multiple repos run).")
-    p.add_argument("--code-index-timeout-s", type=int, default=0,
-                   help="Optional fail-loud timeout for each index_project code "
-                        "stage. 0 disables the timeout (default).")
-    p.add_argument("--code-index-stall-timeout-s", type=int, default=0,
-                   help="Optional fail-loud stall watchdog for index_project: "
-                        "kill when the log file has no size/mtime progress for "
-                        "this many seconds. 0 disables the watchdog (default).")
+    p.add_argument("--code-index-timeout-s", type=int,
+                   default=DEFAULT_CODE_INDEX_TIMEOUT_S,
+                   help="Fail-loud timeout for each index_project code stage "
+                        f"(default {DEFAULT_CODE_INDEX_TIMEOUT_S}s; 0 disables).")
+    p.add_argument("--code-index-stall-timeout-s", type=int,
+                   default=DEFAULT_CODE_INDEX_STALL_TIMEOUT_S,
+                   help="Fail-loud log-heartbeat watchdog for index_project "
+                        f"(default {DEFAULT_CODE_INDEX_STALL_TIMEOUT_S}s; 0 disables).")
     p.add_argument("--source-cache-dir", default=None,
                    help="Optional repo-level source cache for code-only runs. "
                         "Complete cached repos are reused before opening the "
@@ -1285,6 +1514,10 @@ def main(argv: list[str]) -> int:
             raise SystemExit(f"--global-symbol-index not found: {global_symbol_index}")
         print(f"Cross-lib: GLOBAL base-lib symbol index at {global_symbol_index} "
               f"threaded into CODE stage (bounded depth-1 pulls).", file=sys.stderr)
+    repo_list = Path(args.repo_list) if args.repo_list else None
+    project_id_map = (
+        load_project_identity_map(repo_list) if repo_list is not None else {}
+    )
 
     if args.work_dir:
         work_root = Path(args.work_dir)
@@ -1299,24 +1532,39 @@ def main(argv: list[str]) -> int:
     run_report: dict[str, dict] = {}
 
     # ----- commit sources first (independent of tarball extraction) -----
-    commit_sources: list[tuple[str, list[Path]]] = []
+    commit_sources: list[tuple[str, str, list[Path]]] = []
     for spec in args.commit_source:
         if "=" not in spec:
             raise SystemExit(f"--commit-source must be key=path,...; got: {spec}")
         key, paths = spec.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise SystemExit(f"--commit-source key must not be empty: {spec}")
         files = [Path(p) for p in paths.split(",") if p.strip()]
         for f in files:
             if not f.exists():
                 raise SystemExit(f"commit source file missing: {f}")
-        commit_sources.append((key.strip(), files))
+        try:
+            project_id = (
+                require_project_identity(key, source="streaming commit source")
+                if "/" in key
+                else project_id_map[key]
+            )
+        except KeyError as exc:
+            raise SymbolIdentityError(
+                f"{repo_list}: no canonical project identity for "
+                f"bare commit source {key!r}"
+            ) from exc
+        commit_sources.append((key, project_id, files))
 
-    for key, files in commit_sources:
+    for key, project_id, files in commit_sources:
         manifest_key = f"commits:{key}"
         if resume and manifest.is_done(manifest_key):
             print(f"SKIP (done) {manifest_key}", file=sys.stderr)
             continue
         if args.max_repos is not None and processed >= args.max_repos:
             break
+        manifest.mark_started(manifest_key)
         try:
             info = process_one_commit_source(
                 key, files, target_lengths, work_root,
@@ -1324,6 +1572,7 @@ def main(argv: list[str]) -> int:
                 Path(args.commit_repo_dir) if args.commit_repo_dir else None,
                 dedup_db, dedup_near, args.memory_limit_gb,
                 args.analysis_cache_entries,
+                project_id=project_id,
             )
             manifest.mark_done(manifest_key, info)
             run_report[manifest_key] = info
@@ -1372,14 +1621,27 @@ def main(argv: list[str]) -> int:
         )
         try:
             for repo, repo_dir in gen:
+                manifest.mark_started(repo)
                 try:
+                    try:
+                        project_id = (
+                            require_project_identity(repo, source="streaming repo")
+                            if "/" in repo
+                            else project_id_map[repo]
+                        )
+                    except KeyError as exc:
+                        raise SymbolIdentityError(
+                            f"{repo_list}: no canonical project identity for "
+                            f"bare repo {repo!r}"
+                        ) from exc
                     info = process_one_repo(repo, repo_dir, target_lengths, work_root,
                                             dedup_db, dedup_near,
                                             global_symbol_index,
                                             args.memory_limit_gb,
                                             args.parse_workers,
                                             args.code_index_timeout_s,
-                                            args.code_index_stall_timeout_s)
+                                            args.code_index_stall_timeout_s,
+                                            project_id=project_id)
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1

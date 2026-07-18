@@ -671,6 +671,10 @@ def test_gdn_chunk_o_metal_threadgroup_memory_fits_device_limit():
 
 def test_gdn_kkt_lowering_is_non_degraded():
     pytest.importorskip("tilelang")
+    pytest.importorskip(
+        "triton",
+        reason="Path D real lowering requires the optional Triton frontend runtime",
+    )
     from cppmega_v4._tilelang.linear_attention_path_d_real import (
         lower_fla_gdn_kkt_solve,
     )

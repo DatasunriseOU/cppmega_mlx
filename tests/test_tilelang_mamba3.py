@@ -200,15 +200,18 @@ def test_status_is_available_or_explains_why() -> None:
 def test_mamba3_path_b_documents_tilelang_port_boundary() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
     assert mod.__doc__ is not None
-    assert "sequential selective-scan kernels" in mod.__doc__
-    assert "return_msl=True" in mod.__doc__
-    assert "hand-written MSL source" in mod.__doc__
+    doc = " ".join(mod.__doc__.split())
+    assert "sequential selective-scan kernels" in doc
+    assert "return_msl=True" in doc
+    assert "hand-written MSL source" in doc
 
 
-def test_mamba3_bwd_source_keeps_fast_partial_reduce_path_b_surface() -> None:
+def test_mamba3_bwd_keeps_partial_abi_private_and_reduces_to_owner_outputs() -> None:
     mod = importlib.import_module("cppmega_mlx.nn._tilelang.mamba3")
     source = inspect.getsource(mod)
 
+    assert "_BWD_KERNEL = _msl_transform.make_metal_kernel" in source
+    assert "_BWD_KERNEL_DHINIT = _msl_transform.make_metal_kernel" in source
     assert "dB_partial" in mod._BWD_KERNEL_SOURCE
     assert "dC_partial" in mod._BWD_KERNEL_SOURCE
     assert "dA_partial" in mod._BWD_KERNEL_SOURCE
@@ -219,6 +222,30 @@ def test_mamba3_bwd_source_keeps_fast_partial_reduce_path_b_surface() -> None:
     assert "cppmega_atomic_add_float" not in source
     assert "init_value=0" not in source
     assert "atomic_outputs=True" not in source
+
+
+def test_bwd_metal_public_surface_matches_mlx_final_owner_gradients() -> None:
+    inputs = _make_inputs(batch=1, seq=6, heads=2, headdim=3, state=4, dtype=mx.float32)
+    x, B, C, z, A, dt, D, h0 = inputs
+    dy = mx.random.normal(x.shape, dtype=mx.float32) * 0.1
+    mx.eval(dy)
+
+    status = mamba3_mimo_metal_status(x)
+    if not status.available:
+        pytest.skip(f"Metal unavailable for explicit parity: {status.reason}")
+
+    metal_grads = mamba3_mimo_bwd_metal(
+        dy, x, B, C, z, A, dt, D, h0, backend="metal"
+    )
+    mlx_grads = mamba3_mimo_bwd_metal(
+        dy, x, B, C, z, A, dt, D, h0, backend="mlx"
+    )
+    mx.eval(*metal_grads, *mlx_grads)
+
+    expected_shapes = tuple(value.shape for value in inputs)
+    assert tuple(value.shape for value in metal_grads) == expected_shapes
+    for actual, expected in zip(metal_grads, mlx_grads):
+        np.testing.assert_allclose(_np(actual), _np(expected), rtol=5e-3, atol=1e-5)
 
 
 def test_fwd_metal_matches_reference_at_fp32() -> None:

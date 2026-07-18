@@ -223,6 +223,25 @@ def test_mlx_doc_ids_and_sdpa_mask_are_boolean_and_causal() -> None:
     assert out.dtype == mx.bfloat16
 
 
+@pytest.mark.parametrize("dtype", [np.int64, np.uint64])
+def test_document_boundary_masks_preserve_wide_document_ids(dtype) -> None:
+    values = np.array(
+        [[2**31, 2**31, 2**32, 0]],
+        dtype=dtype,
+    )
+
+    numpy_mask = document_boundary_mask(values)
+    mlx_values = mx.array(values)
+    mlx_mask = mlx_document_boundary_mask(mlx_values)
+    mx.eval(mlx_mask)
+
+    assert bool(numpy_mask[0, 0, 1])
+    assert not bool(numpy_mask[0, 0, 2])
+    assert not bool(numpy_mask[0, 2, 3])
+    np.testing.assert_array_equal(np.asarray(mlx_mask), numpy_mask)
+    assert mlx_values.dtype in (mx.int64, mx.uint64)
+
+
 def test_oversized_samples_are_refused_by_default() -> None:
     with pytest.raises(ValueError, match="sample 0 length 5 exceeds usable seq_len 4"):
         pack_documents_with_eos([[1, 2, 3, 4]], seq_len=4, eos_token_id=2)

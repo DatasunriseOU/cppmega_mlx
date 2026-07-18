@@ -32,7 +32,7 @@ def kernel_policy_env(updates: Mapping[str, str | None]) -> Iterator[None]:
                 os.environ[key] = value
 
 
-def test_forced_path_b_local_gb10_quarter_m2rnn_training_route_runs_baseline() -> None:
+def test_forced_path_b_local_gb10_quarter_m2rnn_training_route_runs_owned_metal_kernel() -> None:
     model = build_local_gb10_quarter_tiny_smoke_model(
         pattern="R",
         depth=1,
@@ -74,5 +74,5 @@ def test_forced_path_b_local_gb10_quarter_m2rnn_training_route_runs_baseline() -
     assert m2rnn_dispatches[-1] == {
         "op_name": "m2rnn",
         "path": "path_b",
-        "kernel_used": "reference_path_b_baseline",
+        "kernel_used": "metal_kernel_fwd_v1",
     }

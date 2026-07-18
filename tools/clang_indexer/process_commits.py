@@ -40,7 +40,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Sequence, cast
 
 # Increase recursion limit for deeply nested ASTs
 sys.setrecursionlimit(50000)
@@ -54,33 +54,57 @@ from tools.clang_indexer.index_project import (
     _configure_libclang,
     _adapt_args_for_file,
     _collect_macro_include_dirs,
+    _compute_symbol_id,
+    _document_symbol_identities,
+    _function_part,
+    _iter_code_identifiers,
     _macro_invocation_route_parts,
-    _macro_part_metadata,
+    _macro_part,
     _macro_route_part,
+    _normalize_signature_text,
     _part_macro_provenance,
+    _part_symbol_key,
+    _part_symbol_metadata,
     _sanitize_compile_args_for_clang,
+    _semantic_identity_records_for_arrays,
+    _symbol_part_metadata,
     _used_macro_defs,
+    canonical_symbol_identity,
     FunctionDef,
-    MACRO_KIND,
     MacroDef,
     PartInfo,
     ProjectIndex,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    TypeDef,
     _cpp_domain_sidecars,
-    extract_callees,
-    extract_referenced_types,
+    extract_callee_references,
+    extract_referenced_type_references,
     get_qualified_name,
     FUNCTION_KINDS,
     CONTAINER_KINDS,
     _byte_to_char_mapper,
     _cursor_text_and_metadata,
     extract_clang_ast_metadata,
+    extract_semantic_metadata,
     extract_semantic_metadata_from_parts,
+    normalize_qualified_name,
     register_header_macros,
+    symbol_identity_for_cursor,
+)
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SymbolIdentityError,
+    require_project_identity,
 )
 from cppmega_mlx.data.nanochat_pipeline.build_context import detect_build_context
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 from scripts.pr_ingest import pr_store as _pr_store_mod
 from scripts.pr_ingest.render_discussion import render_discussion as _render_discussion
+
+
+class PartialParseError(RuntimeError):
+    """Raised when a commit range would publish after ordinary parse failures."""
 
 
 class PRDiscussionLookup:
@@ -220,14 +244,62 @@ class ClassDef:
     text: str
     start_line: int
     end_line: int
+    file: str = ""
+    symbol_key: str = ""
+    symbol_id: int = field(init=False)
+    usr: str = ""
+    canonical_signature: str = ""
+    symbol_kind: str = "CLASS_DECL"
+    member_symbol_keys: list[str] = field(default_factory=list)
     ast_depth: list[int] = field(default_factory=list)
     sibling_index: list[int] = field(default_factory=list)
     ast_node_type: list[int] = field(default_factory=list)
+    semantic_symbol_ids: list[int] = field(default_factory=list)
+    semantic_call_targets: list[int] = field(default_factory=list)
+    semantic_type_refs: list[int] = field(default_factory=list)
+    semantic_def_use: list[int] = field(default_factory=list)
+    semantic_symbol_identities: list[dict[str, object]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.qualified_name = normalize_qualified_name(self.qualified_name)
+        self.canonical_signature = _normalize_signature_text(self.canonical_signature)
+        if not self.symbol_key:
+            self.symbol_key = canonical_symbol_identity(
+                qname=self.qualified_name,
+                kind=self.symbol_kind,
+                canonical_signature=self.canonical_signature,
+                file=self.file,
+                line=self.start_line,
+                force_file_scope=True,
+            )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
         self.ast_depth = array('H', self.ast_depth)
         self.sibling_index = array('H', self.sibling_index)
         self.ast_node_type = array('H', self.ast_node_type)
+        self.semantic_symbol_ids = array('Q', self.semantic_symbol_ids)
+        self.semantic_call_targets = array('Q', self.semantic_call_targets)
+        self.semantic_type_refs = array('Q', self.semantic_type_refs)
+        self.semantic_def_use = array('B', self.semantic_def_use)
+
+
+def _class_part(cls: ClassDef) -> PartInfo:
+    return (
+        cls.text,
+        4,
+        0,
+        cls.name,
+        cls.qualified_name,
+        None,
+        None,
+        _symbol_part_metadata(
+            cls.symbol_key,
+            qname=cls.qualified_name,
+            symbol_id=cls.symbol_id,
+            canonical_signature=cls.canonical_signature,
+            usr=cls.usr,
+            kind=cls.symbol_kind,
+        ),
+    )
 
 
 @dataclass
@@ -271,6 +343,20 @@ def _clone_function_def(func: FunctionDef) -> FunctionDef:
         ast_node_type=list(func.ast_node_type),
         referenced_types=list(func.referenced_types),
         baselib_callees=list(func.baselib_callees),
+        symbol_key=func.symbol_key,
+        usr=func.usr,
+        canonical_signature=func.canonical_signature,
+        symbol_kind=func.symbol_kind,
+        callee_keys=list(func.callee_keys),
+        referenced_type_keys=list(func.referenced_type_keys),
+        callee_refs=list(func.callee_refs),
+        baselib_callee_refs=list(func.baselib_callee_refs),
+        referenced_type_refs=list(func.referenced_type_refs),
+        semantic_symbol_ids=list(func.semantic_symbol_ids),
+        semantic_call_targets=list(func.semantic_call_targets),
+        semantic_type_refs=list(func.semantic_type_refs),
+        semantic_def_use=list(func.semantic_def_use),
+        semantic_symbol_identities=list(func.semantic_symbol_identities),
     )
 
 
@@ -281,9 +367,20 @@ def _clone_class_def(cls: ClassDef) -> ClassDef:
         text=cls.text,
         start_line=cls.start_line,
         end_line=cls.end_line,
+        file=cls.file,
+        symbol_key=cls.symbol_key,
+        usr=cls.usr,
+        canonical_signature=cls.canonical_signature,
+        symbol_kind=cls.symbol_kind,
+        member_symbol_keys=list(cls.member_symbol_keys),
         ast_depth=list(cls.ast_depth),
         sibling_index=list(cls.sibling_index),
         ast_node_type=list(cls.ast_node_type),
+        semantic_symbol_ids=list(cls.semantic_symbol_ids),
+        semantic_call_targets=list(cls.semantic_call_targets),
+        semantic_type_refs=list(cls.semantic_type_refs),
+        semantic_def_use=list(cls.semantic_def_use),
+        semantic_symbol_identities=list(cls.semantic_symbol_identities),
     )
 
 
@@ -305,7 +402,7 @@ class AnalysisCache:
 
     def __init__(self, max_entries: int = 128) -> None:
         self.max_entries = max(0, int(max_entries))
-        self._items: OrderedDict[tuple[str, str, tuple[str, ...], str, str], FileAnalysis] = (
+        self._items: OrderedDict[tuple[str, str, str, tuple[str, ...], str, str], FileAnalysis] = (
             OrderedDict()
         )
         self.hits = 0
@@ -319,13 +416,14 @@ class AnalysisCache:
         compile_args: list[str] | None,
         repo_root: str | None,
         build_info: dict[str, object] | None,
-    ) -> tuple[str, str, tuple[str, ...], str, str]:
+        project_id: str | None,
+    ) -> tuple[str, str, str, tuple[str, ...], str, str]:
         digest = hashlib.sha1(
             content.encode("utf-8", errors="surrogatepass")
         ).hexdigest()
         build_key = json.dumps(build_info or {}, sort_keys=True, default=str)
         root_key = os.path.abspath(repo_root) if repo_root else ""
-        return (filepath, root_key, tuple(compile_args or ()), build_key, digest)
+        return (project_id or "", filepath, root_key, tuple(compile_args or ()), build_key, digest)
 
     def get_or_analyze(
         self,
@@ -337,6 +435,7 @@ class AnalysisCache:
         compile_args: list[str] | None,
         repo_root: str | None,
         build_info: dict[str, object] | None,
+        project_id: str | None,
         analyzer: Callable[..., FileAnalysis],
     ) -> FileAnalysis:
         if self.max_entries <= 0:
@@ -349,9 +448,12 @@ class AnalysisCache:
                 compile_args=compile_args,
                 repo_root=repo_root,
                 build_info=build_info,
+                project_id=project_id,
             )
 
-        key = self._key(content, filepath, compile_args, repo_root, build_info)
+        key = self._key(
+            content, filepath, compile_args, repo_root, build_info, project_id
+        )
         cached = self._items.get(key)
         if cached is not None:
             self._items.move_to_end(key)
@@ -367,6 +469,7 @@ class AnalysisCache:
             compile_args=compile_args,
             repo_root=repo_root,
             build_info=build_info,
+            project_id=project_id,
         )
         self._items[key] = _clone_file_analysis(analysis)
         self._items.move_to_end(key)
@@ -725,7 +828,9 @@ class BuildContextResolver:
         self.repo_root = os.path.abspath(repo_root) if repo_root else None
         self.repo_dir = os.path.abspath(repo_dir) if repo_dir else None
         self._cache: dict[str, tuple[dict, list[str], object | None]] = {}
-        self._macro_cache: OrderedDict[tuple[str, str, tuple[str, ...]], ProjectIndex] = OrderedDict()
+        self._macro_cache: OrderedDict[
+            tuple[str, str, str, tuple[str, ...], str], ProjectIndex
+        ] = OrderedDict()
         self._macro_cache_max_entries = int(os.environ.get("CPPMEGA_COMMIT_MACRO_CACHE_ENTRIES", "16"))
 
     def _record_repo_root(self, record: dict) -> str | None:
@@ -786,6 +891,8 @@ class BuildContextResolver:
         repo_root: str | None,
         filepath: str,
         compile_args: list[str] | None,
+        project_id: str,
+        usage_texts: Sequence[str] | None = None,
     ) -> ProjectIndex | None:
         """Return an include-aware macro index for this commit file.
 
@@ -804,7 +911,26 @@ class BuildContextResolver:
         root_file = os.path.normpath(root_file)
         if not os.path.exists(root_file):
             return None
-        key = (root, os.path.relpath(root_file, root), tuple(compile_args or ()))
+        stable_project_id = require_project_identity(
+            project_id,
+            source=f"macro_index_for({filepath})",
+        )
+        usage_names = sorted({
+            match.group(0)
+            for text in (usage_texts or ())
+            for match in _iter_code_identifiers(text)
+        })
+        usage_fingerprint = hashlib.sha1(
+            "\0".join(usage_names).encode("utf-8")
+        ).hexdigest()
+        relative_root_file = os.path.relpath(root_file, root)
+        key = (
+            stable_project_id,
+            root,
+            relative_root_file,
+            tuple(compile_args or ()),
+            usage_fingerprint,
+        )
         cached = self._macro_cache.get(key)
         if cached is not None:
             self._macro_cache.move_to_end(key)
@@ -820,7 +946,13 @@ class BuildContextResolver:
             index,
             [root_file],
             project_dir=root,
+            project_id=stable_project_id,
             include_dirs=include_dirs,
+            macro_usage_texts_by_file=(
+                {relative_root_file: list(usage_texts)}
+                if usage_texts is not None
+                else None
+            ),
         )
         self._macro_cache[key] = index
         self._macro_cache.move_to_end(key)
@@ -838,6 +970,7 @@ def analyze_file_clang(
     compile_args: list[str] | None = None,
     repo_root: str | None = None,
     build_info: dict[str, object] | None = None,
+    project_id: str,
 ) -> FileAnalysis:
     """Parse a single file's content with libclang and extract functions/classes.
 
@@ -845,6 +978,10 @@ def analyze_file_clang(
     includes and compile_commands flags describe the real translation unit.
     Fall back to a temp source only when no repository root is available.
     """
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"analyze_file_clang({filepath})",
+    )
     if not content or len(content) < 20:
         return FileAnalysis(preamble='')
 
@@ -873,13 +1010,24 @@ def analyze_file_clang(
             # unrelated records and was the main per-process RSS amplifier.
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
-    except Exception:
-        return FileAnalysis(preamble='')
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
 
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
         content,
         tu,
         source_path,
+    )
+    identity_project_dir = repo_root or tmpdir
+    semantic_metadata = extract_semantic_metadata(
+        content,
+        tu,
+        source_path,
+        project_dir=identity_project_dir,
+        project_id=stable_project_id,
+        fallback_file=filepath,
     )
     byte_to_char = _byte_to_char_mapper(content)
 
@@ -910,7 +1058,7 @@ def analyze_file_clang(
             return
 
         if cursor.kind in FUNCTION_KINDS and cursor.is_definition():
-            text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
+            text, func_ast_depth, func_sibling_index, func_ast_node_type, offsets = (
                 _cursor_text_and_metadata(
                     cursor,
                     content,
@@ -921,32 +1069,72 @@ def analyze_file_clang(
                     ast_node_type,
                 )
             )
-            if text and len(text) >= 20:
-                callees, baselib_callees = extract_callees(cursor)
-                referenced_types = extract_referenced_types(cursor)
+            if text and len(text) >= 20 and offsets is not None:
+                callee_refs, baselib_callee_refs = extract_callee_references(
+                    cursor,
+                    project_dir=identity_project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=filepath,
+                )
+                referenced_type_refs = extract_referenced_type_references(
+                    cursor,
+                    project_dir=identity_project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=filepath,
+                )
                 qname = get_qualified_name(cursor)
+                symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=identity_project_dir,
+                    project=stable_project_id,
+                    fallback_file=filepath,
+                )
                 start_line = cursor.extent.start.line
                 end_line = cursor.extent.end.line
+                start_offset, end_offset = offsets
                 functions.append(FunctionDef(
                     name=cursor.spelling,
                     qualified_name=qname,
                     file=filepath,
                     line=start_line,
                     text=text,
-                    callees=callees,
+                    callees=[str(ref["qname"]) for ref in callee_refs],
                     is_definition=True,
                     end_line=end_line,
                     ast_depth=func_ast_depth,
                     sibling_index=func_sibling_index,
                     ast_node_type=func_ast_node_type,
-                    referenced_types=referenced_types,
-                    baselib_callees=baselib_callees,
+                    referenced_types=[str(ref["qname"]) for ref in referenced_type_refs],
+                    baselib_callees=[str(ref["qname"]) for ref in baselib_callee_refs],
+                    symbol_key=symbol_key,
+                    usr=usr,
+                    canonical_signature=canonical_signature,
+                    symbol_kind=getattr(cursor.kind, "name", str(cursor.kind)),
+                    callee_keys=[str(ref["symbol_key"]) for ref in callee_refs],
+                    referenced_type_keys=[
+                        str(ref["symbol_key"]) for ref in referenced_type_refs
+                    ],
+                    callee_refs=callee_refs,
+                    baselib_callee_refs=baselib_callee_refs,
+                    referenced_type_refs=referenced_type_refs,
+                    semantic_symbol_ids=semantic_metadata["symbol_ids"][start_offset:end_offset],
+                    semantic_call_targets=semantic_metadata["call_targets"][start_offset:end_offset],
+                    semantic_type_refs=semantic_metadata["type_refs"][start_offset:end_offset],
+                    semantic_def_use=semantic_metadata["def_use"][start_offset:end_offset],
+                    semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                        semantic_metadata,
+                        semantic_metadata["symbol_ids"][start_offset:end_offset],
+                        semantic_metadata["call_targets"][start_offset:end_offset],
+                        semantic_metadata["type_refs"][start_offset:end_offset],
+                        source=f"{filepath}:{start_line}:{qname}",
+                    ),
                 ))
 
         elif cursor.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL,
-                              CursorKind.CLASS_TEMPLATE):
+                              CursorKind.CLASS_TEMPLATE,
+                              CursorKind.CLASS_TEMPLATE_PARTIAL_SPECIALIZATION):
             if cursor.is_definition():
-                text, cls_ast_depth, cls_sibling_index, cls_ast_node_type, _offsets = (
+                text, cls_ast_depth, cls_sibling_index, cls_ast_node_type, offsets = (
                     _cursor_text_and_metadata(
                         cursor,
                         content,
@@ -957,17 +1145,54 @@ def analyze_file_clang(
                         ast_node_type,
                     )
                 )
-                if text and len(text) >= 20:
+                if text and len(text) >= 20 and offsets is not None:
                     qname = get_qualified_name(cursor)
+                    symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                        cursor,
+                        project_dir=identity_project_dir,
+                        project=stable_project_id,
+                        fallback_file=filepath,
+                    )
+                    member_symbol_keys = []
+                    for child in cursor.get_children():
+                        if child.kind not in FUNCTION_KINDS:
+                            continue
+                        member_key, _member_usr, _member_signature = symbol_identity_for_cursor(
+                            child,
+                            project_dir=identity_project_dir,
+                            project=stable_project_id,
+                            fallback_file=filepath,
+                        )
+                        member_symbol_keys.append(member_key)
+                    start_offset, end_offset = offsets
                     classes.append(ClassDef(
                         name=cursor.spelling,
                         qualified_name=qname,
                         text=text,
                         start_line=cursor.extent.start.line,
                         end_line=cursor.extent.end.line,
+                        file=filepath,
+                        symbol_key=symbol_key,
+                        usr=usr,
+                        canonical_signature=canonical_signature,
+                        symbol_kind=getattr(cursor.kind, "name", str(cursor.kind)),
+                        member_symbol_keys=member_symbol_keys,
                         ast_depth=cls_ast_depth,
                         sibling_index=cls_sibling_index,
                         ast_node_type=cls_ast_node_type,
+                        semantic_symbol_ids=semantic_metadata["symbol_ids"][start_offset:end_offset],
+                        semantic_call_targets=semantic_metadata["call_targets"][start_offset:end_offset],
+                        semantic_type_refs=semantic_metadata["type_refs"][start_offset:end_offset],
+                        semantic_def_use=semantic_metadata["def_use"][start_offset:end_offset],
+                        semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                            semantic_metadata,
+                            semantic_metadata["symbol_ids"][start_offset:end_offset],
+                            semantic_metadata["call_targets"][start_offset:end_offset],
+                            semantic_metadata["type_refs"][start_offset:end_offset],
+                            source=(
+                                f"{filepath}:{cursor.extent.start.line}:{qname}"
+                            ),
+                        ),
                     ))
                 # Recurse into class children to extract inline methods,
                 # constructors, and destructors defined inside the class body.
@@ -1030,12 +1255,9 @@ def find_changed_classes(
 
 @dataclass
 class SymbolEntry:
-    """A symbol (function or class) with a stable integer ID.
-
-    ID scheme: functions are numbered 0..N-1, classes are numbered N..N+M-1
-    where N = len(analysis.functions), M = len(analysis.classes).
-    """
+    """A function or class keyed by its canonical clang identity."""
     id: int
+    symbol_key: str
     name: str
     qualified_name: str
     kind: str  # 'function' or 'class'
@@ -1044,24 +1266,22 @@ class SymbolEntry:
 
 
 def build_symbol_table(analysis: FileAnalysis) -> list[SymbolEntry]:
-    """Build a flat symbol table from functions and classes.
-
-    Functions get IDs 0..N-1, classes get IDs N..N+M-1.
-    """
+    """Build a flat symbol table using deterministic canonical symbol IDs."""
     symbols: list[SymbolEntry] = []
-    for i, func in enumerate(analysis.functions):
+    for func in analysis.functions:
         symbols.append(SymbolEntry(
-            id=i,
+            id=func.symbol_id,
+            symbol_key=func.symbol_key,
             name=func.name,
             qualified_name=func.qualified_name,
             kind='function',
             start_line=func.line,
             end_line=func.end_line,
         ))
-    n_funcs = len(analysis.functions)
-    for j, cls in enumerate(analysis.classes):
+    for cls in analysis.classes:
         symbols.append(SymbolEntry(
-            id=n_funcs + j,
+            id=cls.symbol_id,
+            symbol_key=cls.symbol_key,
             name=cls.name,
             qualified_name=cls.qualified_name,
             kind='class',
@@ -1077,19 +1297,17 @@ def compute_changed_symbol_ids(
 ) -> list[int]:
     """Return stable IDs of symbols whose line spans overlap changed lines.
 
-    Uses the same ID scheme as build_symbol_table(): functions first, then
-    classes.
+    IDs are derived from canonical clang USR/signature identities.
     """
     ids: list[int] = []
-    for i, func in enumerate(analysis.functions):
+    for func in analysis.functions:
         func_lines = set(range(func.line, func.end_line + 1))
         if func_lines & changed_line_set:
-            ids.append(i)
-    n_funcs = len(analysis.functions)
-    for j, cls in enumerate(analysis.classes):
+            ids.append(func.symbol_id)
+    for cls in analysis.classes:
         cls_lines = set(range(cls.start_line, cls.end_line + 1))
         if cls_lines & changed_line_set:
-            ids.append(n_funcs + j)
+            ids.append(cls.symbol_id)
     return ids
 
 
@@ -1125,30 +1343,32 @@ def compute_ripple_candidates(
 
     symbols = build_symbol_table(analysis)
     id_to_sym = {s.id: s for s in symbols}
-    n_funcs = len(analysis.functions)
+    functions_by_id = {func.symbol_id: func for func in analysis.functions}
+    classes_by_id = {cls.symbol_id: cls for cls in analysis.classes}
+    local_index = analysis.build_local_index()
 
-    # Build reverse call graph: callee_qname -> list of caller symbol IDs
+    # Build reverse call graph by canonical callee identity.
     callee_to_callers: dict[str, list[int]] = defaultdict(list)
-    for i, func in enumerate(analysis.functions):
-        for callee_qname in func.callees:
-            callee_to_callers[callee_qname].append(i)
+    for func in analysis.functions:
+        for callee_key in local_index._function_callee_keys(func):
+            callee_to_callers[callee_key].append(func.symbol_id)
 
-    # Build class membership: class_qname -> list of function symbol IDs
-    # (functions whose qualified_name starts with "ClassName::")
+    # Class membership is captured from clang semantic children during parsing.
     class_members: dict[str, list[int]] = defaultdict(list)
-    for j, cls in enumerate(analysis.classes):
-        prefix = cls.qualified_name + '::'
-        for i, func in enumerate(analysis.functions):
-            if func.qualified_name.startswith(prefix):
-                class_members[cls.qualified_name].append(i)
+    known_function_keys = {func.symbol_key: func.symbol_id for func in analysis.functions}
+    for cls in analysis.classes:
+        for member_key in cls.member_symbol_keys:
+            member_id = known_function_keys.get(member_key)
+            if member_id is not None:
+                class_members[cls.symbol_key].append(member_id)
 
-    # Build type usage: for each function, which classes appear in its line range
-    # (heuristic: class name appears in function text)
+    class_keys = {cls.symbol_key: cls.symbol_id for cls in analysis.classes}
     func_uses_class: dict[int, list[int]] = defaultdict(list)
-    for i, func in enumerate(analysis.functions):
-        for j, cls in enumerate(analysis.classes):
-            if cls.name in func.text:
-                func_uses_class[i].append(n_funcs + j)
+    for func in analysis.functions:
+        for type_key in func.referenced_type_keys:
+            class_id = class_keys.get(type_key)
+            if class_id is not None:
+                func_uses_class[func.symbol_id].append(class_id)
 
     result = []
     for changed_id in changed_symbol_ids:
@@ -1161,59 +1381,58 @@ def compute_ripple_candidates(
 
         if sym.kind == 'function':
             # BFS through reverse call graph to find callers
-            queue = deque([(sym.qualified_name, 1)])
-            visited_qnames: set[str] = {sym.qualified_name}
+            queue = deque([(sym.symbol_key, 1)])
+            visited_keys: set[str] = {sym.symbol_key}
             while queue:
-                qname, depth = queue.popleft()
+                symbol_key, depth = queue.popleft()
                 if depth > max_depth:
                     continue
-                for caller_id in callee_to_callers.get(qname, []):
+                for caller_id in callee_to_callers.get(symbol_key, []):
                     if caller_id not in seen:
                         seen.add(caller_id)
-                        caller_func = analysis.functions[caller_id]
+                        caller_func = functions_by_id[caller_id]
                         candidates.append({
-                            'symbol_id': caller_id,
+                            'symbol_id': caller_func.symbol_id,
                             'symbol_name': caller_func.qualified_name,
                             'relation': 'caller',
                             'depth': depth,
                         })
-                        if depth < max_depth and caller_func.qualified_name not in visited_qnames:
-                            visited_qnames.add(caller_func.qualified_name)
-                            queue.append((caller_func.qualified_name, depth + 1))
+                        if depth < max_depth and caller_func.symbol_key not in visited_keys:
+                            visited_keys.add(caller_func.symbol_key)
+                            queue.append((caller_func.symbol_key, depth + 1))
 
             # co_member: other methods in the same class
-            for cls_qname, member_ids in class_members.items():
+            for _class_key, member_ids in class_members.items():
                 if changed_id in member_ids:
                     for mid in member_ids:
                         if mid not in seen:
                             seen.add(mid)
                             candidates.append({
                                 'symbol_id': mid,
-                                'symbol_name': analysis.functions[mid].qualified_name,
+                                'symbol_name': functions_by_id[mid].qualified_name,
                                 'relation': 'co_member',
                                 'depth': 1,
                             })
 
         elif sym.kind == 'class':
-            cls_idx = changed_id - n_funcs
-            cls = analysis.classes[cls_idx]
-            # type_dependent: functions that mention this class
-            for i, func in enumerate(analysis.functions):
-                if i not in seen and cls.name in func.text:
-                    seen.add(i)
+            cls = classes_by_id[changed_id]
+            # type_dependent: functions with an exact clang TYPE_REF to this class.
+            for func in analysis.functions:
+                if func.symbol_id not in seen and changed_id in func_uses_class[func.symbol_id]:
+                    seen.add(func.symbol_id)
                     candidates.append({
-                        'symbol_id': i,
+                        'symbol_id': func.symbol_id,
                         'symbol_name': func.qualified_name,
                         'relation': 'type_dependent',
                         'depth': 1,
                     })
             # co_member: methods of this class
-            for mid in class_members.get(cls.qualified_name, []):
+            for mid in class_members.get(cls.symbol_key, []):
                 if mid not in seen:
                     seen.add(mid)
                     candidates.append({
                         'symbol_id': mid,
-                        'symbol_name': analysis.functions[mid].qualified_name,
+                        'symbol_name': functions_by_id[mid].qualified_name,
                         'relation': 'co_member',
                         'depth': 1,
                     })
@@ -1245,30 +1464,30 @@ def extract_function_chain(
     idx = analysis.build_local_index()
 
     # Collect all transitive deps for each changed function
-    all_qnames = set()
+    all_symbol_keys: set[str] = set()
     for i in changed_indices:
         func = analysis.functions[i]
-        all_qnames.add(func.qualified_name)
+        all_symbol_keys.add(func.symbol_key)
         # BFS through local call graph
-        visited = {func.qualified_name}
-        queue = deque([(func.qualified_name, 0)])
+        visited = {func.symbol_key}
+        queue = deque([(func.symbol_key, 0)])
         while queue:
-            qname, depth = queue.popleft()
+            symbol_key, depth = queue.popleft()
             if depth >= max_depth:
                 continue
-            f = idx.functions.get(qname)
+            f = idx.functions.get(symbol_key)
             if not f:
                 continue
-            for callee in f.callees:
+            for callee in idx._function_callee_keys(f):
                 if callee not in visited and callee in idx.functions:
                     visited.add(callee)
-                    all_qnames.add(callee)
+                    all_symbol_keys.add(callee)
                     queue.append((callee, depth + 1))
 
     # Collect FunctionDefs, sorted by dep_level (leaves first)
     result = []
     for func in analysis.functions:
-        if func.qualified_name in all_qnames:
+        if func.symbol_key in all_symbol_keys:
             result.append(func)
     result.sort(key=lambda f: f.dep_level)
     return result
@@ -1317,17 +1536,7 @@ def _macro_dependency_parts_for_commit_targets(
             chunk_claim_stats["commit_macro_chunks_claimed"] = (
                 chunk_claim_stats.get("commit_macro_chunks_claimed", 0) + 1
             )
-        parts.append(
-            (
-                macro.text,
-                MACRO_KIND,
-                0,
-                macro.name,
-                None,
-                None,
-                _macro_part_metadata(macro),
-            )
-        )
+        parts.append(_macro_part(macro))
     return parts
 
 
@@ -1530,14 +1739,14 @@ def format_chain_document(
             cls = old_analysis.classes[ci]
             if not _claim_part(cls.text):
                 continue
-            parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+            parts_info.append(_class_part(cls))
             section_kinds.append('o')
             macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
             semantic_parts += 1
         for func in old_chain:
             if not _claim_part(func.text):
                 continue
-            parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+            parts_info.append(_function_part(func, kind=3))
             section_kinds.append('o')
             macro_targets.append((func.text, func.file, func.end_line))
             semantic_parts += 1
@@ -1555,14 +1764,14 @@ def format_chain_document(
             cls = new_analysis.classes[ci]
             if not _claim_part(cls.text):
                 continue
-            parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+            parts_info.append(_class_part(cls))
             section_kinds.append('n')
             macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
             semantic_parts += 1
         for func in new_chain:
             if not _claim_part(func.text):
                 continue
-            parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+            parts_info.append(_function_part(func, kind=3))
             section_kinds.append('n')
             macro_targets.append((func.text, func.file, func.end_line))
             semantic_parts += 1
@@ -1647,13 +1856,13 @@ def format_diff_document(
         cls = old_analysis.classes[ci]
         if not _claim_part(cls.text):
             continue
-        parts_info.append((cls.text, 4, 0, cls.name, cls.qualified_name))
+        parts_info.append(_class_part(cls))
         section_kinds.append('o')
         macro_targets.append((cls.text, record.get('filepath'), cls.end_line))
     for func in old_chain:
         if not _claim_part(func.text):
             continue
-        parts_info.append((func.text, 3, func.dep_level, func.name, func.qualified_name))
+        parts_info.append(_function_part(func, kind=3))
         section_kinds.append('o')
         macro_targets.append((func.text, func.file, func.end_line))
 
@@ -1696,13 +1905,13 @@ def _analysis_ast_maps(
         return {}
     result: dict[str, tuple[list[int], list[int], list[int]]] = {}
     for func in analysis.functions:
-        result[func.qualified_name] = (
+        result[func.symbol_key] = (
             func.ast_depth,
             func.sibling_index,
             func.ast_node_type,
         )
     for cls in analysis.classes:
-        result[cls.qualified_name] = (
+        result[cls.symbol_key] = (
             cls.ast_depth,
             cls.sibling_index,
             cls.ast_node_type,
@@ -1765,22 +1974,43 @@ def _build_enriched_from_parts(
     chunk_boundaries = []
     offset = 0
 
-    # Maps for edge computation: chunk_idx -> (qname, callees_list)
-    chunk_qnames: dict[int, str] = {}
+    # Edge routing uses (commit section, canonical symbol key), never qname.
+    chunk_symbols: dict[int, tuple[str, str]] = {}
     chunk_callees: dict[int, list[str]] = {}
-    chunk_all_qnames: dict[int, str] = {}
+    chunk_all_symbols: dict[int, tuple[str, str]] = {}
     chunk_types: dict[int, list[str]] = {}
 
-    # Merge functions from both analyses for callee lookup
-    all_funcs: dict[str, FunctionDef] = {}
-    for func in old_analysis.functions:
-        all_funcs[func.qualified_name] = func
-    if new_analysis:
-        for func in new_analysis.functions:
-            all_funcs[func.qualified_name] = func
+    old_funcs = {func.symbol_key: func for func in old_analysis.functions}
+    new_funcs = {
+        func.symbol_key: func for func in (new_analysis.functions if new_analysis else [])
+    }
+    old_classes = {cls.symbol_key: cls for cls in old_analysis.classes}
+    new_classes = {
+        cls.symbol_key: cls for cls in (new_analysis.classes if new_analysis else [])
+    }
     semantic_index = ProjectIndex()
-    for func in all_funcs.values():
+    for func in old_funcs.values():
         semantic_index.add_function(func)
+    for func in new_funcs.values():
+        semantic_index.add_function(func)
+    for cls in list(old_classes.values()) + list(new_classes.values()):
+        semantic_index.add_typedef(TypeDef(
+            name=cls.name,
+            qualified_name=cls.qualified_name,
+            file=cls.file,
+            line=cls.start_line,
+            end_line=cls.end_line,
+            text=cls.text,
+            kind=4,
+            symbol_key=cls.symbol_key,
+            usr=cls.usr,
+            canonical_signature=cls.canonical_signature,
+            symbol_kind=cls.symbol_kind,
+        ))
+        semantic_index.symbol_id_registry.register_records(
+            cls.semantic_symbol_identities,
+            source=f"commit class:{cls.file}:{cls.start_line}:{cls.qualified_name}",
+        )
     for part in parts_info:
         metadata = _part_macro_provenance(part)
         if metadata is None:
@@ -1797,6 +2027,10 @@ def _build_enriched_from_parts(
                 file=file,
                 line=line,
                 text=part[0],
+                project_id=require_project_identity(
+                    metadata.get("project_id"),
+                    source=f"commit macro metadata {file}:{line}:{name}",
+                ),
                 visible_in_file=str(metadata.get("visible_in_file") or file),
                 visible_line=int(metadata.get("visible_line") or line),
                 sequence=sequence,
@@ -1809,8 +2043,19 @@ def _build_enriched_from_parts(
         )
     old_ast = _analysis_ast_maps(old_analysis)
     new_ast = _analysis_ast_maps(new_analysis)
+    part_functions: dict[int, FunctionDef] = {}
+    part_semantic_arrays: dict[int, dict[str, object]] = {}
     macro_route_parts: list[dict[str, object]] = []
     macro_invocation_routes: list[dict[str, object]] = []
+
+    def _unique_qname_value(values, qname: str):
+        normalized_qname = normalize_qualified_name(qname)
+        matches = [
+            value
+            for value in values
+            if normalize_qualified_name(value.qualified_name) == normalized_qname
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
@@ -1822,12 +2067,30 @@ def _build_enriched_from_parts(
         for j in range(offset, offset + part_len):
             structure_ids[j] = kind
         source_kind = section_kinds[i] if section_kinds and i < len(section_kinds) else 'c'
+        symbol_key = _part_symbol_key(part)
+        if source_kind == 'n':
+            source_funcs = new_funcs
+            source_classes = new_classes
+        elif source_kind == 'o':
+            source_funcs = old_funcs
+            source_classes = old_classes
+        else:
+            source_funcs = {**old_funcs, **new_funcs}
+            source_classes = {**old_classes, **new_classes}
+        func = source_funcs.get(symbol_key) if symbol_key else None
+        cls = source_classes.get(symbol_key) if symbol_key else None
+        if symbol_key is None and isinstance(qname, str):
+            func = _unique_qname_value(source_funcs.values(), qname)
+            cls = _unique_qname_value(source_classes.values(), qname)
+            selected = func or cls
+            symbol_key = selected.symbol_key if selected is not None else None
+
         part_ast: tuple[list[int], list[int], list[int]] | None = None
-        if qname:
+        if symbol_key:
             if source_kind == 'n':
-                part_ast = new_ast.get(qname) or old_ast.get(qname)
+                part_ast = new_ast.get(symbol_key)
             else:
-                part_ast = old_ast.get(qname) or new_ast.get(qname)
+                part_ast = old_ast.get(symbol_key)
         elif kind == 1:
             analysis = new_analysis if source_kind == 'n' and new_analysis else old_analysis
             if analysis and len(analysis.preamble_ast_depth) >= part_len:
@@ -1845,21 +2108,49 @@ def _build_enriched_from_parts(
             source=part_ast,
         )
 
-        chunk_boundaries.append({
+        boundary = {
             'start': offset,
             'end': offset + part_len,
             'kind': kind,
             'dep_level': dep_level,
             'name': name,
-        })
+        }
+        symbol_metadata = _part_symbol_metadata(part)
+        if symbol_metadata is not None:
+            boundary['symbol_id'] = int(symbol_metadata['symbol_id'])
+        chunk_boundaries.append(boundary)
 
-        if qname:
-            chunk_all_qnames[i] = qname
-        if qname and qname in all_funcs:
-            func = all_funcs[qname]
-            chunk_qnames[i] = qname
-            chunk_callees[i] = func.callees
-            chunk_types[i] = getattr(func, 'referenced_types', [])
+        if symbol_key and (func is not None or cls is not None):
+            chunk_all_symbols[i] = (source_kind, symbol_key)
+        if func is not None and symbol_key:
+            chunk_symbols[i] = (source_kind, symbol_key)
+            callee_keys: list[str] = []
+            for reference in list(func.callee_refs) + list(func.baselib_callee_refs):
+                key = reference.get('symbol_key')
+                if isinstance(key, str) and key and key not in callee_keys:
+                    callee_keys.append(key)
+            for key in list(func.callee_keys):
+                if key and key not in callee_keys:
+                    callee_keys.append(key)
+            if not callee_keys:
+                for display_name in func.callees:
+                    key = semantic_index.resolve_function_key(display_name)
+                    if key is not None and key not in callee_keys:
+                        callee_keys.append(key)
+            chunk_callees[i] = callee_keys
+            type_keys = list(func.referenced_type_keys)
+            for reference in func.referenced_type_refs:
+                key = reference.get('symbol_key')
+                if isinstance(key, str) and key and key not in type_keys:
+                    type_keys.append(key)
+            chunk_types[i] = type_keys
+            part_functions[i] = func
+            part_semantic_arrays[i] = {
+                'symbol_ids': func.semantic_symbol_ids,
+                'call_targets': func.semantic_call_targets,
+                'type_refs': func.semantic_type_refs,
+                'def_use': func.semantic_def_use,
+            }
             macro_invocation_routes.extend(
                 _macro_invocation_route_parts(
                     part_text,
@@ -1869,6 +2160,13 @@ def _build_enriched_from_parts(
                     start_line=func.line,
                 )
             )
+        elif cls is not None:
+            part_semantic_arrays[i] = {
+                'symbol_ids': cls.semantic_symbol_ids,
+                'call_targets': cls.semantic_call_targets,
+                'type_refs': cls.semantic_type_refs,
+                'def_use': cls.semantic_def_use,
+            }
         macro_route_part = _macro_route_part(
             part_text,
             offset=offset,
@@ -1883,29 +2181,53 @@ def _build_enriched_from_parts(
 
     # Compute call_edges between chunks
     call_edges = []
-    for ci, caller_qname in chunk_qnames.items():
+    for ci, (source_kind, _caller_symbol) in chunk_symbols.items():
         callees = chunk_callees.get(ci, [])
-        for callee_qname in callees:
-            for cj, target_qname in chunk_qnames.items():
-                if ci != cj and target_qname == callee_qname:
+        for callee_symbol in callees:
+            for cj, target_symbol in chunk_symbols.items():
+                if ci != cj and target_symbol == (source_kind, callee_symbol):
                     call_edges.append({'from': ci, 'to': cj})
 
     # Compute type_edges: function chunk referencing type T -> chunk defining T.
     type_edges: list[dict[str, object]] = []
     for ci, ref_types in chunk_types.items():
-        for t in ref_types:
-            for cj, q in chunk_all_qnames.items():
-                if ci != cj and q == t:
+        source_kind = chunk_symbols[ci][0]
+        for type_symbol in ref_types:
+            for cj, target_symbol in chunk_all_symbols.items():
+                if ci != cj and target_symbol == (source_kind, type_symbol):
                     type_edges.append({'from': ci, 'to': cj})
 
     semantic_meta = extract_semantic_metadata_from_parts(
         full_text,
         parts_info,
         semantic_index,
+        part_functions=part_functions,
+        part_semantic_arrays=part_semantic_arrays,
+    )
+    ripple_symbol_ids = [
+        int(symbol_id)
+        for ripple in (ripple_candidates or [])
+        for symbol_id in (
+            [ripple.get('changed_symbol_id')]
+            + [candidate.get('symbol_id') for candidate in ripple.get('candidates', [])]
+        )
+        if symbol_id is not None
+    ]
+    symbol_identities = _document_symbol_identities(
+        parts_info,
+        semantic_index,
+        semantic_meta['symbol_ids'],
+        semantic_meta['call_targets'],
+        semantic_meta['type_refs'],
+        changed_symbol_ids or [],
+        ripple_symbol_ids,
+        source=str(record.get('filepath') or 'clang commit document'),
     )
 
     result: dict = {
         'text': full_text,
+        'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: symbol_identities,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         'call_edges': call_edges,
@@ -1920,6 +2242,36 @@ def _build_enriched_from_parts(
         'changed_symbol_ids': changed_symbol_ids or [],
         'ripple_candidates': ripple_candidates or [],
     }
+    typed_message_parts = [
+        value.strip()
+        for value in (record.get('subject'), record.get('body'))
+        if isinstance(value, str) and value.strip()
+    ]
+    typed_commit_message = '\n\n'.join(typed_message_parts)
+    typed_section_kinds = section_kinds or ['c'] * len(texts)
+    result.update(
+        {
+            # These fields come from typed upstream values. Downstream objective
+            # code must never recover them by parsing rendered doc wrappers.
+            'ifim_instruction_text': typed_commit_message,
+            'commit_msg_text': typed_commit_message,
+            'pre_text': '\n\n'.join(
+                text
+                for text, section_kind in zip(texts, typed_section_kinds)
+                if section_kind == 'o'
+            ),
+            'post_text': '\n\n'.join(
+                text
+                for text, section_kind in zip(texts, typed_section_kinds)
+                if section_kind == 'n'
+            ),
+            'diff_text': (
+                record.get('diff', '')
+                if isinstance(record.get('diff', ''), str)
+                else ''
+            ),
+        }
+    )
     # Commit docs are also C++ world-code documents.  When macro dependency
     # parts are present, route use-sites by original source line instead of
     # assembled lexical order, matching the static code path.
@@ -1927,6 +2279,8 @@ def _build_enriched_from_parts(
         _cpp_domain_sidecars(
             full_text,
             semantic_index,
+            source_doc_id=1,
+            source_path=str(record.get("filepath") or "commit.cpp"),
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         )
@@ -1934,7 +2288,7 @@ def _build_enriched_from_parts(
     temporal_meta = _build_commit_temporal_metadata(
         full_text,
         texts,
-        section_kinds or ['c'] * len(texts),
+        typed_section_kinds,
         record=record,
         old_analysis=old_analysis,
         new_analysis=new_analysis,
@@ -2026,6 +2380,8 @@ def _load_tokenizer(path: Optional[str]):
             from tokenizers import Tokenizer  # type: ignore[reportMissingImports]
             _tokenizer = Tokenizer.from_file(path)
             return
+        except SymbolIdentityError:
+            raise
         except Exception:
             pass
     # Fallback: estimate ~4 bytes per token
@@ -2036,6 +2392,70 @@ def count_tokens(text: str) -> int:
     if _tokenizer is not None:
         return len(_tokenizer.encode(text).ids)
     return max(1, len(text) // 4)
+
+
+def _stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_filepath_id(repo_name: str, filepath: str) -> str:
+    return hashlib.sha1(
+        f"{repo_name}\0{filepath}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def normalize_record_project_identity(
+    record: dict,
+    *,
+    project_id: str,
+) -> bool:
+    """Normalize one cached record to the explicit canonical project identity.
+
+    Extract caches created before the staged-checkout identity fix may contain
+    ``repo="_src"`` (or another bare directory name).  Those values are safe
+    to replace only when the record does not already contain a different valid
+    canonical project identity.  Stable IDs are always recomputed from the
+    resulting ``owner/repo`` and relative filepath, so a legacy cache cannot
+    carry stale provenance into PR lookup or parquet.
+
+    Returns True when any identity field was repaired.  A conflicting valid
+    project identity raises instead of being silently rewritten.
+    """
+    canonical_project = require_project_identity(
+        project_id,
+        source="process_commits --project-id",
+    )
+    raw_repo = record.get("repo")
+    if isinstance(raw_repo, str) and "/" in raw_repo:
+        parsed_repo = require_project_identity(
+            raw_repo,
+            source=f"commit record {record.get('commit_hash') or '<unknown>'}:repo",
+        )
+        if parsed_repo != canonical_project:
+            raise SymbolIdentityError(
+                f"commit record {record.get('commit_hash') or '<unknown>'}: "
+                f"record project identity {parsed_repo!r} conflicts with "
+                f"--project-id {canonical_project!r}"
+            )
+
+    filepath = record.get("filepath")
+    if not isinstance(filepath, str) or not filepath:
+        raise SymbolIdentityError(
+            f"commit record {record.get('commit_hash') or '<unknown>'}: "
+            f"cannot recompute filepath identity without a non-empty filepath, "
+            f"got {filepath!r}"
+        )
+    expected_repo_id = _stable_repo_id(canonical_project)
+    expected_filepath_id = _stable_filepath_id(canonical_project, filepath)
+    changed = (
+        record.get("repo") != canonical_project
+        or record.get("repo_stable_id") != expected_repo_id
+        or record.get("filepath_stable_id") != expected_filepath_id
+    )
+    record["repo"] = canonical_project
+    record["repo_stable_id"] = expected_repo_id
+    record["filepath_stable_id"] = expected_filepath_id
+    return changed
 
 
 # OUR CppMegaTokenizer (with <SPACE>/<NL> whitespace canonicalization) used ONLY
@@ -2123,6 +2543,10 @@ def process_record(
         return []
 
     filepath = record.get('filepath', 'source.cpp')
+    project_id = require_project_identity(
+        record.get("repo"),
+        source=f"commit record {record.get('commit_hash') or '<unknown>'}",
+    )
     repo_root: str | None = None
     compile_args: list[str] | None = None
     build_info: dict[str, object] = {}
@@ -2149,6 +2573,7 @@ def process_record(
             compile_args=compile_args,
             repo_root=repo_root,
             build_info=build_info,
+            project_id=project_id,
             analyzer=active_analyzer,
         )
         new_analysis = analysis_cache.get_or_analyze(
@@ -2159,6 +2584,7 @@ def process_record(
             compile_args=compile_args,
             repo_root=repo_root,
             build_info=build_info,
+            project_id=project_id,
             analyzer=active_analyzer,
         )
     else:
@@ -2170,6 +2596,7 @@ def process_record(
             compile_args=compile_args,
             repo_root=repo_root,
             build_info=build_info,
+            project_id=project_id,
         )
         new_analysis = active_analyzer(
             new_content,
@@ -2179,6 +2606,7 @@ def process_record(
             compile_args=compile_args,
             repo_root=repo_root,
             build_info=build_info,
+            project_id=project_id,
         )
 
     macro_index = (
@@ -2186,6 +2614,8 @@ def process_record(
             repo_root=repo_root,
             filepath=filepath,
             compile_args=compile_args,
+            project_id=project_id,
+            usage_texts=(old_content, new_content),
         )
         if build_context is not None
         else None
@@ -2247,6 +2677,7 @@ def process_jsonl_file(
     dedup_near: bool = True,
     pr_lookup: "PRDiscussionLookup | None" = None,
     analysis_cache_entries: int = 128,
+    project_id: str | None = None,
 ) -> dict:
     """Process a JSONL input file, writing enriched docs to output.
 
@@ -2267,7 +2698,13 @@ def process_jsonl_file(
         'analysis_cache_hits': 0,
         'analysis_cache_misses': 0,
         'analysis_cache_evictions': 0,
+        'legacy_identity_overrides': 0,
     }
+    canonical_project_id = (
+        require_project_identity(project_id, source="process_commits --project-id")
+        if project_id is not None
+        else None
+    )
     seen_hashes: set[str] = set()
     analysis_cache = (
         AnalysisCache(max_entries=analysis_cache_entries)
@@ -2289,6 +2726,13 @@ def process_jsonl_file(
 
             stats['records_read'] += 1
 
+            if canonical_project_id is not None:
+                if normalize_record_project_identity(
+                    record,
+                    project_id=canonical_project_id,
+                ):
+                    stats['legacy_identity_overrides'] += 1
+
             # Tier-2 PR-store lookup glue: set record['pr_discussion'] from the
             # live store (by pr_number then merge/commit SHA) BEFORE the doc is
             # built, so build_docstring emits the @discussion block at the HEAD.
@@ -2307,6 +2751,8 @@ def process_jsonl_file(
                     chunk_claim_stats=stats,
                     analysis_cache=analysis_cache,
                 )
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 stats['parse_errors'] += 1
                 if stats['parse_errors'] <= 10:
@@ -2399,6 +2845,14 @@ def main() -> int:
         help='Parent directory containing repos named by each record["repo"]',
     )
     parser.add_argument(
+        '--project-id', default=None,
+        help=(
+            'Explicit canonical owner/repo identity for every input record. '
+            'Required by the conveyor so staged _src paths cannot leak into '
+            'PR lookup or output provenance.'
+        ),
+    )
+    parser.add_argument(
         '--memory-limit-gb', type=float, default=10.0,
         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10).',
     )
@@ -2464,6 +2918,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.project_id is not None:
+        try:
+            args.project_id = require_project_identity(
+                args.project_id,
+                source="process_commits --project-id",
+            )
+        except SymbolIdentityError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     start_memory_guard(args.memory_limit_gb, label="process_commits")
 
     print("Clang commit processor starting", file=sys.stderr)
@@ -2477,6 +2940,8 @@ def main() -> int:
         print(f"  repo_root: {args.repo_root}", file=sys.stderr)
     if args.repo_dir:
         print(f"  repo_dir: {args.repo_dir}", file=sys.stderr)
+    if args.project_id:
+        print(f"  project_id: {args.project_id}", file=sys.stderr)
 
     # Configure libclang
     try:
@@ -2558,64 +3023,79 @@ def main() -> int:
         'analysis_cache_hits': 0,
         'analysis_cache_misses': 0,
         'analysis_cache_evictions': 0,
+        'legacy_identity_overrides': 0,
     }
 
-    with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
-        # Use /dev/shm if available for faster temp file I/O
-        shm_tmpdir = None
-        if os.path.isdir('/dev/shm'):
-            shm_tmpdir = tempfile.mkdtemp(prefix='clang_commits_', dir='/dev/shm')
-            actual_tmpdir = shm_tmpdir
-        else:
-            actual_tmpdir = tmpdir
-
-        try:
-            with open(args.output, 'w') as out_f:
-                for input_path in args.inputs:
-                    print(f"\n  Processing {input_path}...", file=sys.stderr)
-                    stats = process_jsonl_file(
-                        input_path, out_f, clang_index, actual_tmpdir,
-                        args.max_tokens, args.max_file_bytes,
-                        args.doc_format, args.max_dep_depth,
-                        args.memory_limit_gb,
-                        build_context=build_context,
-                        dedup_store=dedup_store,
-                        dedup_tokenizer=dedup_tokenizer,
-                        dedup_near=dedup_near,
-                        pr_lookup=pr_lookup,
-                        analysis_cache_entries=args.analysis_cache_entries,
+    try:
+        with atomic_output_file(args.output) as staged_output:
+            with tempfile.TemporaryDirectory(prefix='clang_commits_') as tmpdir:
+                # Use /dev/shm if available for faster temp file I/O
+                shm_tmpdir = None
+                if os.path.isdir('/dev/shm'):
+                    shm_tmpdir = tempfile.mkdtemp(
+                        prefix='clang_commits_', dir='/dev/shm'
                     )
+                    actual_tmpdir = shm_tmpdir
+                else:
+                    actual_tmpdir = tmpdir
 
-                    for k in total_stats:
-                        total_stats[k] += stats[k]
+                try:
+                    with staged_output.open('w') as out_f:
+                        for input_path in args.inputs:
+                            print(f"\n  Processing {input_path}...", file=sys.stderr)
+                            stats = process_jsonl_file(
+                                input_path, out_f, clang_index, actual_tmpdir,
+                                args.max_tokens, args.max_file_bytes,
+                                args.doc_format, args.max_dep_depth,
+                                args.memory_limit_gb,
+                                build_context=build_context,
+                                dedup_store=dedup_store,
+                                dedup_tokenizer=dedup_tokenizer,
+                                dedup_near=dedup_near,
+                                pr_lookup=pr_lookup,
+                                analysis_cache_entries=args.analysis_cache_entries,
+                                project_id=args.project_id,
+                            )
 
-                    print(f"  Done: {stats}", file=sys.stderr)
-        finally:
-            if shm_tmpdir:
-                import shutil
-                shutil.rmtree(shm_tmpdir, ignore_errors=True)
+                            for k in total_stats:
+                                total_stats[k] += stats[k]
 
-    if dedup_store is not None:
-        dedup_store.close()
-    if pr_lookup is not None:
-        print(f"  pr_store: {pr_lookup.hits} discussions attached, "
-              f"{pr_lookup.misses} misses (Tier-1 git-only)", file=sys.stderr)
-        pr_lookup.close()
+                            print(f"  Done: {stats}", file=sys.stderr)
+                finally:
+                    if shm_tmpdir:
+                        import shutil
+                        shutil.rmtree(shm_tmpdir, ignore_errors=True)
+
+            if total_stats['parse_errors'] and not args.allow_parse_errors:
+                raise PartialParseError(
+                    "refusing partial commit range: "
+                    f"{total_stats['parse_errors']} record parse error(s); "
+                    "use --allow-parse-errors only for an explicitly lossy run"
+                )
+    except PartialParseError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if dedup_store is not None:
+            dedup_store.close()
+        if pr_lookup is not None:
+            print(f"  pr_store: {pr_lookup.hits} discussions attached, "
+                  f"{pr_lookup.misses} misses (Tier-1 git-only)", file=sys.stderr)
+            pr_lookup.close()
 
     elapsed = time.time() - t0
     print(f"\nTotal: {total_stats}", file=sys.stderr)
+    if args.project_id:
+        print(
+            "  identity normalization: "
+            f"project_id={args.project_id} "
+            f"legacy_identity_overrides={total_stats['legacy_identity_overrides']}",
+            file=sys.stderr,
+        )
     print(f"Time: {elapsed:.1f}s", file=sys.stderr)
     if total_stats['records_read'] > 0:
         rate = total_stats['records_read'] / elapsed
         print(f"Rate: {rate:.1f} records/sec", file=sys.stderr)
-    if total_stats['parse_errors'] and not args.allow_parse_errors:
-        print(
-            "ERROR: refusing partial commit range: "
-            f"{total_stats['parse_errors']} record parse error(s); "
-            "use --allow-parse-errors only for an explicitly lossy run",
-            file=sys.stderr,
-        )
-        return 1
     return 0
 
 

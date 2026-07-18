@@ -24,6 +24,17 @@ _PRIMES = (
     500_041,
 )
 
+_INTEGER_DTYPES = (
+    mx.int8,
+    mx.int16,
+    mx.int32,
+    mx.int64,
+    mx.uint8,
+    mx.uint16,
+    mx.uint32,
+    mx.uint64,
+)
+
 
 def pick_primes(count: int, target_size: int) -> tuple[int, ...]:
     """Pick cppmega-compatible per-table sizes near target_size."""
@@ -125,24 +136,76 @@ class NgramHashEmbedding(nn.Module):
             ],
         )
 
-    def _shifted_tokens(self, token_ids: mx.array) -> mx.array:
+    def _shifted_tokens(
+        self,
+        token_ids: mx.array,
+        *,
+        document_ids: mx.array | None = None,
+    ) -> mx.array:
         batch, seq = token_ids.shape
         shifted: list[mx.array] = [token_ids]
+        segment_ids: mx.array | None = None
+        if document_ids is not None:
+            if seq == 0:
+                segment_ids = mx.zeros((batch, 0), dtype=mx.int32)
+            else:
+                resets = mx.concatenate(
+                    [
+                        mx.ones((batch, 1), dtype=mx.bool_),
+                        document_ids[:, 1:] != document_ids[:, :-1],
+                    ],
+                    axis=1,
+                )
+                segment_ids = mx.cumsum(resets.astype(mx.int32), axis=1)
         for position in range(1, self.max_order):
             if position >= seq:
                 shifted.append(mx.zeros((batch, seq), dtype=mx.int64))
                 continue
             prefix = mx.zeros((batch, position), dtype=mx.int64)
-            shifted.append(mx.concatenate([prefix, token_ids[:, :-position]], axis=1))
+            values = mx.concatenate([prefix, token_ids[:, :-position]], axis=1)
+            if segment_ids is not None:
+                shifted_segments = mx.concatenate(
+                    [
+                        mx.zeros((batch, position), dtype=segment_ids.dtype),
+                        segment_ids[:, :-position],
+                    ],
+                    axis=1,
+                )
+                values = mx.where(
+                    segment_ids == shifted_segments,
+                    values,
+                    mx.zeros_like(values),
+                )
+            shifted.append(values)
         return mx.stack(shifted, axis=0)
 
-    def _hash_all(self, token_ids: mx.array) -> mx.array:
+    def _hash_all(
+        self,
+        token_ids: mx.array,
+        *,
+        document_ids: mx.array | None = None,
+    ) -> mx.array:
         """Return unified table indices with shape (batch, tables, seq)."""
 
         if len(token_ids.shape) != 2:
             raise ValueError(f"token_ids must have shape (batch, seq), got {token_ids.shape}")
+        if document_ids is not None:
+            if not isinstance(document_ids, mx.array):
+                raise TypeError(
+                    "document_ids must be an mx.array, got "
+                    f"{type(document_ids).__name__}"
+                )
+            if tuple(document_ids.shape) != tuple(token_ids.shape):
+                raise ValueError(
+                    "document_ids must match token_ids shape "
+                    f"{tuple(token_ids.shape)}, got {tuple(document_ids.shape)}"
+                )
+            if document_ids.dtype not in _INTEGER_DTYPES:
+                raise TypeError(
+                    f"document_ids dtype must be integer, got {document_ids.dtype}"
+                )
         token_ids = token_ids.astype(mx.int64)
-        shifted = self._shifted_tokens(token_ids)
+        shifted = self._shifted_tokens(token_ids, document_ids=document_ids)
         mults = mx.expand_dims(mx.expand_dims(self.hash_mults.T, -1), -1)
         mask = mx.expand_dims(mx.expand_dims(self.order_mask, -1), -1)
         product = (mults * mx.expand_dims(shifted, 1)) * mask
@@ -156,8 +219,13 @@ class NgramHashEmbedding(nn.Module):
         hashed = hashed + mx.expand_dims(mx.expand_dims(self.table_offsets, -1), -1)
         return mx.transpose(hashed, (1, 0, 2))
 
-    def __call__(self, token_ids: mx.array) -> mx.array:
-        unified_indices = self._hash_all(token_ids)
+    def __call__(
+        self,
+        token_ids: mx.array,
+        *,
+        document_ids: mx.array | None = None,
+    ) -> mx.array:
+        unified_indices = self._hash_all(token_ids, document_ids=document_ids)
         batch, num_tables, seq = unified_indices.shape
         embeddings = self.unified_table.weight[unified_indices]
         embeddings = mx.reshape(
@@ -168,4 +236,3 @@ class NgramHashEmbedding(nn.Module):
 
 
 CppMegaNgramHashEmbedding = NgramHashEmbedding
-

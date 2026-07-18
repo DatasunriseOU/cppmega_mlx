@@ -9,14 +9,37 @@ from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
     DomainKind,
     DomainRoleKind,
+    ParseConfidence,
 )
 
 
 _UNDEF_RE = re.compile(r"(undefined reference to|Undefined symbols for architecture).*?[`'\"](?P<sym>[^`'\"]+)[`'\"]")
 
 
+def _linker_severity(text: str) -> str:
+    lower = text.lower()
+    if "fatal" in lower or "error" in lower or "undefined reference" in lower or "unresolved external symbol" in lower:
+        return "error"
+    if "warning" in lower:
+        return "warning"
+    return "unknown"
+
+
 def parse_linker_error(text: str, *, tool: str = "linker") -> object:
-    doc = new_diagnostic_doc(text, domain=DomainKind.LINKER_ERROR, tool=tool)
+    severity = _linker_severity(text)
+    domain = (
+        DomainKind.LINKER_ERROR
+        if severity == "error"
+        else DomainKind.LINKER_DIAGNOSTIC
+    )
+    doc = new_diagnostic_doc(
+        text,
+        domain=domain,
+        tool=tool,
+        severity=severity,
+        stage="link",
+        confidence=ParseConfidence.HEURISTIC if severity != "unknown" else ParseConfidence.RAW,
+    )
     first_error = 0 if doc.tokens else None
     for idx, token in enumerate(doc.tokens):
         value = token.text.strip("`'\"")
@@ -24,7 +47,7 @@ def parse_linker_error(text: str, *, tool: str = "linker") -> object:
             doc.set_role(idx, DomainRoleKind.COMMAND)
             if first_error is None:
                 first_error = idx
-        elif value.lower() in {"error", "undefined"}:
+        elif value.lower() in {"error", "warning", "undefined"}:
             doc.set_role(idx, DomainRoleKind.SEVERITY)
             if first_error is None:
                 first_error = idx

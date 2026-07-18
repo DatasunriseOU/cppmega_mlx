@@ -49,6 +49,7 @@ Output root is SEPARATE from the code stream: outputs/reindexed_commits/.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -62,13 +63,47 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Sequence
 
-# Reuse the proven machinery from the code driver.  Tests import this module as
-# ``scripts.streaming_reindex_commits`` while production launches it as a file;
-# support both without relying on ambient sys.path order.
-try:
-    from scripts import streaming_reindex as sr
-except ImportError:  # pragma: no cover - exercised by file-mode execution.
-    import streaming_reindex as sr
+def _load_local_streaming_reindex():
+    """Load the sibling code driver without trusting a foreign ``scripts`` package.
+
+    Cross-repo audit tests import this file as a top-level module while another
+    checkout already owns the ``scripts`` namespace. Importing
+    ``scripts.streaming_reindex`` in that state can bind the CUDA repository's
+    unrelated module and silently change every path constant. Bind by this
+    file's real sibling path instead; package-mode imports keep the ordinary
+    relative module identity.
+    """
+
+    if __package__:
+        from . import streaming_reindex
+
+        return streaming_reindex
+
+    module_path = Path(__file__).resolve().with_name("streaming_reindex.py")
+    module_name = "_cppmega_mlx_streaming_reindex"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        existing_path = Path(getattr(existing, "__file__", "")).resolve()
+        if existing_path != module_path:
+            raise ImportError(
+                f"{module_name} already resolves to {existing_path}, expected {module_path}"
+            )
+        return existing
+
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load local streaming reindex module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+sr = _load_local_streaming_reindex()
 
 MLX_ROOT = sr.MLX_ROOT
 VENV_PYTHON = sr.VENV_PYTHON
@@ -141,6 +176,25 @@ def _finalize_git_repo_subtree(
 def range_key(repo: str, start_idx: int) -> str:
     """Exact checkpoint key for one (repo, range_start_idx)."""
     return f"{repo}::r{start_idx}"
+
+
+def stage_materialize_commit_range(
+    repo: str,
+    start_idx: int,
+    enriched: Path,
+    work: Path,
+    *,
+    project_id: str,
+    memory_limit_gb: float = 10.0,
+) -> Path:
+    """Materialize one range under the repo's canonical owner/repo identity."""
+    return stage_materialize(
+        repo=range_key(repo, start_idx),
+        enriched=enriched,
+        work=work,
+        memory_limit_gb=memory_limit_gb,
+        project_id=project_id,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -275,8 +329,20 @@ def get_commit_list(repo_dir: Path) -> list[str]:
     return out.split("\n") if out else []
 
 
-def stage_extract_commits(repo: str, repo_dir: Path, work: Path) -> Path:
-    """extract_git_history.py --repo <_src> -> <repo>_commits.jsonl (all commits)."""
+def stage_extract_commits(
+    repo: str,
+    repo_dir: Path,
+    work: Path,
+    *,
+    project_id: str | None = None,
+) -> Path:
+    """Extract all commits with an explicit canonical project identity."""
+    if project_id is None:
+        raise RepoFailure(
+            repo,
+            "project_identity",
+            "extract_git_history requires an explicit canonical project identity",
+        )
     commits_jsonl = work / f"{repo}_commits.jsonl"
     run_checked(
         repo,
@@ -284,6 +350,10 @@ def stage_extract_commits(repo: str, repo_dir: Path, work: Path) -> Path:
         [
             VENV_PYTHON, EXTRACT_GIT,
             "--repo", repo_dir,
+            "--repo-name", sr.require_project_identity(
+                project_id,
+                source=f"stage_extract_commits({repo})",
+            ),
             "--output", commits_jsonl,
             "--max_commits", "0",
         ],
@@ -460,22 +530,51 @@ def recompress_zstd_max(path: Path) -> None:
         compression_level=ZSTD_LEVEL,
     )
     try:
-        for row_group_index in range(pf.num_row_groups):
-            writer.write_table(pf.read_row_group(row_group_index))
-    finally:
-        writer.close()
-        release_arrow_unused()
+        try:
+            for row_group_index in range(pf.num_row_groups):
+                writer.write_table(pf.read_row_group(row_group_index))
+        finally:
+            writer.close()
+            release_arrow_unused()
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     tmp.replace(path)
 
 
+def publish_range_outputs(
+    repo: str,
+    start_idx: int,
+    packed_by_length: dict[int, Path],
+    target_lengths: Sequence[int] | None = None,
+) -> dict[str, dict]:
+    rkey = range_key(repo, start_idx)
+    all_lengths = set(packed_by_length if target_lengths is None else target_lengths)
+    try:
+        return sr.publish_bucket_outputs_atomically(
+            rkey,
+            packed_by_length,
+            output_root=COMMIT_OUTPUT_ROOT,
+            filename=f"{repo}_r{start_idx}.parquet",
+            prepare_staged=recompress_zstd_max,
+            stats_reader=_parquet_stats,
+            remove_lengths=sorted(all_lengths - set(packed_by_length)),
+        )
+    except RepoFailure:
+        raise
+    except Exception as exc:
+        raise RepoFailure(
+            rkey,
+            "publish",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
 def append_range_output(repo: str, start_idx: int, packed: Path, target_length: int) -> dict:
-    """Place packed parquet at outputs/reindexed_commits/<L>/<repo>_r<start>.parquet (zstd-max)."""
-    out_dir = COMMIT_OUTPUT_ROOT / str(target_length)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / f"{repo}_r{start_idx}.parquet"
-    shutil.copyfile(packed, dest)
-    recompress_zstd_max(dest)
-    return _parquet_stats(dest, target_length)
+    """Publish one range parquet through the atomic bucket publisher."""
+    return publish_range_outputs(repo, start_idx, {target_length: packed})[
+        str(target_length)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -499,6 +598,7 @@ def process_range(
     deferred_stage_dir: Path | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
+    project_id = sr.resolve_project_identity(repo, repo_list)
     rkey = range_key(repo, start_idx)
     rwork = repo_work / f"r{start_idx}"
     rwork.mkdir(parents=True, exist_ok=True)
@@ -535,7 +635,8 @@ def process_range(
                                        pr_store=pr_store, repo_list=repo_list,
                                        memory_limit_gb=memory_limit_gb,
                                        analysis_cache_entries=analysis_cache_entries,
-                                       allow_empty=True)
+                                       allow_empty=True,
+                                       project_id=project_id)
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:
             sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
@@ -543,7 +644,14 @@ def process_range(
             info["stage_timings_s"] = timings
             return info
         started = time.monotonic()
-        tok = stage_materialize(rkey, enriched, rwork, memory_limit_gb)
+        tok = stage_materialize_commit_range(
+            repo,
+            start_idx,
+            enriched,
+            rwork,
+            project_id=project_id,
+            memory_limit_gb=memory_limit_gb,
+        )
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -561,11 +669,13 @@ def process_range(
             )
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
-        per_length: dict[str, dict] = {}
         started = time.monotonic()
+        packed_by_length: dict[int, Path] = {}
         for L, route_parquet in sorted(routed.items()):
-            packed = stage_pack(rkey, route_parquet, L, rwork)
-            per_length[str(L)] = append_range_output(repo, start_idx, packed, L)
+            packed_by_length[L] = stage_pack(rkey, route_parquet, L, rwork)
+        per_length = publish_range_outputs(
+            repo, start_idx, packed_by_length, lengths_sorted
+        )
         timings["pack_s"] = round(time.monotonic() - started, 6)
         if dedup_db is not None and stage_id is not None:
             if defer_promote:
@@ -651,14 +761,24 @@ def process_one_repo(
     deleted immediately after extraction; ``_src`` is kept until all ranges
     finish (process_commits needs it), then the whole repo work dir is removed.
     """
+    with manifest_lock:
+        manifest.mark_started(f"{repo}::repo")
+        if not resume:
+            manifest.mark_started_prefix(f"{repo}::r")
     repo_work = work_root / repo
     repo_work.mkdir(parents=True, exist_ok=True)
     smallest = lengths_sorted[0]
     try:
+        project_id = sr.resolve_project_identity(repo, repo_list)
         commit_list = get_commit_list(repo_dir)
         if not commit_list:
             raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
-        records_jsonl = stage_extract_commits(repo, repo_dir, repo_work)
+        records_jsonl = stage_extract_commits(
+            repo,
+            repo_dir,
+            repo_work,
+            project_id=project_id,
+        )
 
         # .git is no longer needed (records captured); delete to free disk now.
         git_dir = repo_dir / ".git"
@@ -683,6 +803,8 @@ def process_one_repo(
             if resume and manifest.is_done(rkey):
                 _log(f"SKIP (done) {rkey}")
                 continue
+            with manifest_lock:
+                manifest.mark_started(rkey)
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
@@ -793,9 +915,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "rendered PR discussion is attached as "
                         "record['pr_discussion'] (HEAD of the commit doc). Miss "
                         "= Tier-1 git-only (no fail).")
-    p.add_argument("--repo-list", default=None,
+    p.add_argument("--repo-list", default=str(sr.DEFAULT_REPO_LIST),
                    help="Path to outputs/pr_ingest/repo_list.json (bare-name -> "
-                        "owner/repo map) for resolving the PR-store key.")
+                        "owner/repo map) for canonical materialization identity "
+                        f"and the PR-store key. Default {sr.DEFAULT_REPO_LIST}.")
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to process_commits/"
                         "materializer (default 10.0).")
@@ -811,7 +934,6 @@ def main(argv: list[str]) -> int:
     if not target_lengths:
         raise SystemExit("--target-lengths produced no lengths")
     lengths_sorted = tuple(target_lengths)
-    smallest = lengths_sorted[0]
     workers = max(1, int(args.workers or 1))
 
     for path in (VENV_PYTHON, EXTRACT_GIT, sr.PROCESS_COMMITS,
@@ -844,6 +966,8 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"--pr-store does not exist: {pr_store}")
     if repo_list is not None and not repo_list.exists():
         raise SystemExit(f"--repo-list does not exist: {repo_list}")
+    if repo_list is not None:
+        sr.load_project_identity_map(repo_list)
     if pr_store is not None:
         _log(f"PR-store: live lookup into record['pr_discussion'] from {pr_store} "
              f"(repo_list={repo_list})")

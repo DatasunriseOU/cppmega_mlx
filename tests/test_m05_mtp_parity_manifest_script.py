@@ -25,13 +25,13 @@ from cppmega_mlx.training.parity import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m05_mtp_parity_manifest.py"
-PYTHON = ROOT / ".venv" / "bin" / "python"
+PYTHON = Path(sys.executable)
 EXTERNAL_M05_FASTMTP_TASK_ID = "cppmega-mlx-hjfn"
 
 
 def run_script(*args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [str(PYTHON if PYTHON.exists() else sys.executable), str(SCRIPT), *args],
+        [str(PYTHON), str(SCRIPT), *args],
         cwd=ROOT,
         text=True,
         capture_output=True,

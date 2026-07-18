@@ -16,11 +16,12 @@ RULE #1: no mocks of the real store — we build a real (tiny) SQLite store.
 from __future__ import annotations
 
 import sys
+import json
 import os
 import shutil
 import subprocess
 import tarfile
-import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,12 @@ MLX_ROOT = Path(__file__).resolve().parents[1]
 for p in (MLX_ROOT / "tools" / "clang_indexer", MLX_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
+
+
+def _sleeping_parse_worker(args: tuple[float]):
+    (delay_s,) = args
+    time.sleep(delay_s)
+    return [], []
 
 
 def _load_index_project():
@@ -44,17 +51,80 @@ def _load_builder():
     return b
 
 
-def _make_store(tmp: Path):
+def test_boost_provider_spec_keeps_boost_type_definitions() -> None:
+    b = _load_builder()
+    assert b.BASE_LIBS["boost"]["allow_system_types"] is True
+
+
+def test_boost_provider_worker_emits_boost_type_definition(tmp_path: Path) -> None:
+    pytest.importorskip("clang.cindex")
+    b = _load_builder()
+    root = tmp_path / "provider"
+    header = root / "boost" / "include" / "boost" / "route.hpp"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        "namespace boost { struct route_type { int value; }; }\n",
+        encoding="utf-8",
+    )
+
+    _functions, types = b._parse_file_worker(
+        (
+            str(header),
+            str(root),
+            b.project_identity_for_subtree("boost"),
+            "-std=c++17",
+            "c++",
+            [str(root), str(root / "boost" / "include")],
+            {
+                "allow_system_types": b.BASE_LIBS["boost"]["allow_system_types"],
+            },
+        )
+    )
+
+    assert any(row["qualified_name"] == "boost::route_type" for row in types)
+
+
+def _make_store(tmp: Path, *, reference: dict[str, object] | None = None):
     b = _load_builder()
     db = str(tmp / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
     body = ("template<class R> void trim(R& r) "
             "{ /* boost trim impl, long enough body to keep */ }")
-    store.insert_symbols([(
-        "boost::algorithm::trim", "boost", "boost", 2, "func",
-        "boost/algorithm/string/trim.hpp", 5, 40, 1,
-        len(body) // 4, len(body), body,
-    )])
+    reference = reference or {}
+    usr = str(reference.get("usr") or "")
+    signature = str(
+        reference.get("canonical_signature")
+        or "display=trim(R &)|type=void (R &)"
+    )
+    symbol_kind = str(reference.get("symbol_kind") or "FUNCTION_TEMPLATE")
+    record = b.GlobalSymbolRecord(
+        qname="boost::algorithm::trim",
+        base_lib="boost",
+        base_repo="boostorg/boost",
+        kind=2,
+        sym_type="func",
+        file="boost/algorithm/string/trim.hpp",
+        line=5,
+        end_line=40,
+        is_public=1,
+        token_est=len(body) // 4,
+        body_len=len(body),
+        text=body,
+        symbol_key=b.ip.canonical_symbol_identity(
+            qname="boost::algorithm::trim",
+            kind=symbol_kind,
+            usr=usr,
+            canonical_signature=signature,
+            project="boostorg/boost",
+            file="boost/algorithm/string/trim.hpp",
+        ),
+        usr=usr,
+        canonical_signature=signature,
+        symbol_kind=symbol_kind,
+        provider="boost",
+        include_provenance="boost/algorithm/string/trim.hpp",
+    )
+    store.insert_symbols([record])
     store.commit()
     store.close()
     return db, body
@@ -66,10 +136,55 @@ def test_store_reader_roundtrip(tmp_path):
     reader = ip.GlobalSymbolReader(db)
     rec = reader.lookup("boost::algorithm::trim")
     assert rec is not None
-    assert rec["base_repo"] == "boost"
+    assert rec["base_repo"] == "boostorg/boost"
     assert rec["base_lib"] == "boost"
     assert "trim impl" in rec["text"]
     assert reader.lookup("does::not::exist") is None
+    reader.close()
+
+
+def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> None:
+    b = _load_builder()
+    db = str(tmp_path / "location.sqlite")
+    store = b.GlobalSymbolStore(db)
+    symbol_key = b.ip.canonical_symbol_identity(
+        qname="boost::route",
+        kind="FUNCTION_DECL",
+        project="boostorg/boost",
+        file="boost/route.hpp",
+        line=7,
+        column=4,
+        repo_file_location_fallback=True,
+    )
+    store.insert_symbols(
+        [
+            b.GlobalSymbolRecord(
+                qname="boost::route",
+                base_lib="boost",
+                base_repo="boostorg/boost",
+                kind=2,
+                sym_type="func",
+                file="boost/route.hpp",
+                line=7,
+                end_line=9,
+                is_public=1,
+                token_est=8,
+                body_len=32,
+                text="void route() { /* location fallback */ }",
+                symbol_key=symbol_key,
+                symbol_kind="FUNCTION_DECL",
+                provider="boost",
+                include_provenance="boost/route.hpp",
+            )
+        ]
+    )
+    store.commit()
+    store.close()
+
+    reader = b.ip.GlobalSymbolReader(db)
+    record = reader.lookup("boost::route")
+    assert record is not None
+    assert record["symbol_key"] == symbol_key
     reader.close()
 
 
@@ -79,9 +194,31 @@ def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     db = str(tmp_path / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
     body = "size_t basic_string_size() { return 0; }"
-    store.insert_symbols([(
-        "std::basic_string::size", "std", "STL", 2, "func",
-        "stl/inc/string", 1, 1, 1, len(body) // 4, len(body), body,
+    signature = "display=size()|type=size_t ()"
+    store.insert_symbols([b.GlobalSymbolRecord(
+        qname="std::basic_string::size",
+        base_lib="std",
+        base_repo="microsoft/STL",
+        kind=2,
+        sym_type="func",
+        file="STL/stl/inc/string",
+        line=1,
+        end_line=1,
+        is_public=1,
+        token_est=len(body) // 4,
+        body_len=len(body),
+        text=body,
+        symbol_key=b.ip.canonical_symbol_identity(
+            qname="std::basic_string::size",
+            kind="CXX_METHOD",
+            canonical_signature=signature,
+            project="microsoft/STL",
+            file="STL/stl/inc/string",
+        ),
+        canonical_signature=signature,
+        symbol_kind="CXX_METHOD",
+        provider="msvc-stl",
+        include_provenance="string",
     )])
     store.commit()
     store.close()
@@ -89,7 +226,7 @@ def test_store_reader_normalizes_std_inline_namespace(tmp_path):
     reader = ip.GlobalSymbolReader(db)
     rec = reader.lookup("std::__cxx11::basic_string::size")
     assert rec is not None
-    assert rec["base_repo"] == "STL"
+    assert rec["base_repo"] == "microsoft/STL"
     assert "basic_string_size" in rec["text"]
     assert ip.normalize_inline_namespace_qname("std::__1::vector::push_back") == (
         "std::vector::push_back"
@@ -101,16 +238,36 @@ def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
     b = _load_builder()
     db = str(tmp_path / "gsi.sqlite")
     store = b.GlobalSymbolStore(db)
+    msvc_signature = "display=append(const char *)|type=void (const char *)"
+    libcxx_signature = "display=append(size_type, char)|type=void (size_type, char)"
     store.insert_symbols([
-        (
-            "std::basic_string::append", "std", "STL", 2, "func",
-            "stl/inc/xstring", 10, 18, 1, 16, 64,
-            "void append(const char*) { /* overload one */ }",
+        b.GlobalSymbolRecord(
+            qname="std::basic_string::append", base_lib="std",
+            base_repo="microsoft/STL", kind=2, sym_type="func",
+            file="STL/stl/inc/xstring", line=10, end_line=18,
+            is_public=1, token_est=16, body_len=64,
+            text="void append(const char*) { /* overload one */ }",
+            symbol_key=b.ip.canonical_symbol_identity(
+                qname="std::basic_string::append", kind="CXX_METHOD",
+                canonical_signature=msvc_signature, project="microsoft/STL",
+                file="STL/stl/inc/xstring",
+            ),
+            canonical_signature=msvc_signature, symbol_kind="CXX_METHOD",
+            provider="msvc-stl", include_provenance="xstring",
         ),
-        (
-            "std::basic_string::append", "std", "llvm-project", 2, "func",
-            "llvm-project/libcxx/include/string", 200, 215, 1, 32, 128,
-            "void append(size_type, char) { /* overload two */ }",
+        b.GlobalSymbolRecord(
+            qname="std::basic_string::append", base_lib="std",
+            base_repo="llvm/llvm-project", kind=2, sym_type="func",
+            file="llvm-project/libcxx/include/string", line=200, end_line=215,
+            is_public=1, token_est=32, body_len=128,
+            text="void append(size_type, char) { /* overload two */ }",
+            symbol_key=b.ip.canonical_symbol_identity(
+                qname="std::basic_string::append", kind="CXX_METHOD",
+                canonical_signature=libcxx_signature, project="llvm/llvm-project",
+                file="llvm-project/libcxx/include/string",
+            ),
+            canonical_signature=libcxx_signature, symbol_kind="CXX_METHOD",
+            provider="libc++", include_provenance="string",
         ),
     ])
     store.commit()
@@ -128,8 +285,8 @@ def test_store_preserves_distinct_definitions_with_same_qname(tmp_path):
     finally:
         conn.close()
     assert rows == [
-        ("STL", "stl/inc/xstring", 10),
-        ("llvm-project", "llvm-project/libcxx/include/string", 200),
+        ("llvm/llvm-project", "llvm-project/libcxx/include/string", 200),
+        ("microsoft/STL", "STL/stl/inc/xstring", 10),
     ]
 
 
@@ -204,6 +361,46 @@ def test_extraction_cache_reuses_complete_lib_without_restreaming(tmp_path):
     assert cached_file.read_text().startswith("namespace boost")
 
 
+def test_extraction_cache_hardlinks_complete_code_cache(tmp_path):
+    b = _load_builder()
+    tarball = tmp_path / "corpus.tar.zst"
+    tarball.write_bytes(b"stable corpus fingerprint")
+    source_root = tmp_path / "source_cache"
+    boost_root = source_root / "boost"
+    wanted = boost_root / "include" / "boost" / "cached_symbol.hpp"
+    wanted.parent.mkdir(parents=True)
+    wanted.write_text("namespace boost { inline int cached_symbol() { return 7; } }\n")
+    (boost_root / "README.txt").write_text("not an index input\n")
+    (boost_root / ".cppmega_source_cache_complete.json").write_text(json.dumps({
+        "repo": "Boost",
+        "source": str(tarball),
+        "completed_at": "2026-07-14T00:00:00",
+    }))
+    alias = source_root / "BOOST"
+    if not alias.exists():
+        alias.symlink_to(boost_root, target_is_directory=True)
+    spec = dict(b.BASE_LIBS["boost"])
+    spec["subtrees"] = ["boost", "BOOST"]
+
+    cache_root = tmp_path / "extract_cache"
+    counts = b.populate_extraction_cache_from_source_cache(
+        tarball, {"boost": spec}, source_root, cache_root,
+        max_files=10,
+    )
+    cached = cache_root / "boost/boost/include/boost/cached_symbol.hpp"
+    assert counts == {"boost": 1}
+    assert cached.read_text() == wanted.read_text()
+    assert cached.stat().st_ino == wanted.stat().st_ino
+    manifest = json.loads(
+        (cache_root / "boost/.gsi_extract_complete.json").read_text())
+    assert manifest["publication"] == "hardlink"
+
+    dirs, reused = b.prepare_extraction_cache(
+        tarball, {"boost": spec}, cache_root, max_files=10)
+    assert reused == counts
+    assert dirs["boost"] == cache_root / "boost"
+
+
 def test_is_public_symbol_filters():
     b = _load_builder()
     # A1 (public_only=False): accept normal qnames, reject internal segments.
@@ -241,6 +438,142 @@ def test_is_public_symbol_filters():
         b.normalize_inline_namespace_qname("std::__cxx11::basic_string::size")
         == "std::basic_string::size"
     )
+    assert b.normalize_inline_namespace_qname("boost::__1::route") == (
+        "boost::__1::route"
+    )
+
+
+def test_global_symbol_rebuild_rolls_back_late_parse_failure(
+    tmp_path,
+    monkeypatch,
+):
+    b = _load_builder()
+    store = b.GlobalSymbolStore(str(tmp_path / "symbols.sqlite"))
+    with store.rebuild_lib("boost", "A1", ["boost"]):
+        store.mark_lib_done(
+            "boost",
+            "A1",
+            n_files=1,
+            n_funcs=0,
+            n_types=0,
+            n_errors=0,
+            elapsed_s=0.1,
+            subtrees=["boost"],
+        )
+    assert store.lib_done("boost")
+
+    source_root = tmp_path / "source"
+    source_file = source_root / "boost" / "route.hpp"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("namespace boost { int route(int); }\n")
+    monkeypatch.setattr(b.ip, "find_cpp_files", lambda _root: [str(source_file)])
+    monkeypatch.setattr(b, "SYMBOL_BATCH_SIZE", 1)
+
+    def late_failure(tasks, **_kwargs):
+        filepath, project_id, _worker_args = next(iter(tasks))
+        qname = "boost::route"
+        signature = "display=route(int)|type=int (int)"
+        symbol_key = b.ip.canonical_symbol_identity(
+            qname=qname,
+            kind="FUNCTION_DECL",
+            canonical_signature=signature,
+            project=project_id,
+            file="boost/route.hpp",
+        )
+        yield filepath, project_id, (
+            [
+                {
+                    "qualified_name": qname,
+                    "file": "boost/route.hpp",
+                    "line": 1,
+                    "end_line": 1,
+                    "text": "int route(int value) { return value + 1; }",
+                    "symbol_key": symbol_key,
+                    "usr": "",
+                    "canonical_signature": signature,
+                    "symbol_kind": "FUNCTION_DECL",
+                }
+            ],
+            [],
+        )
+        raise RuntimeError("late parse failure")
+
+    monkeypatch.setattr(b, "_iter_parse_results", late_failure)
+    with pytest.raises(RuntimeError, match="late parse failure"):
+        b.index_lib_from_dir(
+            "boost",
+            b.BASE_LIBS["boost"],
+            source_root,
+            store,
+            workers=1,
+            std_arg="-std=c++17",
+        )
+
+    assert not store.lib_done("boost")
+    assert store.conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE base_lib='boost'"
+    ).fetchone()[0] == 0
+    store.close()
+
+
+def test_parse_worker_timeout_is_real_wall_clock():
+    b = _load_builder()
+    started = time.monotonic()
+    with pytest.raises(b.ParseWorkerTimeout, match="slow.cpp"):
+        list(
+            b._iter_parse_results(
+                [("slow.cpp", "owner/repo", (30.0,))],
+                workers=1,
+                timeout_s=0.2,
+                worker_fn=_sleeping_parse_worker,
+            )
+        )
+    assert time.monotonic() - started < 8.0
+
+
+def test_parse_timeout_is_explicitly_configurable():
+    b = _load_builder()
+    args = b.parse_args(["--parse-timeout-seconds", "300"])
+    assert args.parse_timeout_seconds == 300.0
+
+
+def test_abseil_global_api_index_excludes_test_and_benchmark_tus() -> None:
+    b = _load_builder()
+    paths = [
+        "/src/absl/flags/flag.cc",
+        "/src/absl/flags/flag_test.cc",
+        "/src/absl/flags/flag_benchmark.cc",
+        "/src/absl/container/inline.hpp",
+    ]
+    kept, excluded = b._filter_non_provider_sources(paths, b.BASE_LIBS["abseil"])
+    assert kept == [paths[0], paths[3]]
+    assert excluded == 2
+
+
+def test_global_api_index_excludes_non_provider_trees_and_libc_sources() -> None:
+    b = _load_builder()
+    folly_paths = [
+        "/src/folly/container/Map.cpp",
+        "/src/folly/container/test/MapTest.cpp",
+        "/src/folly/benchmark/MapBenchmark.cpp",
+    ]
+    kept, excluded = b._filter_non_provider_sources(
+        folly_paths, b.BASE_LIBS["folly"]
+    )
+    assert kept == [folly_paths[0]]
+    assert excluded == 2
+
+    libc_paths = [
+        "/src/glibc/include/stdio.h",
+        "/src/musl/include/stdlib.h",
+        "/src/glibc/stdlib/strtol.c",
+        "/src/musl/tests/stdio.c",
+    ]
+    kept, excluded = b._filter_non_provider_sources(
+        libc_paths, b.BASE_LIBS["libc"]
+    )
+    assert kept == libc_paths[:2]
+    assert excluded == 2
 
 
 def test_crosslink_budget_bounds():
@@ -260,11 +593,31 @@ def test_crosslink_budget_bounds():
 
 def _tiny_index(ip):
     idx = ip.ProjectIndex()
+    signature = "display=trim(R &)|type=void (R &)"
+    external_key = ip.canonical_symbol_identity(
+        qname="boost::algorithm::trim",
+        kind="FUNCTION_TEMPLATE",
+        canonical_signature=signature,
+    )
     root = ip.FunctionDef(
         name="do_work", qualified_name="myrepo::do_work", file="a.cpp", line=1,
         text=("void do_work() {\n  boost::algorithm::trim(s);\n"
               "  myrepo::local_helper();\n}"),
-        callees=["boost::algorithm::trim", "myrepo::local_helper"],
+        callees=["myrepo::local_helper"],
+        baselib_callees=["boost::algorithm::trim"],
+        baselib_callee_refs=[{
+            "symbol_key": external_key,
+            "symbol_id": ip._compute_symbol_id(external_key),
+            "qname": "boost::algorithm::trim",
+            "usr": "",
+            "canonical_signature": signature,
+            "symbol_kind": "FUNCTION_TEMPLATE",
+            "project": "",
+            "file": "/opt/boost/include/boost/algorithm/string/trim.hpp",
+            "line": 5,
+            "provider": "boost",
+            "include_provenance": "boost/algorithm/string/trim.hpp",
+        }],
         is_definition=True,
     )
     helper = ip.FunctionDef(
@@ -316,7 +669,7 @@ def test_crosslink_on_pulls_tagged_chunk(tmp_path):
     crosslib_idxs = [i for i, b in enumerate(boundaries) if b.get("dep_source")]
     assert len(crosslib_idxs) == 1
     cl_idx = crosslib_idxs[0]
-    assert boundaries[cl_idx]["dep_source"] == "crosslib:boost"
+    assert boundaries[cl_idx]["dep_source"] == "crosslib:boostorg/boost"
     assert boundaries[cl_idx]["name"] == "trim"
     assert "trim impl" in root_doc["text"]
     # The root function chunk's call_edge to the unresolved base-lib callee must
@@ -346,13 +699,15 @@ def _parse_one(ip, src_text, tmp_path):
     src.write_text(src_text)
     idx = Index.create()
     funcs, _types = ip.parse_translation_unit(
-        str(src), idx, ["-std=c++17"], str(tmp_path))
+        str(src), idx, ["-std=c++17"], str(tmp_path),
+        project_id="tests/crossrepo-fixture",
+    )
     return funcs
 
 
 def test_extract_callees_splits_baselib_from_normal():
     ip = _load_index_project()
-    import clang.cindex  # noqa: F401  (skip cleanly if libclang missing)
+    pytest.importorskip("clang.cindex")
     out = ip.extract_callees  # signature check: returns a 2-tuple
     assert ip.is_crosslinkable_baselib("boost::beast::make_printable")
     assert ip.is_crosslinkable_baselib("std::sort")
@@ -390,7 +745,7 @@ def test_real_parse_baselib_callee_survives_and_pulls(tmp_path):
         root.baselib_callees
 
     # Now build a store with the boost def and confirm an actual PULL.
-    db, body = _make_store(tmp_path)
+    db, body = _make_store(tmp_path, reference=root.baselib_callee_refs[0])
     reader = ip.GlobalSymbolReader(db)
     idx = ip.ProjectIndex()
     for f in funcs:
@@ -401,7 +756,7 @@ def test_real_parse_baselib_callee_survives_and_pulls(tmp_path):
     cl = [b for b in root_doc["chunk_boundaries"]
           if (b.get("dep_source") or "").startswith("crosslib:")]
     assert len(cl) == 1, cl
-    assert cl[0]["dep_source"] == "crosslib:boost"
+    assert cl[0]["dep_source"] == "crosslib:boostorg/boost"
     assert cl[0]["name"] == "trim"
     assert "trim impl" in root_doc["text"]
     reader.close()

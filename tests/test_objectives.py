@@ -8,7 +8,8 @@ import pytest
 
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
-from cppmega_mlx.data.fim import EOT_ID, FIM_MIDDLE_ID
+from cppmega_mlx.data.fim import EOT_ID, FIM_MIDDLE_ID, FIM_PREFIX_ID, FIM_SUFFIX_ID
+from cppmega_mlx.data.tokenizer_contract import DOMAIN_DELIMITER_TOKEN_IDS
 from cppmega_mlx.training.objectives import (
     ObjectiveExample,
     build_ast_fim,
@@ -77,18 +78,26 @@ def test_ast_fim_aligned_and_loss_on_middle() -> None:
     assert all(m == 1 for m in mask[mid_input_pos:])
 
 
+def test_ast_fim_character_fallback_is_not_telemetried_as_ast_fim() -> None:
+    packet = _code_packet(list(range(10)), chunks=[(0, 3), (3, 6), (6, 10)])
+
+    ex = build_ast_fim(packet, seed=3, ast_fim_rate=0.0)
+
+    assert ex.objective == "fim"
+    assert ex.metadata["fim_kind"] == "char_fim"
+
+
 def test_ifim_aligned() -> None:
-    src = "// Sum all elements\nint sum(int *a, int n);\n"
-    packet = _code_packet(list(range(10)), chunks=[(3, 6)], )
+    packet = _code_packet(list(range(10)), chunks=[(3, 6)])
     packet = CodePacket(
         token_ids=packet.token_ids,
         chunk_starts=packet.chunk_starts,
         chunk_ends=packet.chunk_ends,
         chunk_kinds=packet.chunk_kinds,
         chunk_dep_levels=packet.chunk_dep_levels,
-        metadata={"source_text": src},
+        ifim_instruction_token_ids=_arr([1200, 1201, 1202]),
     )
-    ex = build_ifim(packet, instruction_encoder=lambda t: [200, 201, 202], seed=1, spm_rate=0.0)
+    ex = build_ifim(packet, seed=1, spm_rate=0.0)
     _assert_aligned(ex)
     assert _np(ex.target_ids)[-1] == EOT_ID
 
@@ -101,37 +110,92 @@ def test_commit_diff_loss_on_diff() -> None:
     )
     ex = build_commit_diff(packet)
     _assert_aligned(ex)
-    # full = [100,101,50,51,52,EOT]; inputs=full[:-1], targets=full[1:].
-    assert _np(ex.input_ids) == [100, 101, 50, 51, 52]
-    assert _np(ex.target_ids) == [101, 50, 51, 52, EOT_ID]
-    # prompt_len=2 -> supervise targets predicting diff tokens (50,51,52)+EOT.
-    # target j predicts full[j+1]; train iff j+1>=2 -> [0,1,1,1,1].
-    assert _np(ex.loss_mask) == [0, 1, 1, 1, 1]
+    full = [
+        17,
+        100,
+        101,
+        18,
+        15,
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"],
+        50,
+        51,
+        52,
+        DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"],
+        16,
+        EOT_ID,
+    ]
+    assert _np(ex.input_ids) == full[:-1]
+    assert _np(ex.target_ids) == full[1:]
+    assert _np(ex.loss_mask) == [0] * 5 + [1] * 6
+    assert ex.metadata["section_boundaries"] == {
+        "commit_message": (0, 4),
+        "diff": (4, 11),
+    }
 
 
 def test_pre_to_post_loss_on_post() -> None:
     packet = CommitPacket(
         pre_token_ids=_arr([10, 11]),
         post_token_ids=_arr([20, 21]),
+        commit_msg=_arr([30]),
     )
     ex = build_pre_to_post(packet)
     _assert_aligned(ex)
-    # full = [10,11,20,21,EOT]; prompt_len=2.
-    assert _np(ex.target_ids) == [11, 20, 21, EOT_ID]
-    assert _np(ex.loss_mask) == [0, 1, 1, 1]
+    cpp_start = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_START"]
+    cpp_end = DOMAIN_DELIMITER_TOKEN_IDS["CPP_CODE_END"]
+    full = [
+        cpp_start,
+        10,
+        11,
+        cpp_end,
+        17,
+        30,
+        18,
+        14,
+        cpp_start,
+        20,
+        21,
+        cpp_end,
+        EOT_ID,
+    ]
+    assert _np(ex.input_ids) == full[:-1]
+    assert _np(ex.target_ids) == full[1:]
+    assert _np(ex.loss_mask) == [0] * 8 + [1] * 4
+    assert ex.metadata["section_boundaries"] == {
+        "pre": (0, 4),
+        "commit_message": (4, 7),
+        "post": (8, 12),
+    }
 
 
 # --------------------------- RECOVERY --------------------------- #
 def test_symbol_recovery_masks_symbol_span() -> None:
-    tokens = [9, 9, 42, 42, 9, 9]
+    tokens = [10, 11, 700, 701, 12, 13]
     symbol_ids = [0, 0, 7, 7, 0, 0]  # span [2,4)
     packet = _code_packet(tokens, symbol_ids=symbol_ids)
     ex = build_recovery(packet, kind="symbol", seed=0)
     _assert_aligned(ex)
-    # targets = tokens[1:]; supervise target j iff predicted token j+1 in [2,4).
-    # j=1 -> token2 (in), j=2 -> token3 (in); others out.
-    assert _np(ex.loss_mask) == [0, 1, 1, 0, 0]
+    full = [
+        FIM_PREFIX_ID,
+        38,
+        10,
+        11,
+        FIM_SUFFIX_ID,
+        12,
+        13,
+        FIM_MIDDLE_ID,
+        700,
+        701,
+        EOT_ID,
+    ]
+    assert _np(ex.input_ids) == full[:-1]
+    assert _np(ex.target_ids) == full[1:]
+    answer_start = full.index(FIM_MIDDLE_ID) + 1
+    assert 700 not in full[:answer_start]
+    assert 701 not in full[:answer_start]
+    assert _np(ex.loss_mask) == [0] * (answer_start - 1) + [1] * 3
     assert ex.metadata["span"] == (2, 4)
+    assert ex.metadata["answer_start"] == answer_start
 
 
 def test_type_recovery_uses_type_refs() -> None:
@@ -173,7 +237,7 @@ def test_recovery_all_zero_channel_raises() -> None:
         build_recovery(packet, kind="symbol", seed=0)
 
 
-def test_ifim_absent_source_text_raises() -> None:
+def test_ifim_absent_typed_instruction_raises() -> None:
     packet = _code_packet(list(range(10)), chunks=[(3, 6)])
-    with pytest.raises(ValueError, match="source_text"):
-        build_ifim(packet, instruction_encoder=lambda t: [1], seed=0)
+    with pytest.raises(ValueError, match="ifim_instruction_token_ids"):
+        build_ifim(packet, seed=0)

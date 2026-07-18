@@ -53,7 +53,7 @@ def _synthetic_packed_table() -> "pa.Table":
             "token_scope_ids": [[0, 0, 1, 1, 0, 0], [0] * SEQ],
             "token_source_doc_ids": [[7] * SEQ, [8] * SEQ],
             "token_confidence_ids": [[4] * SEQ, [2] * SEQ],
-            "token_domain_edges": [[{"from": 1, "to": 2, "kind": 20}], []],
+            "token_domain_edges": [[{"from": 1, "to": 2, "kind": 5}], []],
             "token_build_edges": [[{"from": 2, "to": 3, "kind": 21}], []],
             "token_shell_edges": [[], []],
             "token_diagnostic_edges": [[], []],
@@ -118,7 +118,7 @@ def test_build_code_packets_populates_all_fields() -> None:
     assert p0.role_ids is not None
     assert np.asarray(p0.role_ids).tolist() == [0, 1, 2, 3, 4, 5]
     assert isinstance(p0.domain_edges, DomainEdgeIndex)
-    assert p0.domain_edges.to_triples() == [(1, 2, 20)]
+    assert p0.domain_edges.to_triples() == [(1, 2, 5)]
     assert p0.build_edges.to_triples() == [(2, 3, 21)]
 
     # Row 1 has an empty type_edges list.
@@ -128,7 +128,17 @@ def test_build_code_packets_populates_all_fields() -> None:
 
     # GraphPacket bundling + block aggregation works on parsed edges.
     gp = p0.graph_packet()
-    assert set(gp.relations) == {"call", "type"}
+    assert set(gp.relations) == {
+        "call",
+        "type",
+        "domain",
+        "build",
+        "shell",
+        "diagnostic",
+        "cross_domain",
+    }
+    assert gp.edge("domain").to_pairs() == [(1, 2)]
+    assert gp.edge("build").to_pairs() == [(2, 3)]
     assert gp.num_nodes == 2
 
 
@@ -160,6 +170,42 @@ def test_build_code_packet_records_absent_columns() -> None:
     assert "token_chunk_starts" in p0.metadata["present_columns"]
 
 
+def test_build_code_packet_preserves_full_width_symbol_ids() -> None:
+    batch = _synthetic_batch()
+    high_id = 0xF123456789ABCDEF
+    table = pa.table(
+        {
+            "token_symbol_ids": pa.array(
+                [[high_id] * SEQ, [high_id - 1] * SEQ],
+                type=pa.list_(pa.uint64()),
+            ),
+            "token_call_targets": pa.array(
+                [[0] * SEQ, [high_id] * SEQ], type=pa.list_(pa.uint64())
+            ),
+            "token_type_refs": pa.array(
+                [[high_id - 2] * SEQ, [0] * SEQ], type=pa.list_(pa.uint64())
+            ),
+            "token_def_use": [[0] * SEQ, [1] * SEQ],
+        }
+    )
+
+    packets = build_code_packets(batch, table)
+
+    assert packets[0].symbol_ids is not None
+    assert packets[0].symbol_ids.dtype == mx.uint64
+    assert np.asarray(packets[0].symbol_ids).tolist() == [high_id] * SEQ
+    assert packets[1].call_targets is not None
+    assert packets[1].call_targets.dtype == mx.uint64
+
+
+def test_build_code_packet_rejects_wrong_domain_edge_family() -> None:
+    columns = _synthetic_packed_table().to_pydict()
+    columns["token_build_edges"][0] = [{"from": 2, "to": 3, "kind": 60}]
+
+    with pytest.raises(ValueError, match="belongs to diagnostic, not build"):
+        build_code_packets(_synthetic_batch(), pa.table(columns))
+
+
 def test_build_code_packet_misaligned_semantic_column_raises() -> None:
     batch = _synthetic_batch()
     bad = pa.table(
@@ -170,6 +216,29 @@ def test_build_code_packet_misaligned_semantic_column_raises() -> None:
     )
     with pytest.raises(ValueError, match="token-aligned length 5 != token_ids length 6"):
         build_code_packets(batch, bad)
+
+
+def test_opaque_semantic_identities_preserve_full_uint64_range() -> None:
+    high = (1 << 63) + 987654321
+    packet = build_code_packet_from_row(
+        token_ids=mx.array([1, 2, 3], dtype=mx.int32),
+        columns={
+            "token_symbol_ids": [[0, high, high + 1]],
+            "token_call_targets": [[high + 2, 0, high + 3]],
+            "token_type_refs": [[high + 4, high + 5, 0]],
+            "token_def_use": [[0, 1, 2]],
+        },
+        row_index=0,
+    )
+
+    for field, expected in (
+        ("symbol_ids", [0, high, high + 1]),
+        ("call_targets", [high + 2, 0, high + 3]),
+        ("type_refs", [high + 4, high + 5, 0]),
+    ):
+        values = np.asarray(getattr(packet, field))
+        assert values.dtype == np.dtype(np.uint64)
+        assert values.tolist() == expected
 
 
 def test_build_code_packets_row_count_mismatch_raises() -> None:

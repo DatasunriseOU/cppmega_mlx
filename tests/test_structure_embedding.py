@@ -45,7 +45,7 @@ def test_structure_embedding_unknown_or_empty_component_spec_fails_closed():
         CppMegaStructureEmbedding(hidden_size=16, active_components="")
 
 
-def test_structure_embedding_clamps_ids_and_masks_missing_components():
+def test_structure_embedding_rejects_out_of_range_ids_and_masks_missing_components():
     module = CppMegaStructureEmbedding(
         hidden_size=4,
         active_components="core",
@@ -67,19 +67,26 @@ def test_structure_embedding_clamps_ids_and_masks_missing_components():
     )
     module.up_proj.weight = mx.ones_like(module.up_proj.weight)
 
-    structure_only = module(
-        structure_ids=mx.array([[-2, 9]], dtype=mx.int64),
+    with pytest.raises(ValueError, match="structure.*out of range"):
+        module(
+            structure_ids=mx.array([[-2, 9]], dtype=mx.int64),
+            dep_levels=None,
+            target_dtype=mx.float32,
+        )
+
+    with pytest.raises(ValueError, match="dep_level.*out of range"):
+        module(
+            structure_ids=mx.array([[1, 2]], dtype=mx.int64),
+            dep_levels=mx.array([[0, 99]], dtype=mx.int64),
+            target_dtype=mx.float32,
+        )
+
+    valid = module(
+        structure_ids=mx.array([[1, 2]], dtype=mx.int64),
         dep_levels=None,
         target_dtype=mx.float32,
     )
-    both = module(
-        structure_ids=mx.array([[-2, 9]], dtype=mx.int64),
-        dep_levels=mx.array([[0, 99]], dtype=mx.int64),
-        target_dtype=mx.float32,
-    )
-
-    assert np.allclose(to_numpy(structure_only)[0, :, 0], [0.5, 1.5])
-    assert np.allclose(to_numpy(both)[0, :, 0], [5.5, 21.5])
+    assert np.allclose(to_numpy(valid)[0, :, 0], [1.0, 1.5])
 
 
 def test_structure_embedding_validates_matching_shapes_for_present_components():
@@ -89,6 +96,47 @@ def test_structure_embedding_validates_matching_shapes_for_present_components():
 
     with pytest.raises(ValueError, match="does not match"):
         module(structure_ids=structure_ids, dep_levels=dep_levels)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (0.5, "fractional"),
+        (float("nan"), "finite"),
+        (float("inf"), "finite"),
+    ],
+)
+def test_structure_embedding_rejects_invalid_integer_channels_before_cast(
+    value: float,
+    error: str,
+) -> None:
+    module = CppMegaStructureEmbedding(
+        hidden_size=8,
+        active_components="structure",
+        num_categories=4,
+        bottleneck_dim=2,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        module(
+            structure_ids=mx.array([[value]], dtype=mx.float32),
+            dep_levels=None,
+        )
+
+
+def test_structure_embedding_rejects_uint64_overflow_before_cast() -> None:
+    module = CppMegaStructureEmbedding(
+        hidden_size=8,
+        active_components="structure",
+        num_categories=4,
+        bottleneck_dim=2,
+    )
+
+    with pytest.raises(ValueError, match="out of range"):
+        module(
+            structure_ids=mx.array([[2**64 - 1]], dtype=mx.uint64),
+            dep_levels=None,
+        )
 
 
 def test_structure_embedding_returns_scalar_zero_when_no_active_inputs_are_present():

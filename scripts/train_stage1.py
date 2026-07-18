@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# ruff: noqa: E402
 """Stage-1 end-to-end multi-objective training smoke for the dense C++ LM.
 
 This script ties the whole Stage-1 pipeline together on a tiny, fast profile:
@@ -8,14 +9,11 @@ This script ties the whole Stage-1 pipeline together on a tiny, fast profile:
      ``clang_semantic_4k_v10`` shard) and build one :class:`CodePacket` per
      packed row, trimmed to its ``valid_token_count`` so the real-token prefix
      and every token-aligned side-channel stay byte-aligned.
-  2. Synthesize :class:`CommitPacket` objects from the paired commit rows in
-     ``golden_mini/commits`` (consecutive pre/post rows of the same file) so the
-     commit objectives have real ``pre``/``post``/``diff``/``commit_msg`` token
-     streams to learn from.
-  3. Use :class:`TaskMixer` (Stage-1 default rates, fixed seed) to draw ONE
-     objective per packet, then build the ``(input_ids, target_ids, loss_mask)``
-     example via :mod:`cppmega_mlx.training.objectives`.
-  4. Run :class:`DenseCppLM` on a tiny smoke profile (d=256, depth=4) with AdamW
+  2. Use the production eligibility-aware quota mixer to materialize an exact
+     fixture-only causal/FIM/AST-FIM schedule. The legacy fixture has no typed
+     IFIM or commit sections, so those tasks are explicitly absent here rather
+     than fabricated or folded into another objective.
+  3. Run :class:`DenseCppLM` on a tiny smoke profile (d=256, depth=4) with AdamW
      for a few hundred steps, printing per-objective and overall loss and
      asserting the mixed-objective model learns (final overall loss < initial).
 
@@ -25,10 +23,10 @@ CRITICAL SIDE-CHANNEL ALIGNMENT RULE (enforced, fail-loud):
     Their ``input_ids`` are exactly ``packet.token_ids[:-1]``, so the CodePacket's
     token-aligned structure/platform side-channels (sliced to the SAME prefix and
     order) are still valid and ARE passed into :class:`DenseCppLM`.
-  * ``ast_fim`` / ``ifim`` / ``commit_diff`` / ``pre_to_post`` REORDER (FIM
-    permutation) or SYNTHESIZE (commit splice) the token stream, so the original
-    token-aligned channels no longer line up. For those steps the model is run
-    with side-channels DISABLED (``structure_residual_scale=0`` /
+  * ``fim`` / ``ast_fim`` / ``ifim`` / ``commit_diff`` / ``pre_to_post``
+    REORDER (FIM permutation) or SYNTHESIZE (commit splice) the token stream, so
+    the original token-aligned channels no longer line up. For those steps the
+    model is run with side-channels DISABLED (``structure_residual_scale=0`` /
     ``platform_residual_scale=0`` and NO channels passed). We NEVER pass a
     misaligned channel; whenever channels ARE passed we assert their length
     matches ``input_ids`` and RAISE on any mismatch.
@@ -63,7 +61,15 @@ from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.fim import FIMSpecialTokenIds
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
 from cppmega_mlx.training.objectives import ObjectiveExample
-from cppmega_mlx.training.task_mixer import TaskKind, TaskMixer
+from cppmega_mlx.training.objective_mixer import (
+    EligibilityAwareTaskMixer,
+    ObjectiveSource,
+)
+from cppmega_mlx.training.task_mixer import TaskKind
+from cppmega_mlx.training.stage1_production import (
+    add_stage1_production_arguments,
+    run_stage1_graph_domain_production,
+)
 
 GOLDEN_MINI = _REPO_ROOT / "tests" / "fixtures" / "golden_mini"
 
@@ -79,6 +85,7 @@ _ALIGNED_OBJECTIVES = frozenset(
 # Objectives that reorder / synthesize tokens (side-channels MUST be disabled).
 _REORDERED_OBJECTIVES = frozenset(
     {
+        "fim",
         "ast_fim",
         "ifim",
         "commit_diff",
@@ -98,6 +105,10 @@ def _col(arr) -> np.ndarray:
 
 def _i32(values) -> mx.array:
     return mx.array(np.asarray(values, dtype=np.int32))
+
+
+def _u64(values) -> mx.array:
+    return mx.array(np.asarray(values, dtype=np.uint64))
 
 
 def load_code_packets(
@@ -138,6 +149,26 @@ def load_code_packets(
                         f"{path.name}[row={row_index}].{name}: length {len(vals)} "
                         f"!= valid_token_count {vtc}"
                     )
+                if name in {
+                    "token_symbol_ids",
+                    "token_call_targets",
+                    "token_type_refs",
+                    "token_source_identity_ids",
+                }:
+                    return _u64(vals)
+                return _i32(vals)
+
+            def optional_chan(name: str) -> mx.array | None:
+                if row.get(name) is None:
+                    return None
+                vals = _col(row[name])[:vtc]
+                if len(vals) != vtc:
+                    raise ValueError(
+                        f"{path.name}[row={row_index}].{name}: length {len(vals)} "
+                        f"!= valid_token_count {vtc}"
+                    )
+                if name == "token_source_identity_ids":
+                    return _u64(vals)
                 return _i32(vals)
 
             # Chunk-aligned (NOT token-aligned) clang boundaries — required by the
@@ -149,6 +180,9 @@ def load_code_packets(
                 token_ids=_i32(tokens),
                 target_ids=chan("target_ids"),
                 loss_mask=chan("loss_mask"),
+                document_ids=optional_chan("doc_ids")
+                if row.get("doc_ids") is not None
+                else optional_chan("document_ids"),
                 structure_ids=chan("token_structure_ids"),
                 dep_levels=chan("token_dep_levels"),
                 ast_depth=chan("token_ast_depth"),
@@ -157,6 +191,13 @@ def load_code_packets(
                 symbol_ids=chan("token_symbol_ids"),
                 call_targets=chan("token_call_targets"),
                 type_refs=chan("token_type_refs"),
+                domain_ids=optional_chan("token_domain_ids"),
+                role_ids=optional_chan("token_role_ids"),
+                entity_ids=optional_chan("token_entity_ids"),
+                scope_ids=optional_chan("token_scope_ids"),
+                source_doc_ids=optional_chan("token_source_doc_ids"),
+                source_identity_ids=optional_chan("token_source_identity_ids"),
+                confidence_ids=optional_chan("token_confidence_ids"),
                 repo=str(row.get("repo")) if row.get("repo") is not None else None,
                 filepath=str(row.get("filepath"))
                 if row.get("filepath") is not None
@@ -222,64 +263,67 @@ def load_commit_packets(
     *,
     vocab_size: int,
 ) -> list[CommitPacket]:
-    """Synthesize CommitPackets by pairing consecutive pre/post commit rows.
-
-    ``golden_mini/commits`` stores tokenized before/after pairs of the SAME file
-    on consecutive rows (row 2k = pre, row 2k+1 = post). We pair them into one
-    CommitPacket carrying:
-      * ``pre_token_ids``  = pre row token_ids
-      * ``post_token_ids`` = post row token_ids
-      * ``diff_token_ids`` = post row token_ids (the edited content to predict)
-      * ``commit_msg``     = a short synthetic prompt: [BOS, CODE_START]
-    so ``build_commit_diff`` / ``build_pre_to_post`` have real, non-empty fields.
-    These objectives splice/synthesize the stream, so NO token-aligned
-    side-channels travel with the CommitPacket (alignment rule).
-    """
+    """Load authoritative typed commit sections without inferred fallbacks."""
 
     table = pq.read_table(str(commits_path))
-    rows = table.to_pylist()
-    if len(rows) < 2:
+    required = {
+        "pre_token_ids",
+        "post_token_ids",
+        "diff_token_ids",
+        "commit_msg_token_ids",
+    }
+    missing = sorted(required - set(table.column_names))
+    if missing:
         raise ValueError(
-            f"{commits_path.name}: need >=2 commit rows to form a pre/post pair, "
-            f"got {len(rows)}"
+            f"{commits_path.name}: missing typed commit columns {missing}; "
+            "rendered source_text wrappers are not parsed"
         )
+    rows = table.to_pylist()
 
-    def toks(row, idx) -> np.ndarray:
-        t = np.asarray(row["token_ids"], dtype=np.int64)
-        if t.size < 2:
-            raise ValueError(
-                f"{commits_path.name}[row={idx}]: token_ids too short ({t.size})"
-            )
+    def toks(row, idx, column: str) -> np.ndarray | None:
+        t = np.asarray(row[column], dtype=np.int64)
+        if t.size == 0:
+            return None
         if t.min() < 0 or t.max() >= vocab_size:
             raise ValueError(
-                f"{commits_path.name}[row={idx}]: token id out of range "
+                f"{commits_path.name}[row={idx}].{column}: token id out of range "
                 f"[0,{vocab_size}); got [{int(t.min())},{int(t.max())}]"
             )
         return t
 
     packets: list[CommitPacket] = []
-    msg = _i32([_SPECIAL.fim_prefix - 2, 7])  # [BOS=2, CODE_START=7] synthetic prompt
-    for k in range(0, len(rows) - 1, 2):
-        pre_row, post_row = rows[k], rows[k + 1]
-        pre = toks(pre_row, k)
-        post = toks(post_row, k + 1)
+    for row_index, row in enumerate(rows):
+        pre = toks(row, row_index, "pre_token_ids")
+        post = toks(row, row_index, "post_token_ids")
+        diff = toks(row, row_index, "diff_token_ids")
+        message = toks(row, row_index, "commit_msg_token_ids")
+        if all(section is None for section in (pre, post, diff, message)):
+            # Keep the loader fail-closed: an entirely empty typed row carries
+            # no objective input and must not become a synthetic packet.
+            continue
         packets.append(
             CommitPacket(
-                pre_token_ids=_i32(pre),
-                post_token_ids=_i32(post),
-                diff_token_ids=_i32(post),
-                commit_msg=msg,
-                repo=str(pre_row.get("repo"))
-                if pre_row.get("repo") is not None
+                pre_token_ids=None if pre is None else _i32(pre),
+                post_token_ids=None if post is None else _i32(post),
+                diff_token_ids=None if diff is None else _i32(diff),
+                commit_msg=None if message is None else _i32(message),
+                repo=str(row.get("repo"))
+                if row.get("repo") is not None
                 else None,
-                filepath=str(pre_row.get("filepath"))
-                if pre_row.get("filepath") is not None
+                filepath=str(row.get("filepath"))
+                if row.get("filepath") is not None
                 else None,
-                metadata={"pre_row": k, "post_row": k + 1},
+                commit_or_ref=str(row.get("commit_hash"))
+                if row.get("commit_hash") is not None
+                else None,
+                metadata={"row_index": row_index},
             )
         )
     if not packets:
-        raise ValueError(f"no commit packets paired from {commits_path!r}")
+        raise ValueError(
+            f"no non-empty typed commit rows loaded from {commits_path!r}; "
+            "at least one of pre/post/diff/commit_msg is required"
+        )
     return packets
 
 
@@ -436,73 +480,39 @@ def _loss_for_step(
 
 
 def materialize_steps(
-    mixer: TaskMixer,
+    mixer: EligibilityAwareTaskMixer,
     code_packets: list[CodePacket],
     commit_packets: list[CommitPacket],
     *,
     num_steps: int,
 ) -> list[TrainStep]:
-    """Draw an objective per step and materialize a TrainStep deterministically.
+    """Materialize one exact deterministic quota window with no redraws."""
 
-    Code-family tasks consume a CodePacket; commit-family tasks a CommitPacket.
-    Packets cycle so a small fixture supports an arbitrary step budget. Steps
-    that the fixture cannot satisfy (e.g. a recovery channel with no span on a
-    particular packet) are re-drawn at the NEXT step index — the mixer stays
-    deterministic and we never silently fabricate a span.
-    """
-
+    if not code_packets:
+        raise ValueError("materialize_steps requires at least one CodePacket")
+    sources = [
+        ObjectiveSource(
+            code_packet=code_packets[index % len(code_packets)],
+            commit_packet=(
+                commit_packets[index % len(commit_packets)]
+                if commit_packets
+                else None
+            ),
+        )
+        for index in range(num_steps)
+    ]
+    realized = mixer.materialize_window(sources)
     steps: list[TrainStep] = []
-    code_i = 0
-    commit_i = 0
-    step_index = 0
-    attempts = 0
-    max_attempts = num_steps * 50
-    while len(steps) < num_steps:
-        if attempts > max_attempts:
-            raise RuntimeError(
-                f"could not materialize {num_steps} steps after {attempts} draws; "
-                "fixture too small for the drawn objective mix"
-            )
-        attempts += 1
-        task = mixer.draw_task(step_index)
-        rng = mixer._step_rng(step_index)
-        step_index += 1
-        if task in (TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST):
-            if not commit_packets:
-                # No commit fixture present — this objective is unavailable for the
-                # whole run; advance to the next deterministic draw.
-                continue
-            packet = commit_packets[commit_i % len(commit_packets)]
-            commit_i += 1
-        else:
-            packet = code_packets[code_i % len(code_packets)]
-            code_i += 1
-        try:
-            example = mixer.build(task, packet, rng=rng)
-        except ValueError as exc:
-            # Only an EXPECTED data limitation may be skipped: a recovery channel
-            # with no non-zero span on this packet, or a packet lacking clang
-            # chunk boundaries for AST-FIM. Anything else is a real bug -> RAISE.
-            if not _is_expected_unsatisfiable(exc):
-                raise
-            continue
-        steps.append(build_train_step(example.objective, example, packet))
+    for item in realized:
+        source = sources[item.source_index]
+        packet = (
+            source.commit_packet
+            if item.task in (TaskKind.COMMIT_DIFF, TaskKind.PRE_TO_POST)
+            else source.code_packet
+        )
+        assert packet is not None
+        steps.append(build_train_step(item.example.objective, item.example, packet))
     return steps
-
-
-_EXPECTED_UNSATISFIABLE_MARKERS = (
-    "no non-zero recoverable span",
-    "yields no supervised target",
-    "requires CodePacket.chunk_starts and chunk_ends",
-    "channel is absent",
-)
-
-
-def _is_expected_unsatisfiable(exc: Exception) -> bool:
-    """True only for data-limitation skips (empty span / missing chunks)."""
-
-    text = str(exc)
-    return any(marker in text for marker in _EXPECTED_UNSATISFIABLE_MARKERS)
 
 
 def run_training(
@@ -524,33 +534,20 @@ def run_training(
         code_paths = code_paths + extra
 
     code_packets = load_code_packets(code_paths, vocab_size=vocab_size)
-    commits_path = GOLDEN_MINI / "commits" / "commits.parquet"
-    commit_packets = (
-        load_commit_packets(commits_path, vocab_size=vocab_size)
-        if commits_path.exists()
-        else []
+    # The golden fixture predates typed IFIM/commit fields. Keep this smoke
+    # deliberately narrow; production defaults are exercised by
+    # train_eval_stage1.py and materialize_megatron_objectives.py.
+    rates = {
+        TaskKind.CAUSAL_LM: 0.8,
+        TaskKind.FIM: 0.1,
+        TaskKind.AST_FIM: 0.1,
+    }
+    mixer = EligibilityAwareTaskMixer(
+        rates, seed=seed, special_token_ids=_SPECIAL
     )
 
-    # Stage-1 default mix, with the IFIM rate folded into AST_FIM. IFIM needs a
-    # per-document leading comment/docstring in metadata['source_text']; the
-    # packed golden_mini rows do not carry decoded source text, so IFIM is
-    # genuinely unavailable on THIS fixture. We fold its 0.1 into ast_fim (the
-    # FIM bucket total is preserved) rather than letting the mixer draw an
-    # objective the fixture cannot satisfy. This is explicit + config-driven, not
-    # a silent skip. (A real run with source_text restores the default split.)
-    rates = {
-        TaskKind.CAUSAL_LM: 0.5,
-        TaskKind.AST_FIM: 0.2,  # 0.1 ast_fim + 0.1 folded-in ifim
-        TaskKind.COMMIT_DIFF: 0.1,
-        TaskKind.PRE_TO_POST: 0.1,
-        TaskKind.SYMBOL_RECOVERY: 0.1 / 3.0,
-        TaskKind.TYPE_RECOVERY: 0.1 / 3.0,
-        TaskKind.CALLEE_RECOVERY: 0.1 / 3.0,
-    }
-    mixer = TaskMixer(rates, seed=seed, special_token_ids=_SPECIAL)
-
     steps = materialize_steps(
-        mixer, code_packets, commit_packets, num_steps=num_steps
+        mixer, code_packets, [], num_steps=num_steps
     )
 
     dist = Counter(s.objective for s in steps)
@@ -645,7 +642,59 @@ def main() -> int:
         default=None,
         help="optional dir with a real clang_semantic_4k_v10 shard (one *.parquet)",
     )
+    add_stage1_production_arguments(parser)
+    parser.add_argument(
+        "--production-bucket",
+        type=int,
+        default=None,
+        help="immutable bundle sequence-length bucket",
+    )
+    parser.add_argument(
+        "--production-expected-bundle-id",
+        default=None,
+        help="exact immutable bundle ID expected by the restore receipt",
+    )
+    parser.add_argument(
+        "--production-restore-receipt",
+        type=Path,
+        default=None,
+        help="retained bundle-root restore_receipt.json",
+    )
     args = parser.parse_args()
+    production_bundle_args = {
+        "--production-graph-domain-data": args.production_graph_domain_data,
+        "--production-bucket": args.production_bucket,
+        "--production-expected-bundle-id": args.production_expected_bundle_id,
+        "--production-restore-receipt": args.production_restore_receipt,
+    }
+    production_mode = any(
+        value is not None for value in production_bundle_args.values()
+    )
+    missing_bundle_args = [
+        flag for flag, value in production_bundle_args.items() if value is None
+    ]
+    if production_mode and missing_bundle_args:
+        parser.error(
+            "production bundle mode requires explicit CLI provenance for all bundle "
+            f"arguments; missing {', '.join(missing_bundle_args)}"
+        )
+    if production_mode:
+        run_stage1_graph_domain_production(
+            data_path=args.production_graph_domain_data,
+            bucket=args.production_bucket,
+            expected_bundle_id=args.production_expected_bundle_id,
+            restore_receipt=args.production_restore_receipt,
+            steps=args.steps,
+            batch_size=4,
+            seq_len=4096,
+            hidden_size=1280,
+            depth=24,
+            ffn_hidden_size=3456,
+            learning_rate=args.lr,
+            seed=args.seed,
+            attention_mode=args.production_attention_mode,
+        )
+        return 0
     extra = Path(args.extra_source) if args.extra_source else None
     run_training(
         num_steps=args.steps, seed=args.seed, lr=args.lr, extra_source=extra

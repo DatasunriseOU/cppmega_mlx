@@ -52,8 +52,8 @@ Public surface (mirrors :mod:cppmega_mlx.nn._tilelang.mamba3):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
 
 import mlx.core as mx
 
@@ -614,6 +614,66 @@ def _materialize_h0(
     return h0.astype(dtype)
 
 
+def _dispatch_m2rnn_metal_kernel(
+    kernel: _msl_transform.MetalKernel | None,
+    *,
+    operation: str,
+    inputs: Sequence[mx.array],
+    output_shapes: Sequence[Sequence[int]],
+    output_dtypes: Sequence[mx.Dtype],
+    grid: tuple[int, int, int],
+    threadgroup: tuple[int, int, int],
+    template: Sequence[tuple[str, object]],
+) -> list[mx.array]:
+    """Launch one owned M2RNN Metal kernel and fail closed on any contract error."""
+
+    if kernel is None:
+        raise RuntimeError(f"M2RNN {operation} Metal kernel was not constructed")
+    if len(output_shapes) != len(output_dtypes):
+        raise ValueError(
+            f"M2RNN {operation} Metal dispatch received {len(output_shapes)} "
+            f"output shapes but {len(output_dtypes)} dtypes"
+        )
+    if any(dim <= 0 for dim in (*grid, *threadgroup)):
+        raise ValueError(
+            f"M2RNN {operation} Metal launch dimensions must be positive, "
+            f"got grid={grid}, threadgroup={threadgroup}"
+        )
+
+    try:
+        outputs = kernel(
+            inputs=list(inputs),
+            template=list(template) if template else None,
+            grid=grid,
+            threadgroup=threadgroup,
+            output_shapes=[tuple(shape) for shape in output_shapes],
+            output_dtypes=list(output_dtypes),
+            stream=mx.gpu,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"M2RNN {operation} Metal dispatch failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if len(outputs) != len(output_shapes):
+        raise RuntimeError(
+            f"M2RNN {operation} Metal dispatch returned {len(outputs)} outputs, "
+            f"expected {len(output_shapes)}"
+        )
+    for index, (output, shape, dtype) in enumerate(
+        zip(outputs, output_shapes, output_dtypes, strict=True)
+    ):
+        expected_shape = tuple(shape)
+        if tuple(output.shape) != expected_shape or output.dtype != dtype:
+            raise RuntimeError(
+                f"M2RNN {operation} Metal output {index} violated its contract: "
+                f"got shape={output.shape}, dtype={output.dtype}; "
+                f"expected shape={expected_shape}, dtype={dtype}"
+            )
+    return outputs
+
+
 def m2rnn_fwd_metal(
     q: mx.array,
     k: mx.array,
@@ -622,12 +682,7 @@ def m2rnn_fwd_metal(
     xf: mx.array,
     h0: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
-    """Path B Metal forward, returning (y, h_last, tanh_cache).
-
-    Falls back to the reference scan if Metal is unavailable; in that case
-    tanh_cache is recomputed in pure MLX so the bwd contract still
-    holds.
-    """
+    """Path B Metal forward, returning (y, h_last, tanh_cache)."""
 
     q, k, v, W, xf = _broadcast_inputs(q, k, v, W, xf)
     batch, seq, heads, k_dim, v_dim = _validate_inputs(q, k, v, W, xf, h0)
@@ -647,7 +702,7 @@ def m2rnn_fwd_metal(
 
     status = m2rnn_metal_status(q)
     if not status.available or _FWD_KERNEL is None:
-        return _m2rnn_fwd_pure_mlx(q, k, v, W, xf, h0_full, out_dtype=out_dtype)
+        raise RuntimeError(f"M2RNN forward Metal dispatch unavailable: {status.reason}")
 
     inputs = [
         q.astype(cast_dtype),
@@ -673,76 +728,23 @@ def m2rnn_fwd_metal(
         ("STATE_KV", k_dim * v_dim),
         ("STATE_VV", v_dim * v_dim),
     ]
-    try:
-        outputs = _msl_transform.dispatch(
-            cast(_msl_transform.MetalKernel, _FWD_KERNEL),
-            inputs=inputs,
-            output_shapes=[
-                (batch, seq, heads, v_dim),
-                (batch, heads, k_dim, v_dim),
-                (batch, seq, heads, k_dim, v_dim),
-            ],
-            output_dtypes=[cast_dtype, cast_dtype, cast_dtype],
-            grid=(groups * threads_per_group, 1, 1),
-            threadgroup=(threads_per_group, 1, 1),
-            template=template,
-        )
-    except Exception:
-        return _m2rnn_fwd_pure_mlx(q, k, v, W, xf, h0_full, out_dtype=out_dtype)
+    outputs = _dispatch_m2rnn_metal_kernel(
+        _FWD_KERNEL,
+        operation="forward",
+        inputs=inputs,
+        output_shapes=[
+            (batch, seq, heads, v_dim),
+            (batch, heads, k_dim, v_dim),
+            (batch, seq, heads, k_dim, v_dim),
+        ],
+        output_dtypes=[cast_dtype, cast_dtype, cast_dtype],
+        grid=(groups * threads_per_group, 1, 1),
+        threadgroup=(threads_per_group, 1, 1),
+        template=template,
+    )
 
     y, h_last, tanh_cache = outputs
     return y.astype(out_dtype), h_last.astype(out_dtype), tanh_cache
-
-
-def _m2rnn_fwd_pure_mlx(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    W: mx.array,
-    xf: mx.array,
-    h0: mx.array,
-    *,
-    out_dtype: mx.Dtype,
-) -> tuple[mx.array, mx.array, mx.array]:
-    """Reference forward that also returns the tanh_cache the bwd kernel needs.
-
-    Math identical to :func:cppmega_mlx.nn.m2rnn.m2rnn_scan. We cannot just
-    call the parent helper because we also need the per-step tanh(z_t)
-    saved out for backward.
-    """
-
-    batch, seq, heads, k_dim = q.shape
-    v_dim = v.shape[-1]
-    if seq == 0:
-        return (
-            mx.zeros((batch, 0, heads, v_dim), dtype=out_dtype),
-            h0.astype(out_dtype),
-            mx.zeros((batch, 0, heads, k_dim, v_dim), dtype=h0.dtype),
-        )
-
-    work_dtype = mx.float32
-    h = h0.astype(work_dtype)
-    W_e = W.astype(work_dtype)[None, :, :, :]  # (1, H, V, V)
-    x_all = (
-        mx.expand_dims(k.astype(work_dtype), -1)
-        * mx.expand_dims(v.astype(work_dtype), -2)
-    )  # (B, S, H, K, V)
-    xf_5d = xf.astype(work_dtype)[:, :, :, None, None]
-    out_steps: list[mx.array] = []
-    tanh_steps: list[mx.array] = []
-    for s in range(seq):
-        f = xf_5d[:, s]  # (B, H, 1, 1)
-        z = mx.matmul(h, W_e[0]) + x_all[:, s]
-        tz = mx.tanh(z)
-        tanh_steps.append(tz)
-        h = f * h + (1.0 - f) * tz
-        # y[s, vv] = sum_kk q[kk] * h[kk, vv] -> einsum bhk,bhkv->bhv
-        y_s = mx.einsum("bhk,bhkv->bhv", q[:, s].astype(work_dtype), h)
-        out_steps.append(y_s)
-    y = mx.stack(out_steps, axis=1).astype(out_dtype)
-    h_final = h.astype(out_dtype)
-    tanh_cache = mx.stack(tanh_steps, axis=1).astype(h0.dtype)
-    return y, h_final, tanh_cache
 
 
 def m2rnn_bwd_metal(
@@ -755,12 +757,7 @@ def m2rnn_bwd_metal(
     tanh_cache: mx.array,
     h0: mx.array | None = None,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """Backward pass returning gradients for (q, k, v, W, xf, h0).
-
-    Tries the Metal kernel first; on dispatch failure or when Metal is
-    unavailable, falls back to a pure-MLX implementation that reproduces
-    the same math step-by-step (still uses tanh_cache from the fwd).
-    """
+    """Backward pass returning gradients for (q, k, v, W, xf, h0)."""
 
     q, k, v, W, xf = _broadcast_inputs(q, k, v, W, xf)
     batch, seq, heads, k_dim, v_dim = _validate_inputs(q, k, v, W, xf, h0)
@@ -785,7 +782,7 @@ def m2rnn_bwd_metal(
             h0_full.astype(h0_dtype),
         )
 
-    metal_grads = _m2rnn_bwd_metal_kernel(
+    dq, dk, dv, dW, dxf_, dh0 = _m2rnn_bwd_metal_kernel(
         dy=dy,
         q=q,
         k=k,
@@ -796,28 +793,13 @@ def m2rnn_bwd_metal(
         tanh_cache=tanh_cache,
         cast_dtype=cast_dtype,
     )
-    if metal_grads is not None:
-        dq, dk, dv, dW, dxf_, dh0 = metal_grads
-        return (
-            dq.astype(out_dtypes[0]),
-            dk.astype(out_dtypes[1]),
-            dv.astype(out_dtypes[2]),
-            dW.astype(out_dtypes[3]),
-            dxf_.astype(out_dtypes[4]),
-            dh0.astype(h0_dtype),
-        )
-    # Fall back to pure-MLX bwd.
-    return _m2rnn_bwd_pure_mlx(
-        dy=dy,
-        q=q,
-        k=k,
-        v=v,
-        W=W,
-        xf=xf,
-        h0_full=h0_full,
-        tanh_cache=tanh_cache,
-        out_dtypes=out_dtypes,
-        h0_dtype=h0_dtype,
+    return (
+        dq.astype(out_dtypes[0]),
+        dk.astype(out_dtypes[1]),
+        dv.astype(out_dtypes[2]),
+        dW.astype(out_dtypes[3]),
+        dxf_.astype(out_dtypes[4]),
+        dh0.astype(h0_dtype),
     )
 
 
@@ -832,19 +814,19 @@ def _m2rnn_bwd_metal_kernel(
     h0_full: mx.array,
     tanh_cache: mx.array,
     cast_dtype: mx.Dtype,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array] | None:
-    """Try the Metal bwd kernel; return None if dispatch is not eligible."""
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Launch the owned Metal backward kernel or raise with the failure cause."""
 
     if _BWD_KERNEL is None:
-        return None
+        raise RuntimeError("M2RNN backward Metal kernel was not constructed")
     status = m2rnn_metal_status(q)
     if not status.available:
-        return None
+        raise RuntimeError(f"M2RNN backward Metal dispatch unavailable: {status.reason}")
 
     batch, seq, heads, k_dim = q.shape
     v_dim = v.shape[-1]
     if seq == 0:
-        return None
+        raise RuntimeError("M2RNN backward Metal kernel cannot launch an empty sequence")
 
     inputs = [
         dy.astype(cast_dtype),
@@ -869,133 +851,33 @@ def _m2rnn_bwd_metal_kernel(
         ("STATE_KV", k_dim * v_dim),
         ("STATE_VV", v_dim * v_dim),
     ]
-    try:
-        outputs = _msl_transform.dispatch(
-            cast(_msl_transform.MetalKernel, _BWD_KERNEL),
-            inputs=inputs,
-            output_shapes=[
-                (batch, seq, heads, k_dim),               # dq
-                (batch, seq, heads, k_dim),               # dk
-                (batch, seq, heads, v_dim),               # dv
-                (batch, heads, v_dim, v_dim),             # dW_partial
-                (batch, seq, heads),                      # dxf
-                (batch, heads, k_dim, v_dim),             # dh0
-                (batch * heads, seq, k_dim * v_dim),      # h_steps_scratch
-            ],
-            output_dtypes=[cast_dtype] * 7,
-            grid=(groups * threads_per_group, 1, 1),
-            threadgroup=(threads_per_group, 1, 1),
-            template=template,
-        )
-    except Exception:
-        return None
+    outputs = _dispatch_m2rnn_metal_kernel(
+        _BWD_KERNEL,
+        operation="backward",
+        inputs=inputs,
+        output_shapes=[
+            (batch, seq, heads, k_dim),               # dq
+            (batch, seq, heads, k_dim),               # dk
+            (batch, seq, heads, v_dim),               # dv
+            (batch, heads, v_dim, v_dim),             # dW_partial
+            (batch, seq, heads),                      # dxf
+            (batch, heads, k_dim, v_dim),             # dh0
+            (batch * heads, seq, k_dim * v_dim),      # h_steps_scratch
+        ],
+        output_dtypes=[cast_dtype] * 7,
+        grid=(groups * threads_per_group, 1, 1),
+        threadgroup=(threads_per_group, 1, 1),
+        template=template,
+    )
     dq, dk, dv, dW_partial, dxf_, dh0, _scratch = outputs
     # Reduce dW over batch.
     dW = mx.sum(dW_partial, axis=0)  # (H, V, V)
     return dq, dk, dv, dW, dxf_, dh0
 
 
-def _m2rnn_bwd_pure_mlx(
-    *,
-    dy: mx.array,
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    W: mx.array,
-    xf: mx.array,
-    h0_full: mx.array,
-    tanh_cache: mx.array,
-    out_dtypes: tuple[mx.Dtype, ...],
-    h0_dtype: mx.Dtype,
-) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
-    """Pure-MLX backward. Matches the kernel math step-by-step."""
-
-    batch, seq, heads, k_dim = q.shape
-    v_dim = v.shape[-1]
-    work_dtype = mx.float32
-
-    q_f = q.astype(work_dtype)
-    k_f = k.astype(work_dtype)
-    v_f = v.astype(work_dtype)
-    W_f = W.astype(work_dtype)
-    xf_f = xf.astype(work_dtype)
-    h0_f = h0_full.astype(work_dtype)
-    dy_f = dy.astype(work_dtype)
-    tanh_f = tanh_cache.astype(work_dtype)
-
-    # Re-materialise h_{t-1} sequence (h_steps[t] is h_{t-1} at step t).
-    h_steps: list[mx.array] = []
-    h = h0_f
-    for t in range(seq):
-        h_steps.append(h)
-        f = xf_f[:, t, :, None, None]
-        h = f * h + (1.0 - f) * tanh_f[:, t]
-
-    # Walk backwards.
-    dh = mx.zeros_like(h0_f)
-    dW_acc = mx.zeros((heads, v_dim, v_dim), dtype=work_dtype)
-    dq_steps: list[mx.array] = [mx.zeros((batch, heads, k_dim), dtype=work_dtype)] * seq
-    dk_steps: list[mx.array] = [mx.zeros((batch, heads, k_dim), dtype=work_dtype)] * seq
-    dv_steps: list[mx.array] = [mx.zeros((batch, heads, v_dim), dtype=work_dtype)] * seq
-    dxf_steps: list[mx.array] = [mx.zeros((batch, heads), dtype=work_dtype)] * seq
-
-    for t in range(seq - 1, -1, -1):
-        f = xf_f[:, t, :, None, None]            # (B, H, 1, 1)
-        f_flat = xf_f[:, t]                       # (B, H)
-        one_minus_f = 1.0 - f
-        h_prev = h_steps[t]                      # (B, H, K, V)
-        tz = tanh_f[:, t]                        # (B, H, K, V)
-        h_t = f * h_prev + one_minus_f * tz      # (B, H, K, V)
-
-        # dY[t] is (B, H, V); dq[kk] += sum_vv dY[vv] * h_t[kk, vv]
-        dY_t = dy_f[:, t]                        # (B, H, V)
-        dq_steps[t] = mx.einsum("bhv,bhkv->bhk", dY_t, h_t)
-
-        # dh += q[..., None] * dY[..., None, :]
-        dh = dh + q_f[:, t, :, :, None] * dY_t[:, :, None, :]
-
-        # df_t = sum_kv dh * (h_prev - tz)
-        df = mx.sum(dh * (h_prev - tz), axis=(-1, -2))  # (B, H)
-        dxf_steps[t] = df
-
-        # dh_new = (1 - f) * dh; dz = dh_new * (1 - tanh^2)
-        dh_new = one_minus_f * dh
-        dz = dh_new * (1.0 - tz * tz)
-
-        # dk[kk] = sum_vv dz[kk, vv] * v_t[vv]
-        dk_steps[t] = mx.sum(dz * v_f[:, t, :, None, :], axis=-1)
-        # dv[vv] = sum_kk dz[kk, vv] * k_t[kk]
-        dv_steps[t] = mx.sum(dz * k_f[:, t, :, :, None], axis=-2)
-        # dW[h, v0, vv] += sum_b sum_kk h_prev[b, h, kk, v0] * dz[b, h, kk, vv]
-        dW_step = mx.einsum("bhkv,bhku->bhvu", h_prev, dz)  # (B, H, V_in, V_out)
-        dW_acc = dW_acc + mx.sum(dW_step, axis=0)
-
-        # dh_next = f * dh + dz @ W^T  (where dz is (B,H,K,V_out), W is (H, V_in, V_out))
-        dh = f * dh + mx.einsum("bhku,hvu->bhkv", dz, W_f)
-
-    dq = mx.stack(dq_steps, axis=1).astype(out_dtypes[0])
-    dk = mx.stack(dk_steps, axis=1).astype(out_dtypes[1])
-    dv = mx.stack(dv_steps, axis=1).astype(out_dtypes[2])
-    dxf_out = mx.stack(dxf_steps, axis=1).astype(out_dtypes[4])
-    dW_out = dW_acc.astype(out_dtypes[3])
-    dh0_out = dh.astype(h0_dtype)
-    return dq, dk, dv, dW_out, dxf_out, dh0_out
-
-
 # ---------------------------------------------------------------------------
 # Differentiable wrappers
 # ---------------------------------------------------------------------------
-
-
-def _zeros_for_h0(
-    q: mx.array,
-    *,
-    heads: int,
-    k_dim: int,
-    v_dim: int,
-) -> mx.array:
-    """Return a default zero h0 used when the caller passes None."""
-    return mx.zeros((q.shape[0], heads, k_dim, v_dim), dtype=q.dtype)
 
 
 @mx.custom_function

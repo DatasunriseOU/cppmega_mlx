@@ -34,7 +34,7 @@ docs/upstream/tilelang_metal_mamba3/captures/
 .claude/
 
 # Large real-data samples copied from GB10 for local-only smoke tests.
-data/parquet_samples/
+data/parquet_samples
 
 # Beads / Dolt files (added by bd init)
 .beads/

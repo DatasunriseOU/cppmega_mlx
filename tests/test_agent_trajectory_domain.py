@@ -29,3 +29,17 @@ def test_parse_result_diagnostic_domain_routes_compiler_and_linker_errors():
     assert compiler.domain == DomainKind.COMPILER_ERROR
     assert linker is not None
     assert linker.domain == DomainKind.LINKER_ERROR
+
+
+def test_parse_result_diagnostic_domain_routes_test_and_sanitizer_output():
+    test = parse_result_diagnostic_domain(
+        "FAILED tests/test_app.py::test_cli - AssertionError\n"
+    )
+    sanitizer = parse_result_diagnostic_domain(
+        "==1==ERROR: AddressSanitizer: heap-use-after-free\n"
+    )
+
+    assert test is not None
+    assert test.domain == DomainKind.TEST_OUTPUT
+    assert sanitizer is not None
+    assert sanitizer.domain == DomainKind.SANITIZER_OUTPUT

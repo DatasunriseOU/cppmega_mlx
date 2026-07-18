@@ -4,12 +4,14 @@ Why the autouse env-isolation fixture below exists
 ==================================================
 Meta agent E flagged that bench-harness scripts (``scripts/bench_tilelang_*``)
 read ``TILELANG_ROOT`` / ``TVM_ROOT`` / ``TVM_TARGET`` / ``TVM_METAL_*`` /
-``METAL_DEVICE_WRAPPER_TYPE`` / ``TVM_LIBRARY_PATH`` / ``PYTHONPATH`` and
+``METAL_DEVICE_WRAPPER_TYPE`` / ``TVM_LIBRARY_PATH`` / foreign ``PYTHONPATH`` and
 mutate ``sys.path``. Without isolation, a developer's shell env or the
 output of one test bleeds into another, masking real configuration bugs
 ("works on my machine" but fails on CI). The fixture below scrubs those
 vars at the start of every test via ``monkeypatch.delenv`` (which is
-auto-restored at teardown), giving each test a hermetic env baseline.
+auto-restored at teardown), then restores only this checkout as
+``PYTHONPATH``. That keeps child ``python -m scripts...`` commands working
+under ``PYTHONSAFEPATH=1`` without trusting the caller's path list.
 Tests that need a specific value should ``monkeypatch.setenv`` it
 explicitly inside the test body. The only shared exception is the checked-out
 TileLang dev build path below, which is reintroduced after the scrub so Path C
@@ -37,7 +39,8 @@ import sys
 from pathlib import Path as _Path
 
 
-_DEFAULT_TILELANG_DEV_ROOT = _Path(__file__).resolve().parents[2] / "tilelang"
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+_DEFAULT_TILELANG_DEV_ROOT = _REPO_ROOT.parent / "tilelang"
 _TILELANG_DEV_ROOT = _Path(
     os.environ.get("CPPMEGA_TILELANG_DEV_ROOT", str(_DEFAULT_TILELANG_DEV_ROOT))
 )
@@ -120,6 +123,19 @@ _TILELANG_TVM_ENV_VARS = (
 _VOLATILE_ENV_PREFIXES = ("MLX_", "MTL_")
 
 
+def pytest_collection_modifyitems(config, items):
+    """Keep hardware tests explicit on developer machines and CI runners."""
+
+    if os.environ.get("CPPMEGA_RUN_CUDA_TESTS") == "1":
+        return
+    skip_cuda = pytest.mark.skip(
+        reason="CUDA tests require CPPMEGA_RUN_CUDA_TESTS=1 on a provisioned runner"
+    )
+    for item in items:
+        if "cuda_required" in item.keywords or "cuda_hardware" in item.keywords:
+            item.add_marker(skip_cuda)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_tilelang_tvm_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip TileLang/TVM env vars at test start; auto-restore at teardown.
@@ -139,6 +155,11 @@ def _isolate_tilelang_tvm_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for var in _TILELANG_TVM_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+
+    # Python safe-path mode removes the working directory from child
+    # interpreters. Expose exactly this checkout so repository-owned
+    # ``python -m scripts...`` subprocesses remain hermetic and resolvable.
+    monkeypatch.setenv("PYTHONPATH", str(_REPO_ROOT))
 
     for var in list(os.environ):
         if var.startswith(_VOLATILE_ENV_PREFIXES):

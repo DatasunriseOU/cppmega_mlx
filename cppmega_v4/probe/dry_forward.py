@@ -46,6 +46,13 @@ def dry_forward(
     the fan-in point — matches the convention BrickGraph uses for
     Tiny-Aya style ``GQA‖MLP``.
     """
+    saved_random_state = None
+    if seed is not None:
+        # Module constructors use MLX's process-global RNG. Seed before
+        # constructing the graph, then restore the caller's stream so a
+        # diagnostic forward cannot perturb a subsequent training step.
+        saved_random_state = [mx.array(part) for part in mx.random.state]
+        mx.random.seed(int(seed))
     try:
         # Build modules fresh — caller may have passed instantiate=False.
         modules: dict[str, object] = {}
@@ -183,3 +190,6 @@ def dry_forward(
             verdict="exception",
             detail=f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        if saved_random_state is not None:
+            mx.random.state = saved_random_state

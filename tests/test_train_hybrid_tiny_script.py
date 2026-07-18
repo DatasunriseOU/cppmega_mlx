@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from cppmega_mlx.data.batch import LMTokenBatch
+from scripts.mlx_env_contract import build_mlx_wheel_environment
 from scripts.train_hybrid_tiny import TrainHybridTinyConfig, make_training_loss_fn
 
 
@@ -76,7 +77,13 @@ def run_script(
     timeout: int = 45,
     env: dict[str, str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    process_env = os.environ.copy()
+    # This CLI exercises the MLX wheel/runtime contract, not the Path-C
+    # TileLang source stack. In a full suite the inherited Path-C loader can
+    # retain large TVM/Metal state and make a tiny child process time out.
+    process_env = build_mlx_wheel_environment(
+        os.environ,
+        python=Path(sys.executable),
+    )
     if env is None or "CPPMEGA_OPTIMIZER" not in env:
         process_env.pop("CPPMEGA_OPTIMIZER", None)
     if env is not None:
@@ -1091,6 +1098,7 @@ def test_single_route_cli_smoke_eager_reports_finite_route_metadata(
     write_npz(npz_path, vocab_size=32)
 
     result = run_script(str(npz_path), *_tiny_route_args(symbol))
+    assert "Loading tilelang libs" not in result.stderr
     payload = _load_json_result(result)
 
     _assert_finite_route_training_payload(
@@ -2069,13 +2077,16 @@ def test_resume_rejects_coerced_checkpoint_cursor_metadata(
 
 def test_mlx_disable_compile_env_reports_requested_but_eager_execution(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     npz_path = tmp_path / "tokens_M.npz"
     write_npz(npz_path, vocab_size=32)
-    monkeypatch.setenv("MLX_DISABLE_COMPILE", "1")
 
-    result = run_script(str(npz_path), *_tiny_route_args("M"), "--compile")
+    result = run_script(
+        str(npz_path),
+        *_tiny_route_args("M"),
+        "--compile",
+        env={"MLX_DISABLE_COMPILE": "1"},
+    )
     payload = _load_json_result(result)
 
     assert payload["compile"] is True

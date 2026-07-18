@@ -19,9 +19,10 @@ from __future__ import annotations
 import pytest
 
 from cppmega_mlx.nn._tilelang.mamba3_chunked_scan_core import (
-    MAMBA3_CHUNKED_FWD_BLOCK_M,
-    MAMBA3_CHUNKED_FWD_BLOCK_N,
+    MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT,
+    chunk_scan_fwd_metal_shared_bytes,
     chunk_scan_fwd_grid,
+    select_chunk_scan_fwd_metal_block_dstate,
 )
 
 
@@ -56,6 +57,25 @@ def test_chunk_scan_fwd_grid_requires_divisible_seqlen():
         chunk_scan_fwd_grid(1, 300, 256, 1, 8, 64, 128)
 
 
+def test_metal_dstate_tile_selector_handles_m4_max_dstate128():
+    """The selected state tile must fit the 32 KiB M4 Max threadgroup pool."""
+    full_tile_bytes = chunk_scan_fwd_metal_shared_bytes(block_Dstate=128)
+    assert full_tile_bytes > MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT
+
+    selected = select_chunk_scan_fwd_metal_block_dstate(128)
+    assert selected == 64
+    assert 128 % selected == 0
+    assert (
+        chunk_scan_fwd_metal_shared_bytes(block_Dstate=selected)
+        <= MAMBA3_CHUNKED_FWD_METAL_THREADGROUP_MEMORY_LIMIT
+    )
+
+
+def test_metal_dstate_tile_selector_rejects_explicit_overflow():
+    with pytest.raises(ValueError, match="threadgroup memory"):
+        select_chunk_scan_fwd_metal_block_dstate(128, requested=128)
+
+
 def _torch_mps_available() -> bool:
     try:
         import torch
@@ -80,10 +100,11 @@ def _ref_program(cb, x, dt, dA_cumsum, C, prev_states, D):
         torch.ones(chunk_size, chunk_size, device=x.device, dtype=bool), 0
     )
     sd = sd.masked_fill(~cm, 0)
+    # Production SSD input contract is inp = x * B; dt remains in the frozen
+    # F2 ABI and affects this stage only through dA_cumsum.
     out = torch.einsum(
-        "bchls,bhcs,bcshp->bclhp",
+        "bchls,bcshp->bclhp",
         sd.to(x.dtype),
-        dt.to(x.dtype),
         rearrange(x, "b (c s) h p -> b c s h p", c=nchunks),
     )
     sdo = torch.exp(rearrange(dA_cumsum, "b h c l -> b c l h 1"))
@@ -142,7 +163,8 @@ def test_chunk_scan_fwd_metal_compiles_runs_and_matches_ssd(
         -torch.rand(batch, nheads, nchunks, chunk, device=dev) * 0.05, dim=-1
     ).half()
     C = (torch.randn(batch, seqlen, ngroups, dstate, device=dev) * 0.1).half()
-    ps = (torch.randn(batch, nchunks, nheads, headdim, dstate, device=dev) * 0.1).half()
+    # F1 writes the recurrent handoff in fp32; F2 consumes that exact ABI.
+    ps = (torch.randn(batch, nchunks, nheads, headdim, dstate, device=dev) * 0.1).float()
     D = torch.randn(nheads, device=dev).half()
 
     out = torch.zeros(batch, seqlen, nheads, headdim, device=dev, dtype=torch.float16)

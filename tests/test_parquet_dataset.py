@@ -343,6 +343,7 @@ def test_parquet_token_semantic_and_temporal_metadata_reach_side_channel_map(
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     path = tmp_path / "semantic_temporal.parquet"
+    high_identity = (1 << 63) + 1000
     table = pa.table(
         {
             "token_ids": pa.array(
@@ -350,12 +351,12 @@ def test_parquet_token_semantic_and_temporal_metadata_reach_side_channel_map(
                 type=pa.large_list(pa.int32()),
             ),
             "token_symbol_ids": pa.array(
-                [[10, 11, 12, 13, 14, 15, 16, 17]],
-                type=pa.large_list(pa.int32()),
+                [[high_identity + offset for offset in range(8)]],
+                type=pa.large_list(pa.uint64()),
             ),
             "token_call_targets": pa.array(
-                [[20, 21, 22, 23, 24, 25, 26, 27]],
-                type=pa.large_list(pa.int32()),
+                [[high_identity + 100 + offset for offset in range(8)]],
+                type=pa.large_list(pa.uint64()),
             ),
             "token_change_mask_post": pa.array(
                 [[0, 0, 1, 1, 0, 1, 0, 1]],
@@ -377,11 +378,27 @@ def test_parquet_token_semantic_and_temporal_metadata_reach_side_channel_map(
     assert set(batch.side_channels) == {"semantic_graph", "temporal_diff"}
     np.testing.assert_array_equal(
         np.array(batch.side_channels["semantic_graph"]["token_symbol_ids"]),
-        [[10, 11, 12, 13], [14, 15, 16, 17]],
+        np.array(
+            [
+                [high_identity + offset for offset in range(4)],
+                [high_identity + offset for offset in range(4, 8)],
+            ],
+            dtype=np.uint64,
+        ),
     )
     np.testing.assert_array_equal(
         np.array(batch.side_channels["semantic_graph"]["token_call_targets"]),
-        [[20, 21, 22, 23], [24, 25, 26, 27]],
+        np.array(
+            [
+                [high_identity + 100 + offset for offset in range(4)],
+                [high_identity + 100 + offset for offset in range(4, 8)],
+            ],
+            dtype=np.uint64,
+        ),
+    )
+    assert (
+        np.array(batch.side_channels["semantic_graph"]["token_symbol_ids"]).dtype
+        == np.dtype(np.uint64)
     )
     np.testing.assert_array_equal(
         np.array(batch.side_channels["temporal_diff"]["token_change_mask_post"]),

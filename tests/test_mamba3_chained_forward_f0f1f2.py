@@ -40,7 +40,6 @@ import pytest
 # ground truth), so this harness validates the NEW Metal F0/F1 against the SAME
 # contract the Stage-1 eager reference already matched the serial forward to.
 from tests.test_mamba3_chunk_scan_combine_f2 import (
-    _eager_precompute,
     _serial_forward,
     _torch_mps_available,
 )
@@ -142,7 +141,7 @@ def _ref_chunked_forward_fp32(C, Bmat, x, A, dt, h0, D, chunk_size):
     xexp = rearrange(xf, "b (c s) hh p -> b c s hh p", c=nchunks)
     dtc = rearrange(dtf, "b (c s) hh -> b hh c s", c=nchunks)
     decay_states = torch.exp(dA_cumsum[:, :, :, -1:] - dA_cumsum)
-    summary = torch.einsum("bhcs,bhcs,bcshp,bcshn->bchpn", decay_states, dtc, xexp, Bexp)
+    summary = torch.einsum("bhcs,bcshp,bcshn->bchpn", decay_states, xexp, Bexp)
 
     # --- F1 reference (fp32 inter-chunk recurrence seeded by h0) ---
     chunk_tail = dA_cumsum[:, :, :, -1]  # (b,nheads,c)
@@ -216,7 +215,7 @@ def _serial_full_forward(C, Bmat, x, A, dt, h0, D):
 
     The OUR recurrence (mamba3.py ``_chunked_mamba3_diagonal_scan``):
       log_decay[t] = A[h]*dt[t]
-      h[t]  = exp(log_decay[t]) * h[t-1] + dt[t] * (x[t] outer B[t])
+      h[t]  = exp(log_decay[t]) * h[t-1] + x[t] outer B[t]
       y[t]  = sum_n h[t] * C[t] + D*x[t]   (no z gate; F2 output contract)
     Seeded by ``h0``. fp32. Returns (out (b,S,H,P), h_last (b,H,P,N)).
     """
@@ -235,9 +234,7 @@ def _serial_full_forward(C, Bmat, x, A, dt, h0, D):
     out = torch.zeros(batch, seqlen, nheads, headdim)
     for t in range(seqlen):
         decay = torch.exp(Af.view(1, nheads) * dtf[:, t])  # (b,H)
-        inp = dtf[:, t][:, :, None, None] * (
-            xf[:, t][:, :, :, None] * Bf[:, t][:, :, None, :]
-        )  # (b,H,P,N)
+        inp = xf[:, t][:, :, :, None] * Bf[:, t][:, :, None, :]  # (b,H,P,N)
         state = decay[:, :, None, None] * state + inp
         y = torch.einsum("bhpn,bhn->bhp", state, Cf[:, t])  # (b,H,P)
         out[:, t] = y + D.float().view(1, nheads, 1) * xf[:, t]
@@ -317,12 +314,12 @@ def test_chained_metal_f0f1f2_matches_serial_forward(
        prev_states, final_state)
     torch.mps.synchronize()
 
-    # ---- F2: scan+combine ---- (consumes F0+F1 handoff; prev_states->fp16) ----
+    # ---- F2: scan+combine ---- (consumes F0+F1 handoff; prev_states is fp32) ----
     k2 = build_chunk_scan_combine_metal(batch, seqlen, chunk, ngroups, nheads, headdim, dstate)
     dt_k = rearrange(dt, "b (c s) hh -> b hh c s", c=nchunks).contiguous()
     out = torch.zeros(batch, seqlen, nheads, headdim, device=dev, dtype=torch.float16)
     k2(cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
-       C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+       C.contiguous(), prev_states.contiguous(), D.contiguous(), out)
     torch.mps.synchronize()
 
     # ---- SERIAL ground truth (full per-timestep recurrence, seeded by h0) ----
@@ -655,7 +652,7 @@ def test_region_flip_on_full_scale_region_parity(monkeypatch, capsys):
     out = torch.zeros(b, S, H, P, device=dev, dtype=torch.float16)
     kernels["mamba3_chunk_scan_combine"](
         cb.contiguous(), x.contiguous(), dt_k.contiguous(), dA_cumsum.contiguous(),
-        C.contiguous(), prev_states.half().contiguous(), D.contiguous(), out)
+        C.contiguous(), prev_states.contiguous(), D.contiguous(), out)
     torch.mps.synchronize()
 
     out_serial, hlast_serial = _serial_full_forward(

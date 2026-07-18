@@ -12,12 +12,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -37,11 +39,6 @@ from cppmega_mlx.training.parity import (  # noqa: E402
     build_m03_forward_parity_manifest,
     validate_m03_cuda_reference_artifact_dict,
 )
-from cppmega_mlx.recipes.model_factory import (  # noqa: E402
-    build_local_gb10_quarter_tiny_smoke_model,
-    local_gb10_quarter_profile,
-)
-
 DEFAULT_OUTPUT = ROOT / M03_FORWARD_PARITY_OUTPUT
 DEFAULT_SEED = M03_FORWARD_PARITY_SEED
 DEFAULT_BATCH_SIZE = M03_FORWARD_PARITY_BATCH_SIZE
@@ -113,10 +110,46 @@ def input_tokens_sha256(tokens: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(tokens).tobytes()).hexdigest()
 
 
+_READINESS_KERNEL_ENV_VARS = (
+    "CPPMEGA_KERNEL_PATH",
+    "CPPMEGA_KERNEL_PATH__MAMBA3_MIMO",
+    "CPPMEGA_KERNEL_PATH__M2RNN",
+    "CPPMEGA_KERNEL_PATH__SPARSE_MLA",
+)
+
+
+@contextmanager
+def _reference_kernel_path() -> Iterator[None]:
+    """Run the readiness probe on the explicit pure-MLX reference path."""
+
+    previous = {name: os.environ.get(name) for name in _READINESS_KERNEL_ENV_VARS}
+    try:
+        for name in _READINESS_KERNEL_ENV_VARS:
+            os.environ[name] = "ref"
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def local_mlx_readiness(tokens: np.ndarray, *, seed: int) -> dict[str, Any]:
-    """Run MLX-side structural and tiny forward readiness without CUDA claims."""
+    """Run tiny MLX readiness without CUDA or custom-kernel claims."""
+
+    with _reference_kernel_path():
+        return _run_local_mlx_readiness(tokens, seed=seed)
+
+
+def _run_local_mlx_readiness(tokens: np.ndarray, *, seed: int) -> dict[str, Any]:
+    """Build and execute the tiny smoke model inside the reference scope."""
 
     import mlx.core as mx
+    from cppmega_mlx.recipes.model_factory import (
+        build_local_gb10_quarter_tiny_smoke_model,
+        local_gb10_quarter_profile,
+    )
 
     profile = local_gb10_quarter_profile()
     expanded = profile.expanded_pattern
@@ -131,6 +164,8 @@ def local_mlx_readiness(tokens: np.ndarray, *, seed: int) -> dict[str, Any]:
     finite = bool(np.isfinite(logits_np).all())
     return {
         "readiness_status": "pass" if finite else "fail",
+        "kernel_path": "reference",
+        "kernel_path_forced": True,
         "local_mlx_forward_executed": True,
         "local_mlx_forward_scope": "tiny_smoke_only",
         "readiness_is_cuda_parity": False,
@@ -141,7 +176,8 @@ def local_mlx_readiness(tokens: np.ndarray, *, seed: int) -> dict[str, Any]:
         "execution_note": (
             "This script records full local_gb10_quarter profile metadata but "
             "does not allocate or forward the full profile; it only executes "
-            "the tiny smoke model below."
+            "the tiny smoke model below through the explicit pure-MLX reference "
+            "kernel path."
         ),
         "full_profile": {
             "name": profile.name,

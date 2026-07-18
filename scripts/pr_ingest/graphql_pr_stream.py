@@ -577,7 +577,7 @@ def _append_jsonl(path: str, obj: dict, *, lock: threading.Lock | None = None) -
 # Repo list loading.                                                          #
 # --------------------------------------------------------------------------- #
 def load_repo_list(path: str) -> list[str]:
-    """Load owner/repo strings from build_repo_list.py's repo_list.json."""
+    """Load only GitHub ``owner_repo`` keys from a mixed-forge repo list."""
     if not os.path.exists(path):
         raise SystemExit(
             f"[graphql-stream] --repo-list not found: {path}. "
@@ -592,11 +592,26 @@ def load_repo_list(path: str) -> list[str]:
         )
     out = []
     seen: set[str] = set()
-    for r in repos:
-        owner_repo = r.get("owner_repo")
-        if not owner_repo:
+    for index, r in enumerate(repos):
+        if not isinstance(r, dict):
             raise SystemExit(
-                f"[graphql-stream] repo entry missing 'owner_repo': {r}"
+                f"[graphql-stream] {path}: repos[{index}] must be an object"
+            )
+        owner_repo = r.get("owner_repo")
+        if owner_repo is None:
+            continue
+        if not isinstance(owner_repo, str) or not owner_repo:
+            raise SystemExit(
+                f"[graphql-stream] invalid owner_repo in repos[{index}]: {r}"
+            )
+        project_identity = r.get("project_identity")
+        if (
+            project_identity is not None
+            and project_identity != owner_repo
+        ):
+            raise SystemExit(
+                f"[graphql-stream] repos[{index}] has conflicting project_identity "
+                f"{project_identity!r} and owner_repo {owner_repo!r}"
             )
         if owner_repo in seen:
             continue

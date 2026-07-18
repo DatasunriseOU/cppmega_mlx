@@ -98,6 +98,31 @@ def test_coverage_hinge_zero_when_edges_in_topk():
     assert float(cov) == 0.0
 
 
+def test_graph_pair_mask_rejects_positive_edge_outside_valid_pairs() -> None:
+    scores = mx.zeros((1, 2, 2), dtype=mx.float32)
+    targets = mx.zeros_like(scores).at[0, 1, 1].add(1.0)
+    pair_mask = mx.zeros_like(scores)
+
+    with pytest.raises(ValueError, match="positive edge outside pair_mask"):
+        indexer_edge_bce_loss(scores, targets, pair_mask=pair_mask)
+
+
+def test_coverage_hinge_excludes_invalid_pairs_from_topk_boundary() -> None:
+    scores = mx.array([[[2.0, 1.0, 100.0, 100.0]]], dtype=mx.float32)
+    targets = mx.array([[[1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32)
+    pair_mask = mx.array([[[1.0, 1.0, 0.0, 0.0]]], dtype=mx.float32)
+
+    loss = indexer_coverage_hinge_loss(
+        scores,
+        targets,
+        pair_mask=pair_mask,
+        topk=1,
+        margin=1.0,
+    )
+
+    assert float(loss.item()) == 0.0
+
+
 def test_apply_graph_indexer_bias_broadcasts_and_preserves_masks():
     scores = mx.array(
         np.array(

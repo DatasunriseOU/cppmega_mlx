@@ -27,6 +27,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,7 +37,35 @@ if str(_REPO_ROOT) not in sys.path:
 import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
+from cppmega_mlx.data.domain_schema import (
+    DOMAIN_EDGE_FIELD_FAMILIES,
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
+    canonicalize_domain_edge_fields,
+    normalize_domain_edge_record,
+    remap_embedded_domain_spans,
+)
 from cppmega_mlx.data.nanochat_pipeline.language_info import language_info_to_prefix
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityError,
+    SymbolIdentityRegistry,
+    require_project_identity,
+)
+from cppmega_mlx.data.source_identity import (
+    normalize_positive_source_ids,
+    normalize_row_local_doc_ids,
+    source_identity,
+    validate_source_identity_registry,
+)
+from cppmega_mlx.data.tokenizer_contract import (
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
+)
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     PLATFORM_IDS_COLUMN,
     TOKEN_AST_DEPTH_COLUMN,
@@ -62,6 +91,7 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched import (
     TOKEN_SIBLING_INDEX_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
     TOKEN_SOURCE_DOC_IDS_COLUMN,
+    TOKEN_SOURCE_IDENTITY_IDS_COLUMN,
     TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_SYMBOL_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
@@ -72,9 +102,13 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     AUTHOR_TIMESTAMP_COLUMN,
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
+    COMMIT_MSG_TEXT_COLUMN,
+    COMMIT_MSG_TOKEN_IDS_COLUMN,
     COMMIT_HASH_COLUMN,
     COMMIT_TIMESTAMP_COLUMN,
     DOC_TYPE_COLUMN,
+    DIFF_TEXT_COLUMN,
+    DIFF_TOKEN_IDS_COLUMN,
     EDIT_OP_PER_TOKEN_COLUMN,
     FILEPATH_COLUMN,
     FILEPATH_STABLE_ID_COLUMN,
@@ -84,9 +118,15 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     HAS_PR_DISCUSSION_COLUMN,
     HAS_RENAME_AMBIGUITY_COLUMN,
     HUNK_ID_PER_TOKEN_COLUMN,
+    IFIM_INSTRUCTION_TEXT_COLUMN,
+    IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
     IS_MERGE_COMMIT_COLUMN,
     PARENT_COUNT_COLUMN,
     PARENT_HASHES_COLUMN,
+    POST_TEXT_COLUMN,
+    POST_TOKEN_IDS_COLUMN,
+    PRE_TEXT_COLUMN,
+    PRE_TOKEN_IDS_COLUMN,
     PR_DISCUSSION_CHARS_COLUMN,
     PR_DISCUSSION_LINES_COLUMN,
     PR_NUMBER_COLUMN,
@@ -95,7 +135,23 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TIMESTAMP_COLUMN,
     TOKEN_CHANGE_MASK_POST_COLUMN,
     TOKEN_CHANGE_MASK_PRE_COLUMN,
+    SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
+
+def _normalize_char_domain_edges(
+    raw_edges: object,
+    *,
+    family: str,
+) -> list[dict[str, int]]:
+    return [
+        {"from_char": src, "to_char": dst, "kind": kind}
+        for src, dst, kind in (
+            normalize_domain_edge_record(edge, family=family)
+            for edge in (raw_edges or [])  # type: ignore[union-attr]
+        )
+    ]
+
+
 from scripts.nanochat_data.token_budget import (
     chunk_enriched_document,
     count_tokens,
@@ -104,6 +160,7 @@ from scripts.nanochat_data.token_budget import (
     tokenizer_fingerprint,
 )
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +174,7 @@ GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
 _MEMORY_LIMIT_GB = 10.0
 _OVERFLOW_POLICIES = ("split", "drop")
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 _CHAR_LEVEL_METADATA_FIELDS = (
     "ast_depth",
     "sibling_index",
@@ -138,6 +196,7 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "domain_entity_ids",
     "domain_scope_ids",
     "domain_source_doc_ids",
+    "domain_source_identity_ids",
     "domain_confidence_ids",
 )
 _STATIC_DOC_TYPES = {"code", "code_header", "build"}
@@ -205,6 +264,12 @@ def _with_default_static_provenance(
     if not _has_value(repo):
         _validate_static_provenance(record)
         return record
+    repo = require_project_identity(
+        repo, source=f"clang enriched row {record.get(FILEPATH_COLUMN)!r}"
+    )
+    if record.get(REPO_COLUMN) != repo:
+        record = dict(record)
+        record[REPO_COLUMN] = repo
 
     filepath = record.get(FILEPATH_COLUMN)
     if not _has_value(record.get(REPO_STABLE_ID_COLUMN)):
@@ -377,7 +442,16 @@ def maybe_keep_document_exact(doc: dict, tokenizer, max_tokens: int) -> list[dic
 
 _SCHEMA = pa.schema([
     pa.field("text", pa.string()),
+    pa.field(SYMBOL_IDENTITIES_COLUMN, pa.list_(pa.struct([
+        pa.field("symbol_id", pa.uint64()),
+        pa.field("symbol_key", pa.string()),
+    ]))),
     pa.field("source_text", pa.string()),
+    pa.field(IFIM_INSTRUCTION_TEXT_COLUMN, pa.string()),
+    pa.field(COMMIT_MSG_TEXT_COLUMN, pa.string()),
+    pa.field(PRE_TEXT_COLUMN, pa.string()),
+    pa.field(POST_TEXT_COLUMN, pa.string()),
+    pa.field(DIFF_TEXT_COLUMN, pa.string()),
     pa.field("source_doc_id", pa.string()),
     pa.field(DOC_TYPE_COLUMN, pa.string()),
     pa.field(HEADER_FRAGMENT_KIND_COLUMN, pa.string()),
@@ -390,6 +464,7 @@ _SCHEMA = pa.schema([
         pa.field("kind", pa.int8()),
         pa.field("dep_level", pa.int32()),
         pa.field("name", pa.string()),
+        pa.field("symbol_id", pa.uint64()),
     ]))),
     pa.field("call_edges", pa.list_(pa.struct([
         pa.field("from", pa.int32()),
@@ -402,9 +477,9 @@ _SCHEMA = pa.schema([
     pa.field("ast_depth", pa.list_(pa.uint16())),
     pa.field("sibling_index", pa.list_(pa.uint16())),
     pa.field("ast_node_type", pa.list_(pa.uint16())),
-    pa.field("symbol_ids", pa.list_(pa.uint32())),
-    pa.field("call_targets", pa.list_(pa.uint32())),
-    pa.field("type_refs", pa.list_(pa.uint32())),
+    pa.field("symbol_ids", pa.list_(pa.uint64())),
+    pa.field("call_targets", pa.list_(pa.uint64())),
+    pa.field("type_refs", pa.list_(pa.uint64())),
     pa.field("def_use", pa.list_(pa.uint8())),
     pa.field("domain_kind", pa.uint16()),
     pa.field("domain_ids", pa.list_(pa.uint16())),
@@ -412,6 +487,7 @@ _SCHEMA = pa.schema([
     pa.field("domain_entity_ids", pa.list_(pa.uint32())),
     pa.field("domain_scope_ids", pa.list_(pa.uint32())),
     pa.field("domain_source_doc_ids", pa.list_(pa.uint32())),
+    pa.field("domain_source_identity_ids", pa.list_(pa.uint64())),
     pa.field("domain_confidence_ids", pa.list_(pa.uint8())),
     pa.field("domain_edges", pa.list_(pa.struct([
         pa.field("from_char", pa.int32()),
@@ -475,21 +551,27 @@ _SCHEMA = pa.schema([
     pa.field(HAS_AMBIGUOUS_RECONSTRUCTION_COLUMN, pa.bool_()),
     pa.field(HAS_RENAME_AMBIGUITY_COLUMN, pa.bool_()),
     pa.field(TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(COMMIT_MSG_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(PRE_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(POST_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(DIFF_TOKEN_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(PLATFORM_IDS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_STRUCTURE_IDS_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_DEP_LEVELS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_DEPTH_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_SIBLING_INDEX_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_AST_NODE_TYPE_COLUMN, pa.list_(pa.uint16())),
-    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint32())),
-    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SYMBOL_IDS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_CALL_TARGETS_COLUMN, pa.list_(pa.uint64())),
+    pa.field(TOKEN_TYPE_REFS_COLUMN, pa.list_(pa.uint64())),
     pa.field(TOKEN_DEF_USE_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_DOMAIN_IDS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_ROLE_IDS_COLUMN, pa.list_(pa.uint16())),
     pa.field(TOKEN_ENTITY_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_SCOPE_IDS_COLUMN, pa.list_(pa.uint32())),
     pa.field(TOKEN_SOURCE_DOC_IDS_COLUMN, pa.list_(pa.uint32())),
+    pa.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, pa.list_(pa.uint64())),
     pa.field(TOKEN_CONFIDENCE_IDS_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_PRE_COLUMN, pa.list_(pa.uint8())),
     pa.field(TOKEN_CHANGE_MASK_POST_COLUMN, pa.list_(pa.uint8())),
@@ -544,14 +626,53 @@ _SCHEMA = pa.schema([
         pa.field("to", pa.uint32()),
         pa.field("kind", pa.int32()),
     ]))),
+    pa.field(SOURCE_IDENTITY_REGISTRY_COLUMN, pa.list_(pa.struct([
+        pa.field("source_identity_id", pa.uint64(), nullable=False),
+        pa.field("canonical_sha256", pa.string(), nullable=False),
+        pa.field("source", pa.string(), nullable=False),
+    ]))),
 ])
+_SCHEMA = _SCHEMA.with_metadata(
+    {
+        SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): str(
+            REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION
+        ).encode("ascii"),
+        DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
+            DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+        ),
+        DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
+            DOMAIN_SCHEMA_SHA256.encode("ascii")
+        ),
+        TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
+            TOKENIZER_CONTRACT_SHA256.encode("ascii")
+        ),
+        b"cppmega.case5_schema": b"case5_domain_routes_v1",
+    }
+)
 
 
-def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa.Table:
+def rows_to_table(
+    rows: list,
+    *,
+    tokenized_rows: list[dict] | None = None,
+    identity_registry: SymbolIdentityRegistry | None = None,
+) -> pa.Table:
     """Convert a list of doc dicts to a PyArrow table."""
     tokenized_rows = tokenized_rows or [{} for _ in rows]
+    if len(tokenized_rows) != len(rows):
+        raise ValueError(
+            "tokenized_rows length must match rows: "
+            f"{len(tokenized_rows)} != {len(rows)}"
+        )
+    corpus_registry = identity_registry or SymbolIdentityRegistry()
     texts = []
+    symbol_identities_col = []
     source_texts = []
+    ifim_instruction_texts = []
+    commit_msg_texts = []
+    pre_texts = []
+    post_texts = []
+    diff_texts = []
     source_doc_ids = []
     doc_types = []
     header_fragment_kinds = []
@@ -574,6 +695,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     domain_entity_ids_col = []
     domain_scope_ids_col = []
     domain_source_doc_ids_col = []
+    domain_source_identity_ids_col = []
     domain_confidence_ids_col = []
     domain_edges_col = []
     build_edges_col = []
@@ -608,6 +730,11 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     ambiguous_reconstruction = []
     rename_ambiguity = []
     token_ids_col = []
+    ifim_instruction_token_ids_col = []
+    commit_msg_token_ids_col = []
+    pre_token_ids_col = []
+    post_token_ids_col = []
+    diff_token_ids_col = []
     platform_ids_col = []
     token_structure_ids_col = []
     token_dep_levels_col = []
@@ -623,6 +750,7 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_entity_ids_col = []
     token_scope_ids_col = []
     token_source_doc_ids_col = []
+    token_source_identity_ids_col = []
     token_confidence_ids_col = []
     token_change_mask_pre_col = []
     token_change_mask_post_col = []
@@ -641,13 +769,70 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
     token_shell_edges_col = []
     token_diagnostic_edges_col = []
     token_cross_domain_edges_col = []
+    source_identity_registry_col = []
 
-    for row, tokenized in zip(rows, tokenized_rows):
+    for row_index, (row, tokenized) in enumerate(
+        zip(rows, tokenized_rows, strict=True)
+    ):
+        canonical_edge_fields = canonicalize_domain_edge_fields(
+            row,
+            source_length=len(row.get("text", "")),
+        )
+        identity_version = row.get("symbol_identity_schema_version")
+        if identity_version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise SymbolIdentityError(
+                "clang-enriched row has missing or stale symbol identity schema "
+                f"version {identity_version!r}; regenerate it with clang USR/signature "
+                f"schema v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
+        if SYMBOL_IDENTITIES_COLUMN not in row:
+            raise SymbolIdentityError(
+                f"clang-enriched row {row_index} has no {SYMBOL_IDENTITIES_COLUMN!r} "
+                "collision registry; regenerate it with symbol identity schema v3"
+            )
+        row_registry = SymbolIdentityRegistry()
+        normalized_identities = row_registry.register_records(
+            row.get(SYMBOL_IDENTITIES_COLUMN),
+            source=f"clang-enriched row {row_index}",
+        )
+        corpus_registry.register_records(
+            normalized_identities,
+            source=f"clang-enriched row {row_index}",
+        )
+        used_symbol_ids = {
+            int(value)
+            for field in ("symbol_ids", "call_targets", "type_refs")
+            for value in row.get(field, [])
+            if int(value) != 0
+        }
+        used_symbol_ids.update(
+            int(boundary["symbol_id"])
+            for boundary in row.get("chunk_boundaries", [])
+            if isinstance(boundary, dict) and boundary.get("symbol_id") not in (None, 0)
+        )
+        used_symbol_ids.update(
+            int(value)
+            for field in (
+                TOKEN_SYMBOL_IDS_COLUMN,
+                TOKEN_CALL_TARGETS_COLUMN,
+                TOKEN_TYPE_REFS_COLUMN,
+            )
+            for value in tokenized.get(field, [])
+            if int(value) != 0
+        )
+        row_registry.require_ids(
+            used_symbol_ids,
+            source=f"clang-enriched row {row_index}",
+        )
+        symbol_identities_col.append(row_registry.records(used_symbol_ids))
         row_text = row.get("text", "")
         texts.append(row_text)
-        # source_text falls back to the emitted text when absent so the column
-        # is always populated for the IFIM objective.
-        source_texts.append(row.get("source_text") or row_text)
+        source_texts.append(row.get("source_text"))
+        ifim_instruction_texts.append(row.get(IFIM_INSTRUCTION_TEXT_COLUMN))
+        commit_msg_texts.append(row.get(COMMIT_MSG_TEXT_COLUMN))
+        pre_texts.append(row.get(PRE_TEXT_COLUMN))
+        post_texts.append(row.get(POST_TEXT_COLUMN))
+        diff_texts.append(row.get(DIFF_TEXT_COLUMN))
         raw_source_doc_id = row.get("source_doc_id")
         source_doc_ids.append(
             None if raw_source_doc_id is None else str(raw_source_doc_id)
@@ -677,6 +862,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 "kind": int(cb.get("kind", 0)),
                 "dep_level": int(cb.get("dep_level", 0)),
                 "name": str(cb.get("name", "")),
+                "symbol_id": (
+                    None if cb.get("symbol_id") is None else int(cb["symbol_id"])
+                ),
             }
             for cb in cbs
         ])
@@ -701,47 +889,35 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         domain_entity_ids_col.append(row.get("domain_entity_ids", []))
         domain_scope_ids_col.append(row.get("domain_scope_ids", []))
         domain_source_doc_ids_col.append(row.get("domain_source_doc_ids", []))
+        domain_source_identity_ids_col.append(
+            row.get("domain_source_identity_ids", [])
+        )
         domain_confidence_ids_col.append(row.get("domain_confidence_ids", []))
-        domain_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("domain_edges", [])
-        ])
-        build_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("build_edges", [])
-        ])
-        shell_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("shell_edges", [])
-        ])
-        diagnostic_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("diagnostic_edges", [])
-        ])
-        cross_domain_edges_col.append([
-            {
-                "from_char": int(e.get("from_char", e.get("from", 0))),
-                "to_char": int(e.get("to_char", e.get("to", 0))),
-                "kind": int(e.get("kind", 0)),
-            }
-            for e in row.get("cross_domain_edges", [])
-        ])
+        domain_edges_col.append(
+            _normalize_char_domain_edges(
+                canonical_edge_fields["domain_edges"], family="domain"
+            )
+        )
+        build_edges_col.append(
+            _normalize_char_domain_edges(
+                canonical_edge_fields["build_edges"], family="build"
+            )
+        )
+        shell_edges_col.append(
+            _normalize_char_domain_edges(
+                canonical_edge_fields["shell_edges"], family="shell"
+            )
+        )
+        diagnostic_edges_col.append(
+            _normalize_char_domain_edges(
+                canonical_edge_fields["diagnostic_edges"], family="diagnostic"
+            )
+        )
+        cross_domain_edges_col.append(
+            _normalize_char_domain_edges(
+                canonical_edge_fields["cross_domain_edges"], family="cross_domain"
+            )
+        )
         change_mask_pre_col.append(row.get("change_mask_pre", []))
         change_mask_post_col.append(row.get("change_mask_post", []))
         hunk_id_per_char_col.append(row.get("hunk_id_per_char", []))
@@ -805,6 +981,15 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         )
         rename_ambiguity.append(row.get(HAS_RENAME_AMBIGUITY_COLUMN, False))
         token_ids_col.append(tokenized.get(TOKEN_IDS_COLUMN, []))
+        ifim_instruction_token_ids_col.append(
+            tokenized.get(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN, [])
+        )
+        commit_msg_token_ids_col.append(
+            tokenized.get(COMMIT_MSG_TOKEN_IDS_COLUMN, [])
+        )
+        pre_token_ids_col.append(tokenized.get(PRE_TOKEN_IDS_COLUMN, []))
+        post_token_ids_col.append(tokenized.get(POST_TOKEN_IDS_COLUMN, []))
+        diff_token_ids_col.append(tokenized.get(DIFF_TOKEN_IDS_COLUMN, []))
         platform_ids_col.append(tokenized.get(PLATFORM_IDS_COLUMN, []))
         token_structure_ids_col.append(tokenized.get(TOKEN_STRUCTURE_IDS_COLUMN, []))
         token_dep_levels_col.append(tokenized.get(TOKEN_DEP_LEVELS_COLUMN, []))
@@ -820,6 +1005,9 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         token_entity_ids_col.append(tokenized.get(TOKEN_ENTITY_IDS_COLUMN, []))
         token_scope_ids_col.append(tokenized.get(TOKEN_SCOPE_IDS_COLUMN, []))
         token_source_doc_ids_col.append(tokenized.get(TOKEN_SOURCE_DOC_IDS_COLUMN, []))
+        token_source_identity_ids_col.append(
+            tokenized.get(TOKEN_SOURCE_IDENTITY_IDS_COLUMN, [])
+        )
         token_confidence_ids_col.append(tokenized.get(TOKEN_CONFIDENCE_IDS_COLUMN, []))
         token_change_mask_pre_col.append(
             tokenized.get(TOKEN_CHANGE_MASK_PRE_COLUMN, row.get(TOKEN_CHANGE_MASK_PRE_COLUMN, []))
@@ -852,12 +1040,38 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
         token_shell_edges_col.append(tokenized.get(TOKEN_SHELL_EDGES_COLUMN, []))
         token_diagnostic_edges_col.append(tokenized.get(TOKEN_DIAGNOSTIC_EDGES_COLUMN, []))
         token_cross_domain_edges_col.append(tokenized.get(TOKEN_CROSS_DOMAIN_EDGES_COLUMN, []))
+        source_identity_registry_col.append(
+            tokenized.get(
+                SOURCE_IDENTITY_REGISTRY_COLUMN,
+                row.get(SOURCE_IDENTITY_REGISTRY_COLUMN, []),
+            )
+        )
 
     return pa.table(
         {
             "text": pa.array(texts, type=_SCHEMA.field("text").type),
+            SYMBOL_IDENTITIES_COLUMN: pa.array(
+                symbol_identities_col,
+                type=_SCHEMA.field(SYMBOL_IDENTITIES_COLUMN).type,
+            ),
             "source_text": pa.array(
                 source_texts, type=_SCHEMA.field("source_text").type
+            ),
+            IFIM_INSTRUCTION_TEXT_COLUMN: pa.array(
+                ifim_instruction_texts,
+                type=_SCHEMA.field(IFIM_INSTRUCTION_TEXT_COLUMN).type,
+            ),
+            COMMIT_MSG_TEXT_COLUMN: pa.array(
+                commit_msg_texts, type=_SCHEMA.field(COMMIT_MSG_TEXT_COLUMN).type
+            ),
+            PRE_TEXT_COLUMN: pa.array(
+                pre_texts, type=_SCHEMA.field(PRE_TEXT_COLUMN).type
+            ),
+            POST_TEXT_COLUMN: pa.array(
+                post_texts, type=_SCHEMA.field(POST_TEXT_COLUMN).type
+            ),
+            DIFF_TEXT_COLUMN: pa.array(
+                diff_texts, type=_SCHEMA.field(DIFF_TEXT_COLUMN).type
             ),
             "source_doc_id": pa.array(
                 source_doc_ids, type=_SCHEMA.field("source_doc_id").type
@@ -925,6 +1139,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             "domain_source_doc_ids": pa.array(
                 domain_source_doc_ids_col,
                 type=_SCHEMA.field("domain_source_doc_ids").type,
+            ),
+            "domain_source_identity_ids": pa.array(
+                domain_source_identity_ids_col,
+                type=_SCHEMA.field("domain_source_identity_ids").type,
             ),
             "domain_confidence_ids": pa.array(
                 domain_confidence_ids_col,
@@ -1014,6 +1232,23 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             TOKEN_IDS_COLUMN: pa.array(
                 token_ids_col, type=_SCHEMA.field(TOKEN_IDS_COLUMN).type
             ),
+            IFIM_INSTRUCTION_TOKEN_IDS_COLUMN: pa.array(
+                ifim_instruction_token_ids_col,
+                type=_SCHEMA.field(IFIM_INSTRUCTION_TOKEN_IDS_COLUMN).type,
+            ),
+            COMMIT_MSG_TOKEN_IDS_COLUMN: pa.array(
+                commit_msg_token_ids_col,
+                type=_SCHEMA.field(COMMIT_MSG_TOKEN_IDS_COLUMN).type,
+            ),
+            PRE_TOKEN_IDS_COLUMN: pa.array(
+                pre_token_ids_col, type=_SCHEMA.field(PRE_TOKEN_IDS_COLUMN).type
+            ),
+            POST_TOKEN_IDS_COLUMN: pa.array(
+                post_token_ids_col, type=_SCHEMA.field(POST_TOKEN_IDS_COLUMN).type
+            ),
+            DIFF_TOKEN_IDS_COLUMN: pa.array(
+                diff_token_ids_col, type=_SCHEMA.field(DIFF_TOKEN_IDS_COLUMN).type
+            ),
             PLATFORM_IDS_COLUMN: pa.array(
                 platform_ids_col, type=_SCHEMA.field(PLATFORM_IDS_COLUMN).type
             ),
@@ -1070,6 +1305,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
             TOKEN_SOURCE_DOC_IDS_COLUMN: pa.array(
                 token_source_doc_ids_col,
                 type=_SCHEMA.field(TOKEN_SOURCE_DOC_IDS_COLUMN).type,
+            ),
+            TOKEN_SOURCE_IDENTITY_IDS_COLUMN: pa.array(
+                token_source_identity_ids_col,
+                type=_SCHEMA.field(TOKEN_SOURCE_IDENTITY_IDS_COLUMN).type,
             ),
             TOKEN_CONFIDENCE_IDS_COLUMN: pa.array(
                 token_confidence_ids_col,
@@ -1139,6 +1378,10 @@ def rows_to_table(rows: list, *, tokenized_rows: list[dict] | None = None) -> pa
                 token_cross_domain_edges_col,
                 type=_SCHEMA.field(TOKEN_CROSS_DOMAIN_EDGES_COLUMN).type,
             ),
+            SOURCE_IDENTITY_REGISTRY_COLUMN: pa.array(
+                source_identity_registry_col,
+                type=_SCHEMA.field(SOURCE_IDENTITY_REGISTRY_COLUMN).type,
+            ),
         },
         schema=_SCHEMA,
     )
@@ -1156,9 +1399,25 @@ def gcs_list_files(prefix: str) -> list:
         capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
-        log.error("gcloud storage ls failed: %s", result.stderr)
-        return []
+        raise RuntimeError(f"gcloud storage ls failed for {uri}: {result.stderr}")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def gcs_object_exists(uri: str) -> bool:
+    """Return whether one exact GCS object exists, failing on access errors."""
+
+    result = subprocess.run(
+        ["gcloud", "storage", "ls", uri],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode == 0:
+        return True
+    detail = f"{result.stdout}\n{result.stderr}".lower()
+    if "matched no objects" in detail or "no urls matched" in detail:
+        return False
+    raise RuntimeError(f"gcloud storage ls failed for {uri}: {result.stderr}")
 
 
 def gcs_download(gcs_uri: str, local_path: str):
@@ -1248,6 +1507,7 @@ def _remap_chunk_boundaries(
                 "kind": cb.get("kind", 0),
                 "dep_level": cb.get("dep_level", 0),
                 "name": cb.get("name", ""),
+                "symbol_id": cb.get("symbol_id"),
             }
         )
     return remapped, old_to_new
@@ -1278,16 +1538,22 @@ def _map_exact_kept_char(kept_indices: list[int], original_offset: int) -> int |
     return None
 
 
-def _shift_char_edge_triples(raw_edges: list, header_len: int) -> list[dict]:
+def _shift_char_edge_triples(
+    raw_edges: list,
+    header_len: int,
+    *,
+    family: str,
+) -> list[dict]:
     shifted = []
-    for edge in raw_edges or []:
-        if not isinstance(edge, dict):
-            continue
+    for src, dst, kind in (
+        normalize_domain_edge_record(edge, family=family)
+        for edge in raw_edges or []
+    ):
         shifted.append(
             {
-                "from_char": int(edge.get("from_char", edge.get("from", 0))) + header_len,
-                "to_char": int(edge.get("to_char", edge.get("to", 0))) + header_len,
-                "kind": int(edge.get("kind", 0)),
+                "from_char": src + header_len,
+                "to_char": dst + header_len,
+                "kind": kind,
             }
         )
     return shifted
@@ -1297,26 +1563,38 @@ def _remap_char_edge_triples(
     raw_edges: list,
     kept_indices: list[int],
     header_len: int,
+    *,
+    family: str,
+    source_length: int,
 ) -> list[dict]:
     remapped = []
-    for edge in raw_edges or []:
-        if not isinstance(edge, dict):
-            continue
-        mapped_from = _map_exact_kept_char(
-            kept_indices,
-            int(edge.get("from_char", edge.get("from", -1))),
-        )
-        mapped_to = _map_exact_kept_char(
-            kept_indices,
-            int(edge.get("to_char", edge.get("to", -1))),
-        )
+    for src, dst, kind in (
+        normalize_domain_edge_record(edge, family=family)
+        for edge in raw_edges or []
+    ):
+        if src == dst:
+            if src > source_length:
+                raise ValueError(
+                    f"character point {src} is outside source point bounds "
+                    f"[0, {source_length}]"
+                )
+            mapped_from = mapped_to = bisect_left(kept_indices, src)
+        else:
+            mapped_from = _map_exact_kept_char(
+                kept_indices,
+                src,
+            )
+            mapped_to = _map_exact_kept_char(
+                kept_indices,
+                dst,
+            )
         if mapped_from is None or mapped_to is None:
             continue
         remapped.append(
             {
                 "from_char": mapped_from + header_len,
                 "to_char": mapped_to + header_len,
-                "kind": int(edge.get("kind", 0)),
+                "kind": kind,
             }
         )
     return remapped
@@ -1347,6 +1625,10 @@ def process_record_with_policy(
         )
 
     text = record.get("text", "")
+    record = {
+        **record,
+        **canonicalize_domain_edge_fields(record, source_length=len(text)),
+    }
     structure_ids = record.get("structure_ids", [])
     chunk_boundaries = record.get("chunk_boundaries", [])
 
@@ -1378,15 +1660,21 @@ def process_record_with_policy(
             old_to_new_chunk,
         )
         filtered_domain_edge_fields = {
-            name: _remap_char_edge_triples(record.get(name, []), kept_indices, header_len)
-            for name in (
-                "domain_edges",
-                "build_edges",
-                "shell_edges",
-                "diagnostic_edges",
-                "cross_domain_edges",
+            name: _remap_char_edge_triples(
+                record.get(name, []),
+                kept_indices,
+                header_len,
+                family=family,
+                source_length=len(text),
             )
+            for name, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
+        filtered_embedded_domain_spans = remap_embedded_domain_spans(
+            record.get("embedded_domain_spans", []),
+            source_length=len(text),
+            kept_indices=kept_indices,
+            prefix_length=header_len,
+        )
     else:
         filtered_structure_ids = _align_structure_ids(structure_ids, len(filtered_text))
         filtered_chunk_boundaries = chunk_boundaries
@@ -1394,26 +1682,80 @@ def process_record_with_policy(
         filtered_type_edges = record.get("type_edges", [])
 
         filtered_domain_edge_fields = {
-            name: _shift_char_edge_triples(record.get(name, []), header_len)
-            for name in (
-                "domain_edges",
-                "build_edges",
-                "shell_edges",
-                "diagnostic_edges",
-                "cross_domain_edges",
+            name: _shift_char_edge_triples(
+                record.get(name, []), header_len, family=family
             )
+            for name, family in DOMAIN_EDGE_FIELD_FAMILIES.items()
         }
+        filtered_embedded_domain_spans = remap_embedded_domain_spans(
+            record.get("embedded_domain_spans", []),
+            source_length=len(text),
+            kept_indices=None,
+            prefix_length=header_len,
+        )
 
     full_sids = [0] * header_len + filtered_structure_ids
+    source_identity_registry = [
+        dict(entry) for entry in record.get(SOURCE_IDENTITY_REGISTRY_COLUMN, [])
+    ]
+    if source_identity_registry:
+        validated_registry = validate_source_identity_registry(source_identity_registry)
+        source_identity_id = next(iter(validated_registry))
+    else:
+        identity = source_identity(record)
+        source_identity_registry = [identity.as_dict()]
+        source_identity_id = identity.source_identity_id
     char_metadata: dict[str, list[int]] = {}
     for key in _CHAR_LEVEL_METADATA_FIELDS:
         values = record.get(key, [])
         if metadata_stale:
             remapped = _remap_optional_char_metadata(values, kept_indices, len(text))
-            char_metadata[key] = [0] * header_len + remapped if remapped else []
+            if key == "domain_source_doc_ids":
+                remapped = normalize_row_local_doc_ids(
+                    remapped,
+                    length=len(filtered_text),
+                    fallback_doc_id=1,
+                )
+                char_metadata[key] = [remapped[0] if remapped else 1] * header_len + remapped
+            elif key == "domain_source_identity_ids":
+                if len(source_identity_registry) > 1 and (
+                    not remapped or any(int(value) == 0 for value in remapped)
+                ):
+                    raise ValueError(
+                        "multi-source document lost exact character source identities"
+                    )
+                remapped = normalize_positive_source_ids(
+                    remapped,
+                    length=len(filtered_text),
+                    fallback_source_id=source_identity_id,
+                )
+                char_metadata[key] = [source_identity_id] * header_len + remapped
+            else:
+                char_metadata[key] = [0] * header_len + remapped if remapped else []
         else:
             aligned = _align_optional_char_metadata(values, len(filtered_text))
-            char_metadata[key] = [0] * header_len + aligned if aligned else []
+            if key == "domain_source_doc_ids":
+                aligned = normalize_row_local_doc_ids(
+                    aligned,
+                    length=len(filtered_text),
+                    fallback_doc_id=1,
+                )
+                char_metadata[key] = [aligned[0] if aligned else 1] * header_len + aligned
+            elif key == "domain_source_identity_ids":
+                if len(source_identity_registry) > 1 and (
+                    not aligned or any(int(value) == 0 for value in aligned)
+                ):
+                    raise ValueError(
+                        "multi-source document is missing exact character source identities"
+                    )
+                aligned = normalize_positive_source_ids(
+                    aligned,
+                    length=len(filtered_text),
+                    fallback_source_id=source_identity_id,
+                )
+                char_metadata[key] = [source_identity_id] * header_len + aligned
+            else:
+                char_metadata[key] = [0] * header_len + aligned if aligned else []
 
     adjusted_chunks = [
         {
@@ -1422,9 +1764,14 @@ def process_record_with_policy(
             "kind": cb.get("kind", 0),
             "dep_level": cb.get("dep_level", 0),
             "name": cb.get("name", ""),
+            "symbol_id": cb.get("symbol_id"),
         }
         for cb in filtered_chunk_boundaries
     ]
+    validate_source_identity_registry(
+        source_identity_registry,
+        referenced_ids=char_metadata.get("domain_source_identity_ids", []),
+    )
 
     combined = {
         **{k: v for k, v in record.items()
@@ -1432,16 +1779,20 @@ def process_record_with_policy(
                         "call_edges", "type_edges", "actual_token_count",
                         "domain_edges", "build_edges", "shell_edges",
                         "diagnostic_edges", "cross_domain_edges",
+                        "embedded_domain_spans",
                         *_CHAR_LEVEL_METADATA_FIELDS)},
         "text": full_text,
         # source_text mirrors the emitted (header-prefixed) document text so the
         # IFIM objective, which reads metadata['source_text'], aligns with the
         # tokenized text exactly.
         "source_text": full_text,
+        "source_identity_id": source_identity_id,
+        SOURCE_IDENTITY_REGISTRY_COLUMN: source_identity_registry,
         "structure_ids": full_sids,
         "chunk_boundaries": adjusted_chunks,
         "call_edges": filtered_call_edges,
         "type_edges": filtered_type_edges,
+        "embedded_domain_spans": filtered_embedded_domain_spans,
         **filtered_domain_edge_fields,
         **char_metadata,
     }
@@ -1469,7 +1820,7 @@ def _open_jsonl(path: str | os.PathLike[str]):
     return open(target, "r", encoding="utf-8", errors="replace")
 
 
-def convert_local_jsonl_to_parquet(
+def _convert_local_jsonl_to_parquet_path(
     input_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
     *,
@@ -1496,6 +1847,7 @@ def convert_local_jsonl_to_parquet(
     rows: list[dict] = []
     wrote_rows = False
     active_tokenizer_fingerprint = tokenizer_fingerprint(tokenizer)
+    identity_registry = SymbolIdentityRegistry()
 
     def flush_rows() -> None:
         nonlocal rows, wrote_rows, writer
@@ -1510,7 +1862,11 @@ def convert_local_jsonl_to_parquet(
             if materialize_tokenized_enriched
             else None
         )
-        table = rows_to_table(rows, tokenized_rows=tokenized_rows)
+        table = rows_to_table(
+            rows,
+            tokenized_rows=tokenized_rows,
+            identity_registry=identity_registry,
+        )
         if writer is None:
             writer = pq.ParquetWriter(target, _SCHEMA, compression="snappy")
         writer.write_table(table)
@@ -1547,6 +1903,8 @@ def convert_local_jsonl_to_parquet(
                             stable_doc_signature)
                         sig = stable_doc_signature(record)
                         source_doc_id = sig or f"{source.name}:{docs_in}"
+                    except SymbolIdentityError:
+                        raise
                     except Exception:
                         source_doc_id = f"{source.name}:{docs_in}"
                 for sub_doc in sub_docs:
@@ -1591,6 +1949,45 @@ def convert_local_jsonl_to_parquet(
     return {"docs_in": docs_in, "docs_out": docs_out}
 
 
+def convert_local_jsonl_to_parquet(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    tokenizer,
+    max_tokens: int,
+    overflow_policy: str = "split",
+    dry_run: bool = False,
+    materialize_tokenized_enriched: bool = False,
+    local_batch_size: int = 512,
+    memory_limit_gb: float = 10.0,
+    default_repo: str | None = None,
+) -> dict[str, int]:
+    """Convert locally, publishing the parquet only after full validation."""
+
+    if default_repo is not None:
+        default_repo = require_project_identity(
+            default_repo, source="clang_enriched_to_parquet --default-repo"
+        )
+    kwargs = {
+        "tokenizer": tokenizer,
+        "max_tokens": max_tokens,
+        "overflow_policy": overflow_policy,
+        "dry_run": dry_run,
+        "materialize_tokenized_enriched": materialize_tokenized_enriched,
+        "local_batch_size": local_batch_size,
+        "memory_limit_gb": memory_limit_gb,
+        "default_repo": default_repo,
+    }
+    if dry_run:
+        return _convert_local_jsonl_to_parquet_path(
+            input_path, output_path, **kwargs
+        )
+    with atomic_output_file(output_path) as staged_output:
+        return _convert_local_jsonl_to_parquet_path(
+            input_path, staged_output, **kwargs
+        )
+
+
 def process_input_file(gcs_uri: str, tmpdir: str,
                        dry_run: bool, shard_size: int,
                        shard_counter: list, output_rows: list,
@@ -1598,7 +1995,8 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                        output_prefix_gcs: str,
                        tokenizer,
                        max_tokens: int,
-                       overflow_policy: str = "split") -> tuple:
+                       overflow_policy: str = "split",
+                       identity_registry: SymbolIdentityRegistry | None = None) -> tuple:
     """Download, decompress, and process one .jsonl.gz file.
 
     Returns (docs_in, docs_out) counts.
@@ -1650,6 +2048,8 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                         stable_doc_signature)
                     sig = stable_doc_signature(record)
                     source_doc_id = sig or f"{fname}:{docs_in}"
+                except SymbolIdentityError:
+                    raise
                 except Exception:
                     source_doc_id = f"{fname}:{docs_in}"
             for sub_doc in sub_docs:
@@ -1673,6 +2073,7 @@ def process_input_file(gcs_uri: str, tmpdir: str,
                     dry_run,
                     output_prefix_local,
                     output_prefix_gcs,
+                    identity_registry=identity_registry,
                 )
 
     os.unlink(local_gz)
@@ -1685,6 +2086,8 @@ def _flush_shard(
     dry_run: bool,
     output_prefix_local: str,
     output_prefix_gcs: str,
+    *,
+    identity_registry: SymbolIdentityRegistry | None = None,
 ):
     """Write rows to a parquet file and upload to GCS."""
     shard_idx = counter[0]
@@ -1705,6 +2108,7 @@ def _flush_shard(
             if _TOKENIZED_ENRICHED_TOKENIZER is not None
             else None
         ),
+        identity_registry=identity_registry,
     )
     check_memory_limit(_MEMORY_LIMIT_GB, label="clang_enriched_to_parquet")
     pq.write_table(table, local_path, compression="snappy")
@@ -1721,7 +2125,9 @@ def _flush_shard(
             for col_token_ids in table.column(TOKEN_IDS_COLUMN).to_pylist():
                 if col_token_ids:
                     token_lists.append(list(col_token_ids))
-        except (KeyError, Exception):
+        except SymbolIdentityError:
+            raise
+        except Exception:
             token_lists = []
         if token_lists and _TOKENIZED_ENRICHED_TOKENIZER is not None:
             stats = compute_corpus_stats(
@@ -1734,12 +2140,18 @@ def _flush_shard(
                 _json.dump(stats, _f)
             try:
                 gcs_upload(stats_path, gcs_uri + ".corpus_stats.json")
+            except SymbolIdentityError:
+                raise
             except Exception:
                 pass
             try:
                 os.unlink(stats_path)
+            except SymbolIdentityError:
+                raise
             except Exception:
                 pass
+    except SymbolIdentityError:
+        raise
     except Exception as _exc:
         log.warning("corpus_stats emit failed: %s", _exc)
     gcs_upload(local_path, gcs_uri)
@@ -1882,7 +2294,8 @@ def main():
 
     log.info("Listing input files at gs://%s/%s/", GCS_BUCKET, args.input_prefix)
     input_files = gcs_list_files(args.input_prefix)
-    gz_files = [f for f in input_files if f.endswith(".jsonl.gz")]
+    all_gz_files = [f for f in input_files if f.endswith(".jsonl.gz")]
+    gz_files = list(all_gz_files)
 
     if not gz_files:
         log.error("No .jsonl.gz files found at gs://%s/%s/",
@@ -1891,6 +2304,7 @@ def main():
 
     if args.max_files > 0:
         gz_files = gz_files[:args.max_files]
+    full_input = len(gz_files) == len(all_gz_files)
 
     log.info(
         "Found %d input files. Processing with hard_budget=%d tokens, shard_size=%d, dry_run=%s",
@@ -1904,6 +2318,12 @@ def main():
     total_out = 0
     shard_counter = [0]  # mutable counter shared across calls
     output_rows = []
+    identity_registry = SymbolIdentityRegistry()
+    staging_prefix = (
+        f"{args.output_prefix}/.staging-{uuid.uuid4().hex}"
+        if not args.dry_run
+        else args.output_prefix
+    )
 
     with tempfile.TemporaryDirectory(prefix=f"clang_{size_label}_") as tmpdir:
         # Local dir for shard staging
@@ -1916,19 +2336,21 @@ def main():
                     gcs_uri, tmpdir, args.dry_run,
                     args.shard_size, shard_counter, output_rows,
                     output_prefix_local,
-                    args.output_prefix,
+                    staging_prefix,
                     tokenizer,
                     max_tokens,
                     args.overflow_policy,
+                    identity_registry,
                 )
                 total_in += docs_in
                 total_out += docs_out
                 log.info("  %s: %d in -> %d out (cumulative: %d in, %d out, %d shards)",
                          gcs_uri.split("/")[-1], docs_in, docs_out,
                          total_in, total_out, shard_counter[0])
+            except SymbolIdentityError:
+                raise
             except Exception as e:
-                log.error("Failed to process %s: %s", gcs_uri, e)
-                continue
+                raise RuntimeError(f"Failed to process {gcs_uri}: {e}") from e
 
         # Flush remaining rows
         if output_rows:
@@ -1937,7 +2359,8 @@ def main():
                 shard_counter,
                 args.dry_run,
                 output_prefix_local,
-                args.output_prefix,
+                staging_prefix,
+                identity_registry=identity_registry,
             )
             output_rows.clear()
 
@@ -1945,15 +2368,43 @@ def main():
              total_in, total_out, shard_counter[0])
 
     if not args.dry_run:
-        # Write _COMPLETE sentinel
-        sentinel_uri = (
-            f"gs://{GCS_BUCKET}/{args.output_prefix}/_COMPLETE"
-        )
-        subprocess.run(
-            ["gcloud", "storage", "cp", "/dev/null", sentinel_uri],
-            check=False,
-        )
-        log.info("Wrote sentinel: %s", sentinel_uri)
+        staged_root = f"gs://{GCS_BUCKET}/{staging_prefix}/"
+        final_root = f"gs://{GCS_BUCKET}/{args.output_prefix}/"
+        sentinel_uri = final_root + "_COMPLETE"
+        try:
+            if gcs_object_exists(sentinel_uri):
+                subprocess.run(
+                    ["gcloud", "storage", "rm", sentinel_uri],
+                    check=True,
+                    timeout=600,
+                )
+            staged_files = gcs_list_files(staging_prefix)
+            if not staged_files:
+                raise RuntimeError(f"no staged parquet outputs under {staged_root}")
+            for staged_uri in staged_files:
+                relative = staged_uri.removeprefix(staged_root)
+                if not relative or relative == "_COMPLETE":
+                    continue
+                subprocess.run(
+                    ["gcloud", "storage", "cp", staged_uri, final_root + relative],
+                    check=True,
+                    timeout=600,
+                )
+            if full_input:
+                subprocess.run(
+                    ["gcloud", "storage", "cp", "/dev/null", sentinel_uri],
+                    check=True,
+                    timeout=600,
+                )
+                log.info("Wrote sentinel: %s", sentinel_uri)
+            else:
+                log.info("Partial --max-files run: not publishing _COMPLETE")
+        finally:
+            subprocess.run(
+                ["gcloud", "storage", "rm", "--recursive", staged_root],
+                check=False,
+                timeout=600,
+            )
 
 
 if __name__ == "__main__":

@@ -18,10 +18,10 @@ step from the coupling formula (they are never learned independently)::
     b2 = 1 - a2 * a1**(2L)
     b1 = b2 * (1 - a1) / (1 - a1**(2L))
 
-with ``0 <= a1 < 1`` and ``0 <= a2 < 1`` (enforced via a sigmoid on the stored
-logits). This coupling is precisely what keeps the activation L-infinity norm
-BOUNDED *near input scale* as the unrolled depth ``T`` grows — the core
-stability claim of the paper.
+with ``0 < a1 < 1`` and ``0 < a2 < 1`` (enforced via a margin-scaled sigmoid on
+the stored logits). This coupling is precisely what keeps the activation
+L-infinity norm BOUNDED *near input scale* as the unrolled depth ``T`` grows —
+the core stability claim of the paper.
 
 Ablation (verified in ``tests/test_stable_loop_scaling.py``), toy core,
 input ``||x||_inf == 2.29``:
@@ -47,6 +47,7 @@ performance.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
 
 import mlx.core as mx
@@ -56,6 +57,48 @@ import mlx.nn as nn
 # caller supplies the pre-norm module so the loop owns the residual scaling
 # while the core owns the per-sublayer transform ``f^l``.
 Sublayer = Callable[[nn.Module, mx.array, object], mx.array]
+
+
+@dataclass(frozen=True)
+class FixedPointConvergenceResult:
+    """Auditable outcome of one fixed-point inference run."""
+
+    state: mx.array
+    residuals: tuple[float, ...]
+    steps: int
+    converged: bool
+    eta: float
+    tau: float
+
+    @property
+    def final_residual(self) -> float:
+        """Residual observed on the final attempted iteration."""
+        return self.residuals[-1]
+
+    def to_info(self) -> dict[str, object]:
+        """Return the legacy diagnostics mapping used by ``collect_residuals``."""
+        return {
+            "residuals": list(self.residuals),
+            "steps": self.steps,
+            "halted": self.converged,
+            "converged": self.converged,
+            "eta": self.eta,
+            "mode": "inference",
+            "best_effort": not self.converged,
+        }
+
+
+class FixedPointConvergenceError(RuntimeError):
+    """Raised when fixed-point inference exhausts its iteration budget."""
+
+    def __init__(self, result: FixedPointConvergenceResult) -> None:
+        self.result = result
+        super().__init__(
+            "StableFixedPointLoop inference did not converge after "
+            f"{result.steps} steps: final_residual={result.final_residual:.8g} "
+            f">= tau={result.tau:.8g}; pass best_effort=True only when an "
+            "explicitly non-converged state is acceptable"
+        )
 
 
 class StableLoopCore(Protocol):
@@ -76,6 +119,17 @@ def _inf_norm(x: mx.array) -> mx.array:
     return mx.max(mx.abs(x))
 
 
+def _require_finite_tensor(x: mx.array, *, where: str) -> None:
+    """Fail immediately when an MLX tensor contains NaN or infinity."""
+    if not bool(mx.all(mx.isfinite(x)).item()):
+        raise FloatingPointError(f"{where}: tensor contains non-finite values")
+
+
+def _require_finite_float(value: float, *, where: str) -> None:
+    if not math.isfinite(value):
+        raise FloatingPointError(f"{where}: value is non-finite ({value})")
+
+
 class StableFixedPointLoop(nn.Module):
     """Weight-tied stable looped core with derived residual coupling.
 
@@ -92,14 +146,17 @@ class StableFixedPointLoop(nn.Module):
         ``len(core.sublayers)`` and ``len(core.norms)``.
     a1_init, a2_init:
         Initial values of the two free gates (paper defaults 0.75 / 0.25).
-        Must lie in ``[0, 1)``.
+        Must lie strictly inside the configured gate margin.
     tau:
         Fixed-point halting threshold for the relative L-inf residual.
     max_loops:
         Maximum number of loop iterations during inference fixed-point
-        iteration before halting is forced.
+        iteration before non-convergence raises.
     eps:
         Numerical floor used in the relative residual denominator.
+    gate_margin:
+        Strict distance maintained between each realized trainable gate and
+        the endpoints zero and one, including when logits saturate.
     """
 
     def __init__(
@@ -113,6 +170,7 @@ class StableFixedPointLoop(nn.Module):
         tau: float = 0.1,
         max_loops: int = 32,
         eps: float = 1e-6,
+        gate_margin: float = 1e-4,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -128,19 +186,26 @@ class StableFixedPointLoop(nn.Module):
             )
         if len(norms) != n_sublayers:
             raise ValueError(
-                f"core.norms has {len(norms)} entries but n_sublayers="
-                f"{n_sublayers}"
+                f"core.norms has {len(norms)} entries but n_sublayers={n_sublayers}"
             )
-        if not 0.0 <= a1_init < 1.0:
-            raise ValueError(f"a1_init must be in [0, 1), got {a1_init}")
-        if not 0.0 <= a2_init < 1.0:
-            raise ValueError(f"a2_init must be in [0, 1), got {a2_init}")
-        if tau <= 0.0:
-            raise ValueError(f"tau must be positive, got {tau}")
+        if not math.isfinite(gate_margin) or not 1e-6 <= gate_margin < 0.5:
+            raise ValueError(
+                f"gate_margin must be finite and in [1e-6, 0.5), got {gate_margin}"
+            )
+        for name, value in (("a1_init", a1_init), ("a2_init", a2_init)):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value}")
+            if not gate_margin < value < 1.0 - gate_margin:
+                raise ValueError(
+                    f"{name} must be in ({gate_margin}, {1.0 - gate_margin}), "
+                    f"got {value}"
+                )
+        if not math.isfinite(tau) or tau <= 0.0:
+            raise ValueError(f"tau must be finite and positive, got {tau}")
         if max_loops <= 0:
             raise ValueError(f"max_loops must be positive, got {max_loops}")
-        if eps <= 0.0:
-            raise ValueError(f"eps must be positive, got {eps}")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps}")
 
         self.core = core
         self.d_model = int(d_model)
@@ -148,18 +213,44 @@ class StableFixedPointLoop(nn.Module):
         self.tau = float(tau)
         self.max_loops = int(max_loops)
         self.eps = float(eps)
+        self.gate_margin = float(gate_margin)
 
         # Only a1, a2 are free. We store them as unconstrained logits and pass
-        # them through a sigmoid so the realized gates always satisfy the
-        # 0 <= a < 1 constraint without any clamping in the forward path.
-        self.logit_a1 = mx.array(_inverse_sigmoid(a1_init), dtype=mx.float32)
-        self.logit_a2 = mx.array(_inverse_sigmoid(a2_init), dtype=mx.float32)
+        # them through a margin-scaled sigmoid so even saturated logits stay a
+        # representable, strict distance from both zero and one.
+        self.logit_a1 = mx.array(
+            _inverse_margin_sigmoid(a1_init, self.gate_margin), dtype=mx.float32
+        )
+        self.logit_a2 = mx.array(
+            _inverse_margin_sigmoid(a2_init, self.gate_margin), dtype=mx.float32
+        )
 
     def gates(self) -> tuple[mx.array, mx.array]:
-        """Return the realized free gates ``(a1, a2)`` in ``[0, 1)``."""
-        a1 = mx.sigmoid(self.logit_a1)
-        a2 = mx.sigmoid(self.logit_a2)
-        return a1, a2
+        """Return finite free gates strictly inside ``(0, 1)``."""
+        for name, logit in (
+            ("logit_a1", self.logit_a1),
+            ("logit_a2", self.logit_a2),
+        ):
+            if logit.shape != ():
+                raise ValueError(
+                    f"StableFixedPointLoop.gates: {name} must be scalar, got "
+                    f"shape {logit.shape}"
+                )
+
+        logits = mx.stack(
+            [self.logit_a1.astype(mx.float32), self.logit_a2.astype(mx.float32)]
+        )
+        gates = self.gate_margin + (1.0 - 2.0 * self.gate_margin) * mx.sigmoid(logits)
+        combined = mx.concatenate([logits, gates])
+        if not bool(mx.all(mx.isfinite(combined)).item()):
+            _require_finite_tensor(
+                self.logit_a1, where="StableFixedPointLoop.gates.logit_a1"
+            )
+            _require_finite_tensor(
+                self.logit_a2, where="StableFixedPointLoop.gates.logit_a2"
+            )
+            _require_finite_tensor(gates, where="StableFixedPointLoop.gates.output")
+        return gates[0], gates[1]
 
     def scales(self) -> tuple[mx.array, mx.array, mx.array, mx.array]:
         """Return ``(a1, a2, b1, b2)`` with ``b1, b2`` derived via coupling.
@@ -171,13 +262,15 @@ class StableFixedPointLoop(nn.Module):
         """
         a1, a2 = self.gates()
         two_l = self.n_sublayers
-        a1_pow = a1 ** two_l
+        a1_pow = a1**two_l
         b2 = 1.0 - a2 * a1_pow
-        # 1 - a1**(2L) is strictly positive for a1 in [0, 1); the eps floor only
-        # guards the a1 -> 0 / 2L large numeric edge and never changes the
-        # mathematical value within machine precision.
+        # The gate margin keeps this denominator strictly positive even when a
+        # trainable logit saturates, so the coupling remains the exact formula.
         denom = 1.0 - a1_pow
-        b1 = b2 * (1.0 - a1) / (denom + self.eps)
+        b1 = b2 * (1.0 - a1) / denom
+        _require_finite_tensor(
+            mx.stack([a1, a2, b1, b2]), where="StableFixedPointLoop.scales"
+        )
         return a1, a2, b1, b2
 
     def f_theta(self, z: mx.array, x: mx.array, ctx: object) -> mx.array:
@@ -192,8 +285,19 @@ class StableFixedPointLoop(nn.Module):
         the residual-map convention ``f(z; x)``.
         """
         del x  # x participates only in the inter-iteration mix, not within f.
-        _a1, _a2, b1, _b2 = self.scales()
-        a1, _ = self.gates()
+        _require_finite_tensor(z, where="StableFixedPointLoop.f_theta.input_state")
+        scales = self.scales()
+        z = self._f_theta_with_scales(z, ctx, scales)
+        _require_finite_tensor(z, where="StableFixedPointLoop.f_theta.output_state")
+        return z
+
+    def _f_theta_with_scales(
+        self,
+        z: mx.array,
+        ctx: object,
+        scales: tuple[mx.array, mx.array, mx.array, mx.array],
+    ) -> mx.array:
+        a1, _a2, b1, _b2 = scales
         sublayers = list(self.core.sublayers)
         norms = list(self.core.norms)
         for sublayer, norm in zip(sublayers, norms):
@@ -206,13 +310,44 @@ class StableFixedPointLoop(nn.Module):
 
         ``z0_{i+1} = a2 * z^{2L}_i + b2 * x``.
         """
-        _a1, a2, _b1, b2 = self.scales()
+        _require_finite_tensor(
+            z_block, where="StableFixedPointLoop.iteration_mix.block_state"
+        )
+        _require_finite_tensor(x, where="StableFixedPointLoop.iteration_mix.input")
+        mixed = self._iteration_mix_with_scales(z_block, x, self.scales())
+        _require_finite_tensor(
+            mixed, where="StableFixedPointLoop.iteration_mix.output_state"
+        )
+        return mixed
+
+    @staticmethod
+    def _iteration_mix_with_scales(
+        z_block: mx.array,
+        x: mx.array,
+        scales: tuple[mx.array, mx.array, mx.array, mx.array],
+    ) -> mx.array:
+        _a1, a2, _b1, b2 = scales
         return a2 * z_block + b2 * x
 
     def loop_step(self, z: mx.array, x: mx.array, ctx: object) -> mx.array:
         """One full FPRM loop iteration: block sweep then iteration mix."""
-        z_block = self.f_theta(z, x, ctx)
-        return self.iteration_mix(z_block, x)
+        _require_finite_tensor(z, where="StableFixedPointLoop.loop_step.input_state")
+        _require_finite_tensor(x, where="StableFixedPointLoop.loop_step.input")
+        mixed = self._loop_step_with_scales(z, x, ctx, self.scales())
+        _require_finite_tensor(
+            mixed, where="StableFixedPointLoop.loop_step.output_state"
+        )
+        return mixed
+
+    def _loop_step_with_scales(
+        self,
+        z: mx.array,
+        x: mx.array,
+        ctx: object,
+        scales: tuple[mx.array, mx.array, mx.array, mx.array],
+    ) -> mx.array:
+        z_block = self._f_theta_with_scales(z, ctx, scales)
+        return self._iteration_mix_with_scales(z_block, x, scales)
 
     def residual_map(self, z: mx.array, x: mx.array, ctx: object) -> mx.array:
         """The full fixed-point map ``f(z; x)`` = one loop iteration output.
@@ -221,11 +356,17 @@ class StableFixedPointLoop(nn.Module):
         """
         return self.loop_step(z, x, ctx)
 
-    def relative_residual(
-        self, z: mx.array, f_z: mx.array
-    ) -> mx.array:
+    def relative_residual(self, z: mx.array, f_z: mx.array) -> mx.array:
         """Relative L-inf residual ``||z - f(z)||_inf / (||f(z)||_inf + eps)``."""
-        return _inf_norm(z - f_z) / (_inf_norm(f_z) + self.eps)
+        _require_finite_tensor(z, where="StableFixedPointLoop.relative_residual.state")
+        _require_finite_tensor(
+            f_z, where="StableFixedPointLoop.relative_residual.mapped_state"
+        )
+        residual = _inf_norm(z - f_z) / (_inf_norm(f_z) + self.eps)
+        _require_finite_tensor(
+            residual, where="StableFixedPointLoop.relative_residual.output"
+        )
+        return residual
 
     def forward(
         self,
@@ -238,7 +379,9 @@ class StableFixedPointLoop(nn.Module):
         fpopt_gamma: float = 1.0,
         fpopt_eta0: float = 1.0,
         collect_residuals: bool = False,
-    ) -> mx.array | tuple[mx.array, dict[str, object]]:
+        return_convergence: bool = False,
+        best_effort: bool = False,
+    ) -> mx.array | tuple[mx.array, dict[str, object]] | FixedPointConvergenceResult:
         """Run the stable loop.
 
         Two distinct modes:
@@ -252,21 +395,40 @@ class StableFixedPointLoop(nn.Module):
         When ``collect_residuals`` is ``True`` the method returns
         ``(z, info)`` where ``info`` carries the per-step residual trace, the
         number of steps run, and whether halting fired under ``tau``.
+
+        Inference raises :class:`FixedPointConvergenceError` when ``max_loops``
+        is exhausted. ``best_effort=True`` is the only path that returns a
+        non-converged state. ``return_convergence=True`` preserves the typed
+        convergence result for higher-level model APIs.
         """
+        _require_finite_tensor(z0, where="StableFixedPointLoop.forward.initial_state")
+        _require_finite_tensor(x, where="StableFixedPointLoop.forward.input")
+        if collect_residuals and return_convergence:
+            raise ValueError(
+                "collect_residuals and return_convergence are mutually exclusive"
+            )
         if training_loops is not None:
+            if best_effort:
+                raise ValueError("best_effort is only valid for fixed-point inference")
+            if return_convergence:
+                raise ValueError(
+                    "return_convergence is only valid for fixed-point inference"
+                )
             if training_loops <= 0:
                 raise ValueError(
                     f"training_loops must be positive, got {training_loops}"
                 )
             z = z0
+            scales = self.scales()
             residuals: list[float] = []
             for _ in range(training_loops):
+                f_z = self._loop_step_with_scales(z, x, ctx, scales)
+                _require_finite_tensor(
+                    f_z, where="StableFixedPointLoop.training.output_state"
+                )
                 if collect_residuals:
-                    f_z = self.residual_map(z, x, ctx)
                     residuals.append(float(self.relative_residual(z, f_z).item()))
-                    z = f_z
-                else:
-                    z = self.loop_step(z, x, ctx)
+                z = f_z
             if collect_residuals:
                 info: dict[str, object] = {
                     "residuals": residuals,
@@ -286,6 +448,8 @@ class StableFixedPointLoop(nn.Module):
             fpopt_gamma=fpopt_gamma,
             fpopt_eta0=fpopt_eta0,
             collect_residuals=collect_residuals,
+            return_convergence=return_convergence,
+            best_effort=best_effort,
         )
 
     def _fixed_point_infer(
@@ -298,19 +462,15 @@ class StableFixedPointLoop(nn.Module):
         fpopt_gamma: float,
         fpopt_eta0: float,
         collect_residuals: bool,
-    ) -> mx.array | tuple[mx.array, dict[str, object]]:
+        return_convergence: bool,
+        best_effort: bool,
+    ) -> mx.array | tuple[mx.array, dict[str, object]] | FixedPointConvergenceResult:
         if fpopt_patience <= 0:
-            raise ValueError(
-                f"fpopt_patience must be positive, got {fpopt_patience}"
-            )
+            raise ValueError(f"fpopt_patience must be positive, got {fpopt_patience}")
         if not 0.0 < fpopt_gamma <= 1.0:
-            raise ValueError(
-                f"fpopt_gamma must be in (0, 1], got {fpopt_gamma}"
-            )
+            raise ValueError(f"fpopt_gamma must be in (0, 1], got {fpopt_gamma}")
         if not 0.0 < fpopt_eta0 <= 1.0:
-            raise ValueError(
-                f"fpopt_eta0 must be in (0, 1], got {fpopt_eta0}"
-            )
+            raise ValueError(f"fpopt_eta0 must be in (0, 1], got {fpopt_eta0}")
 
         z = z0
         eta = fpopt_eta0
@@ -323,14 +483,20 @@ class StableFixedPointLoop(nn.Module):
             steps = step + 1
             f_tilde = self.residual_map(z, x, ctx)
             residual = float(self.relative_residual(z, f_tilde).item())
+            _require_finite_float(
+                residual, where="StableFixedPointLoop.inference.residual"
+            )
             residuals.append(residual)
             if residual < self.tau:
                 halted = True
                 # Take the damped step then stop.
                 z = eta * f_tilde + (1.0 - eta) * z
+                _require_finite_tensor(
+                    z, where="StableFixedPointLoop.inference.converged_state"
+                )
                 break
-            # FPOPT damping: on a stall (no improvement) relax eta toward 1.0
-            # via gamma. gamma == 1.0 keeps eta == eta0 (the paper's best).
+            # FPOPT damping: on a stall (no improvement), geometrically decay
+            # eta. Smaller eta retains more of the old state and damps harder.
             if residual < best_residual - self.eps:
                 best_residual = residual
                 stall = 0
@@ -338,18 +504,31 @@ class StableFixedPointLoop(nn.Module):
                 stall += 1
                 if stall >= fpopt_patience:
                     eta = eta * fpopt_gamma
+                    if not math.isfinite(eta) or eta <= 0.0:
+                        raise FloatingPointError(
+                            "StableFixedPointLoop.inference.eta: damping decayed "
+                            f"to an invalid value ({eta})"
+                        )
                     stall = 0
             z = eta * f_tilde + (1.0 - eta) * z
+            _require_finite_tensor(
+                z, where="StableFixedPointLoop.inference.updated_state"
+            )
 
+        result = FixedPointConvergenceResult(
+            state=z,
+            residuals=tuple(residuals),
+            steps=steps,
+            converged=halted,
+            eta=eta,
+            tau=self.tau,
+        )
+        if not halted and not best_effort:
+            raise FixedPointConvergenceError(result)
+        if return_convergence:
+            return result
         if collect_residuals:
-            info: dict[str, object] = {
-                "residuals": residuals,
-                "steps": steps,
-                "halted": halted,
-                "eta": eta,
-                "mode": "inference",
-            }
-            return z, info
+            return z, result.to_info()
         return z
 
     def __call__(
@@ -360,22 +539,27 @@ class StableFixedPointLoop(nn.Module):
         *,
         training_loops: int | None = None,
         **kwargs: object,
-    ) -> mx.array | tuple[mx.array, dict[str, object]]:
+    ) -> mx.array | tuple[mx.array, dict[str, object]] | FixedPointConvergenceResult:
         return self.forward(z0, x, ctx, training_loops=training_loops, **kwargs)
 
 
 def _inverse_sigmoid(p: float) -> float:
     """Logit of ``p`` so ``sigmoid(logit) == p`` for ``p`` in ``(0, 1)``."""
     if not 0.0 < p < 1.0:
-        # Allow the paper inits (0.75, 0.25); reject exact 0/1 which have no
-        # finite logit (and would violate the strict 0 <= a < 1 with a < 1).
-        raise ValueError(
-            f"gate init must be in the open interval (0, 1), got {p}"
-        )
+        # Exact endpoints have no finite logit and cannot satisfy the strict
+        # gate-margin contract.
+        raise ValueError(f"gate init must be in the open interval (0, 1), got {p}")
     return math.log(p / (1.0 - p))
 
 
+def _inverse_margin_sigmoid(p: float, margin: float) -> float:
+    unit_p = (p - margin) / (1.0 - 2.0 * margin)
+    return _inverse_sigmoid(unit_p)
+
+
 __all__ = [
+    "FixedPointConvergenceError",
+    "FixedPointConvergenceResult",
     "StableFixedPointLoop",
     "StableLoopCore",
     "Sublayer",

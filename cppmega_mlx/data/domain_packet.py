@@ -15,6 +15,7 @@ from cppmega_mlx.data.domain_schema import (
     DomainRoleKind,
     ParseConfidence,
     delimiter_token_ids,
+    validate_domain_edge_kind,
 )
 
 
@@ -64,6 +65,8 @@ class DomainEdgeIndex:
             bool(mx.any(self.src < 0).item()) or bool(mx.any(self.dst < 0).item())
         ):
             raise ValueError("DomainEdgeIndex endpoints must be non-negative")
+        for value in np.asarray(self.kind).tolist():
+            validate_domain_edge_kind(int(value))
 
     @property
     def num_edges(self) -> int:
@@ -212,6 +215,9 @@ def wrap_with_domain_tokens(packet: DomainPacket) -> DomainPacket:
     metadata["domain_wrapped"] = True
     metadata["domain_start_token_id"] = int(start_id)
     metadata["domain_end_token_id"] = int(end_id)
+    source_values = np.asarray(packet.source_doc_ids).tolist()
+    start_source = int(source_values[0]) if source_values else 0
+    end_source = int(source_values[-1]) if source_values else 0
 
     return DomainPacket(
         token_ids=token_ids,
@@ -220,7 +226,14 @@ def wrap_with_domain_tokens(packet: DomainPacket) -> DomainPacket:
         role_ids=wrap_sidecar(packet.role_ids, delimiter_value=delimiter_role),
         entity_ids=wrap_sidecar(packet.entity_ids, delimiter_value=0),
         scope_ids=wrap_sidecar(packet.scope_ids, delimiter_value=0),
-        source_doc_ids=wrap_sidecar(packet.source_doc_ids, delimiter_value=0),
+        source_doc_ids=mx.concatenate(
+            [
+                mx.array([start_source], dtype=mx.int32),
+                packet.source_doc_ids.astype(mx.int32),
+                mx.array([end_source], dtype=mx.int32),
+            ],
+            axis=0,
+        ),
         confidence_ids=wrap_sidecar(packet.confidence_ids, delimiter_value=exact),
         graph_edges=packet.graph_edges.shifted(1),
         metadata=metadata,

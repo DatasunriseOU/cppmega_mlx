@@ -9,6 +9,7 @@ materialized reference at small shapes where exact equality is achievable.
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,17 @@ from cppmega_mlx.training.loss import (
     next_token_cross_entropy,
     next_token_cut_cross_entropy,
 )
+
+
+def _isolated_bench_env() -> dict[str, str]:
+    environment = dict(os.environ)
+    for name in tuple(environment):
+        if name in {"PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "DYLD_LIBRARY_PATH"}:
+            environment.pop(name, None)
+        elif name.startswith(("TL_", "TILELANG", "TVM_")):
+            environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
 
 
 def _make_inputs(
@@ -322,7 +334,13 @@ def test_bench_script_runs_at_tiny_shape(tmp_path: Path) -> None:
         "--output",
         str(output),
     ]
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_isolated_bench_env(),
+    )
     assert completed.returncode == 0, completed.stderr
     import json
 
@@ -608,7 +626,13 @@ def test_chunked_eager_grad_hits_acceptance_4x_reduction_at_large_vocab(
         "--chunk-rows", str(DEFAULT_CHUNK_ROWS),
         "--output", str(output),
     ]
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_isolated_bench_env(),
+    )
     assert completed.returncode == 0, completed.stderr
 
     import json

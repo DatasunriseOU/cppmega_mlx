@@ -9,6 +9,7 @@ optimizer.state so fixed-shape batches can be replayed efficiently.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any, Callable, Literal, Mapping, Sequence, TypeVar, cast
@@ -19,10 +20,15 @@ from mlx.nn.utils import average_gradients
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from cppmega_mlx.data.batch import LMTokenBatch, ensure_lm_batch
+from cppmega_mlx.data.batch import (
+    LMTokenBatch,
+    ensure_lm_batch,
+    prevalidated_batch_values,
+)
 from cppmega_mlx.runtime.path_c_physical_abi import (
     physical_abi_runtime_kernel_args,
 )
+from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.training.loss import next_token_cross_entropy
 
 
@@ -79,6 +85,11 @@ STABLE_BATCH_KEYS = (
     "sibling_index_ids",
     "node_type_ids",
     "platform_ids",
+    "domain_ids",
+    "role_ids",
+    "confidence_ids",
+    "graph_attention_bias",
+    "graph_edge_kind_bias",
 )
 
 CompiledBatch = dict[str, mx.array | None]
@@ -1616,6 +1627,8 @@ def maybe_compile_region(
 
 def normalize_compiled_batch(
     batch: LMTokenBatch | Mapping[str, mx.array | None] | mx.array,
+    *,
+    graph_routes_enabled: bool | None = None,
 ) -> CompiledBatch:
     """Return the fixed-key batch pytree used by compiled train steps.
 
@@ -1626,7 +1639,56 @@ def normalize_compiled_batch(
     training batches, and structured batches.
     """
 
-    batch_dict = ensure_lm_batch(batch).as_dict()
+    lm_batch = ensure_lm_batch(batch)
+    batch_dict = lm_batch.as_dict()
+    nested_domain = (
+        None
+        if lm_batch.side_channels is None
+        else lm_batch.side_channels.get("domain_routes")
+    )
+    if nested_domain is not None:
+        for key in ("domain_ids", "role_ids", "confidence_ids"):
+            direct = batch_dict.get(key)
+            nested = nested_domain.get(key)
+            if direct is not None and nested is not None:
+                raise ValueError(
+                    f"compiled batch received duplicate direct/nested {key}"
+                )
+            if nested is not None:
+                batch_dict[key] = nested
+
+    graph_attention_bias = lm_batch.graph_attention_bias
+    graph_edge_kind_bias = lm_batch.graph_edge_kind_bias
+    if graph_routes_enabled is False:
+        provided_graph_fields = [
+            name
+            for name, value in (
+                ("graph_batch", lm_batch.graph_batch),
+                ("graph_attention_bias", graph_attention_bias),
+                ("graph_edge_kind_bias", graph_edge_kind_bias),
+            )
+            if value is not None
+        ]
+        if provided_graph_fields:
+            raise ValueError(
+                "compiled batch received graph data while graph routes are "
+                "disabled: " + ", ".join(provided_graph_fields)
+            )
+        graph_attention_bias = None
+        graph_edge_kind_bias = None
+    elif lm_batch.graph_batch is not None:
+        aligned = lm_batch.graph_batch.input_aligned(
+            source_sequence_length=int(lm_batch.tokens.shape[1]),
+            input_sequence_length=int(lm_batch.inputs.shape[1]),
+        )
+        graph_attention_bias, graph_edge_kind_bias = build_token_graph_biases(
+            aligned,
+            batch_size=int(lm_batch.inputs.shape[0]),
+            seq_length=int(lm_batch.inputs.shape[1]),
+            document_ids=lm_batch.input_document_ids,
+        )
+    batch_dict["graph_attention_bias"] = graph_attention_bias
+    batch_dict["graph_edge_kind_bias"] = graph_edge_kind_bias
     return {key: batch_dict.get(key) for key in STABLE_BATCH_KEYS}
 
 
@@ -1731,27 +1793,51 @@ class CompiledPretrainingStep:
         batch: LMTokenBatch | Mapping[str, mx.array] | mx.array,
     ) -> PretrainingMetrics:
         self.model.train()
-        batch_dict = normalize_compiled_batch(batch)
+        model_config = getattr(self.model, "config", None)
+        graph_routes_enabled = getattr(model_config, "graph_routes_enabled", None)
+        if graph_routes_enabled is not None and not isinstance(graph_routes_enabled, bool):
+            raise TypeError("model config graph_routes_enabled must be a boolean")
+        batch_dict = normalize_compiled_batch(
+            batch,
+            graph_routes_enabled=graph_routes_enabled,
+        )
+        batch_is_prevalidated = False
+        loss_validator = getattr(self.loss_fn, "validate_batch", None)
+        if callable(loss_validator):
+            loss_validator(batch_dict)
+            batch_is_prevalidated = True
+        validator = getattr(self.model, "validate_training_batch", None)
+        if validator is None and self.compile:
+            validator = getattr(self.model, "validate_compiled_batch", None)
+        if callable(validator):
+            validator(batch_dict)
+            batch_is_prevalidated = True
         if self.compile:
             self._check_compiled_batch_signature(batch_dict)
         pending_microbatches = self._pending_microbatches + 1
         do_update = pending_microbatches == self.grad_accum_steps
 
         start = time.perf_counter()
-        if self.compile:
-            if self._compiled_step is None:
-                self._compiled_step = self._build_compiled_step()
-            loss, ntokens, self._grad_accum = self._compiled_step(
-                batch_dict,
-                self._grad_accum,
-                do_update,
-            )
-        else:
-            loss, ntokens, self._grad_accum = self._eager_step(
-                batch_dict,
-                self._grad_accum,
-                do_update,
-            )
+        validation_context = (
+            prevalidated_batch_values()
+            if batch_is_prevalidated
+            else nullcontext()
+        )
+        with validation_context:
+            if self.compile:
+                if self._compiled_step is None:
+                    self._compiled_step = self._build_compiled_step()
+                loss, ntokens, self._grad_accum = self._compiled_step(
+                    batch_dict,
+                    self._grad_accum,
+                    do_update,
+                )
+            else:
+                loss, ntokens, self._grad_accum = self._eager_step(
+                    batch_dict,
+                    self._grad_accum,
+                    do_update,
+                )
         mx.eval(
             self.model.state,
             self.optimizer.state,

@@ -17,16 +17,27 @@ from __future__ import annotations
 
 import pytest
 
+from cppmega_mlx.data.domain_schema import (
+    DomainEdgeKind,
+    DomainKind,
+    ParseConfidence,
+)
 from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_CALL_EDGES_COLUMN,
     TOKEN_CHUNK_DEP_LEVELS_COLUMN,
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
+    TOKEN_CONFIDENCE_IDS_COLUMN,
+    TOKEN_DIAGNOSTIC_EDGES_COLUMN,
+    TOKEN_DOMAIN_EDGES_COLUMN,
+    TOKEN_DOMAIN_IDS_COLUMN,
     TOKEN_IDS_COLUMN,
+    TOKEN_SOURCE_DOC_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
 )
 from scripts.nanochat_data.pack_enriched_rows import (
+    DOC_IDS_COLUMN,
     DOC_DEP_EDGES_COLUMN,
     NUM_DOCS_COLUMN,
     SOURCE_DOC_INDICES_COLUMN,
@@ -46,6 +57,11 @@ def _doc(
     chunk_dep_levels: list[int] | None = None,
     call_edges: list[dict[str, int]] | None = None,
     type_edges: list[dict[str, int]] | None = None,
+    domain_edges: list[dict[str, int]] | None = None,
+    diagnostic_edges: list[dict[str, int]] | None = None,
+    domain_ids: list[int] | None = None,
+    confidence_ids: list[int] | None = None,
+    source_doc_ids: list[int] | None = None,
     doc_dep_edges: list[int] | None = None,
 ):
     n_chunks = len(chunk_starts)
@@ -57,6 +73,11 @@ def _doc(
         TOKEN_CHUNK_DEP_LEVELS_COLUMN: list(chunk_dep_levels or [0] * n_chunks),
         TOKEN_CALL_EDGES_COLUMN: list(call_edges or []),
         TOKEN_TYPE_EDGES_COLUMN: list(type_edges or []),
+        TOKEN_DOMAIN_EDGES_COLUMN: list(domain_edges or []),
+        TOKEN_DIAGNOSTIC_EDGES_COLUMN: list(diagnostic_edges or []),
+        TOKEN_DOMAIN_IDS_COLUMN: list(domain_ids or []),
+        TOKEN_CONFIDENCE_IDS_COLUMN: list(confidence_ids or []),
+        TOKEN_SOURCE_DOC_IDS_COLUMN: list(source_doc_ids or []),
         DOC_DEP_EDGES_COLUMN: list(doc_dep_edges or []),
     }
     return normalize_document_record(record, source_doc_index=index)
@@ -149,6 +170,103 @@ def test_intra_doc_edges_remap_to_correct_global_tokens() -> None:
     doc2_use_span = _chunk_token_span(row, 5)
     assert row["input_ids"][doc2_dep_span[0] : doc2_dep_span[1]] == [30, 31]
     assert row["input_ids"][doc2_use_span[0] : doc2_use_span[1]] == [32, 33]
+
+
+def test_two_doc_pack_shifts_every_edge_family_and_certifies_diagnostics() -> None:
+    heuristic = int(ParseConfidence.HEURISTIC)
+    first = _doc(
+        0,
+        [10, 11, 12],
+        chunk_starts=[0, 1],
+        chunk_ends=[1, 3],
+        call_edges=[{"from": 1, "to": 0}],
+        type_edges=[{"from": 0, "to": 1}],
+        domain_edges=[{"from": 0, "to": 2, "kind": int(DomainEdgeKind.INCLUDE)}],
+        domain_ids=[int(DomainKind.TEST_OUTPUT)] * 3,
+        confidence_ids=[heuristic] * 3,
+        source_doc_ids=[1, 2, 2],
+    )
+    second = _doc(
+        1,
+        [20, 21, 22],
+        chunk_starts=[0, 1],
+        chunk_ends=[1, 3],
+        call_edges=[{"from": 0, "to": 1}],
+        type_edges=[{"from": 1, "to": 0}],
+        domain_edges=[{"from": 0, "to": 2, "kind": int(DomainEdgeKind.INCLUDE)}],
+        diagnostic_edges=[
+            {
+                "from": 0,
+                "to": 2,
+                "kind": int(DomainEdgeKind.DIAG_PRIMARY_LOCATION),
+            }
+        ],
+        domain_ids=[int(DomainKind.SANITIZER_OUTPUT)] * 3,
+        confidence_ids=[heuristic] * 3,
+        source_doc_ids=[9, 9, 9],
+        doc_dep_edges=[0],
+    )
+
+    rows, overflow = pack_documents(
+        [first, second], target_length=8, pad_token_id=0, strategy="sequential"
+    )
+
+    assert overflow == []
+    assert len(rows) == 1
+    row = rows[0]
+    assert row[VALID_TOKEN_COUNT_COLUMN] == 6
+    assert row[DOC_IDS_COLUMN] == [1, 1, 1, 2, 2, 2, 2, 2]
+    assert row[TOKEN_SOURCE_DOC_IDS_COLUMN] == [1, 2, 2, 9, 9, 9, 0, 0]
+    assert row[TOKEN_CHUNK_STARTS_COLUMN] == [0, 1, 3, 4]
+    assert row[TOKEN_CHUNK_ENDS_COLUMN] == [1, 3, 4, 6]
+    assert row[TOKEN_CALL_EDGES_COLUMN] == [
+        {"from": 1, "to": 0},
+        {"from": 2, "to": 3},
+    ]
+    assert row[TOKEN_TYPE_EDGES_COLUMN] == [
+        {"from": 0, "to": 1},
+        {"from": 3, "to": 2},
+    ]
+    assert row[TOKEN_DOMAIN_EDGES_COLUMN] == [
+        {"from": 0, "to": 2, "kind": int(DomainEdgeKind.INCLUDE)},
+        {"from": 3, "to": 5, "kind": int(DomainEdgeKind.INCLUDE)},
+    ]
+    assert row[TOKEN_DIAGNOSTIC_EDGES_COLUMN] == [
+        {
+            "from": 3,
+            "to": 5,
+            "kind": int(DomainEdgeKind.DIAG_PRIMARY_LOCATION),
+        }
+    ]
+
+    assert row[TOKEN_CONFIDENCE_IDS_COLUMN] == [
+        int(ParseConfidence.RAW),
+        int(ParseConfidence.RAW),
+        int(ParseConfidence.RAW),
+        heuristic,
+        heuristic,
+        heuristic,
+        int(ParseConfidence.ABSENT),
+        int(ParseConfidence.ABSENT),
+    ]
+
+    valid = int(row[VALID_TOKEN_COUNT_COLUMN])
+    logical_ids = row[DOC_IDS_COLUMN]
+    for start, end in zip(
+        row[TOKEN_CHUNK_STARTS_COLUMN], row[TOKEN_CHUNK_ENDS_COLUMN], strict=True
+    ):
+        assert 0 <= start < end <= valid
+        assert len(set(logical_ids[start:end])) == 1
+    for edge in row[TOKEN_CALL_EDGES_COLUMN] + row[TOKEN_TYPE_EDGES_COLUMN]:
+        source_span = _chunk_token_span(row, edge["from"])
+        target_span = _chunk_token_span(row, edge["to"])
+        assert logical_ids[source_span[0]] == logical_ids[target_span[0]]
+        assert source_span[1] <= valid
+        assert target_span[1] <= valid
+    for edge in row[TOKEN_DOMAIN_EDGES_COLUMN] + row[TOKEN_DIAGNOSTIC_EDGES_COLUMN]:
+        assert 0 <= edge["from"] < valid
+        assert 0 <= edge["to"] < valid
+        assert logical_ids[edge["from"]] == logical_ids[edge["to"]]
 
 
 def test_overlong_doc_gets_its_own_block_unsplit() -> None:

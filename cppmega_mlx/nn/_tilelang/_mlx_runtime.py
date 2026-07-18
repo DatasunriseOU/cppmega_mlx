@@ -167,14 +167,220 @@ def _validate_owner_result(result: Any, expected_outputs: tuple[Any, ...]) -> An
     return expected_outputs
 
 
+def _mlx_dtype_from_tvm_dtype(dtype: Any) -> Any:
+    """Map a static TVM dtype spelling to the corresponding MLX dtype."""
+    import mlx.core as mx
+
+    name = str(dtype).strip()
+    aliases = {
+        "bool": mx.bool_,
+        "int8": mx.int8,
+        "uint8": mx.uint8,
+        "int16": mx.int16,
+        "uint16": mx.uint16,
+        "int32": mx.int32,
+        "uint32": mx.uint32,
+        "int64": mx.int64,
+        "uint64": mx.uint64,
+        "float16": mx.float16,
+        "float32": mx.float32,
+        "bfloat16": mx.bfloat16,
+        "complex64": mx.complex64,
+    }
+    try:
+        return aliases[name]
+    except KeyError as exc:
+        raise NativeTileLangRuntimeError(
+            f"native TileLang graph outputs do not support TVM dtype {name!r}"
+        ) from exc
+
+
+def _normalize_graph_result(result: Any, *, output_count: int) -> Any:
+    """Match the native callable's scalar-vs-sequence output contract."""
+    if output_count <= 0:
+        raise NativeTileLangRuntimeError(
+            f"native TileLang graph route requires outputs, got {output_count}"
+        )
+    if output_count == 1:
+        if isinstance(result, (list, tuple)):
+            if len(result) != 1:
+                raise NativeTileLangRuntimeError(
+                    "native TileLang graph route returned an unexpected output count: "
+                    f"got {len(result)}, expected 1"
+                )
+            return result[0]
+        return result
+    if not isinstance(result, (list, tuple)) or len(result) != output_count:
+        actual = len(result) if isinstance(result, (list, tuple)) else type(result).__name__
+        raise NativeTileLangRuntimeError(
+            "native TileLang graph route returned an unexpected output count: "
+            f"got {actual}, expected {output_count}"
+        )
+    return result
+
+
+def _native_graph_launch_config(artifact: Any) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Recover static TileLang block/thread extents for an MLX graph launch."""
+    adapter = getattr(artifact, "adapter", None)
+    launch_config = getattr(adapter, "_metal_launch_config", None)
+    if callable(launch_config):
+        try:
+            grid_blocks, threadgroup = launch_config()
+        except (AttributeError, NotImplementedError):
+            # Older pinned TileLang artifacts may expose a placeholder helper
+            # which explicitly declares that launch metadata is unavailable.
+            # Any other exception is a malformed artifact and must remain
+            # visible instead of being converted into a different launch.
+            grid_blocks = threadgroup = None
+        if grid_blocks is not None and threadgroup is not None:
+            try:
+                blocks = tuple(int(x) for x in grid_blocks)
+                threads = tuple(int(x) for x in threadgroup)
+            except (TypeError, ValueError) as exc:
+                raise NativeTileLangRuntimeError(
+                    "native TileLang graph launch metadata is not integer-valued"
+                ) from exc
+            if len(blocks) != 3 or len(threads) != 3 or any(
+                value <= 0 for value in (*blocks, *threads)
+            ):
+                raise NativeTileLangRuntimeError(
+                    "native TileLang graph launch metadata must contain three "
+                    f"positive extents: blocks={blocks!r}, threads={threads!r}"
+                )
+            return blocks, threads
+
+    prim_func = getattr(artifact, "prim_func", None)
+    script = getattr(prim_func, "script", None)
+    if not callable(script):
+        raise NativeTileLangRuntimeError(
+            "native TileLang graph outputs require a PrimFunc script or launch metadata"
+        )
+    text = str(script())
+    pattern = re.compile(
+        r'''T\.launch_thread\(\s*["'](?P<tag>blockIdx|threadIdx)\.(?P<axis>[xyz])["']\s*,\s*(?P<extent>\d+)\s*\)'''
+    )
+    blocks = [1, 1, 1]
+    threads = [1, 1, 1]
+    axes = {"x": 0, "y": 1, "z": 2}
+    for match in pattern.finditer(text):
+        target = blocks if match.group("tag") == "blockIdx" else threads
+        target[axes[match.group("axis")]] = int(match.group("extent"))
+    if not pattern.search(text):
+        raise NativeTileLangRuntimeError(
+            "native TileLang graph outputs could not recover static launch extents"
+        )
+    return tuple(blocks), tuple(threads)
+
+
+def _build_native_graph_runner(
+    artifact: Any,
+    result_indices: tuple[int, ...],
+) -> Callable[[tuple[Any, ...]], Any]:
+    """Build the explicit MLX graph-output route for a native artifact.
+
+    TVM-FFI transfers MLX buffers through DLPack and therefore cannot consume
+    MLX tracer arrays during ``mx.compile``. The graph route uses the exact
+    emitted MSL in an MLX primitive, while owner-output calls continue through
+    the native artifact. It is constructed only for callers that explicitly
+    request ``allow_graph_outputs``.
+    """
+    prim_func = getattr(artifact, "prim_func", None)
+    params = getattr(prim_func, "params", None)
+    buffer_map = getattr(prim_func, "buffer_map", None)
+    source = getattr(artifact, "kernel_source", None)
+    if params is None or buffer_map is None or source is None:
+        raise NativeTileLangRuntimeError(
+            "native TileLang graph outputs require PrimFunc buffers and kernel source"
+        )
+
+    names: list[str] = []
+    shapes: list[tuple[int, ...]] = []
+    dtypes: list[Any] = []
+    for param in params:
+        try:
+            buffer = buffer_map[param]
+            name = str(buffer.name)
+            shape = tuple(int(dim) for dim in buffer.shape)
+            dtype = _mlx_dtype_from_tvm_dtype(buffer.dtype)
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise NativeTileLangRuntimeError(
+                "native TileLang graph outputs require static tensor-only PrimFunc "
+                f"parameters; failed at {param!r}"
+            ) from exc
+        names.append(name)
+        shapes.append(shape)
+        dtypes.append(dtype)
+
+    num_params = len(names)
+    if not result_indices or any(index < 0 or index >= num_params for index in result_indices):
+        raise NativeTileLangRuntimeError(
+            f"native TileLang graph output indices {result_indices!r} are invalid "
+            f"for {num_params} PrimFunc parameters"
+        )
+    result_set = set(result_indices)
+    input_indices = tuple(index for index in range(num_params) if index not in result_set)
+    input_names = tuple(names[index] for index in input_indices)
+    output_names = tuple(names[index] for index in result_indices)
+    output_shapes = tuple(shapes[index] for index in result_indices)
+    output_dtypes = tuple(dtypes[index] for index in result_indices)
+    block_grid, threadgroup = _native_graph_launch_config(artifact)
+    grid = tuple(
+        max(1, int(blocks) * int(threads))
+        for blocks, threads in zip(block_grid, threadgroup, strict=True)
+    )
+    attrs = getattr(prim_func, "attrs", None)
+    try:
+        symbol = str(attrs["global_symbol"])
+    except (KeyError, TypeError):
+        symbol = "tilelang"
+    graph_name = re.sub(r"[^A-Za-z0-9_]", "_", symbol) + "_mlx_graph"
+
+    adapter = wrap_tilelang_metal_kernel(
+        str(source),
+        input_count=len(input_names),
+        output_count=len(output_names),
+        input_buffer_names=input_names,
+        output_buffer_names=output_names,
+        name=graph_name,
+        allow_mx_fast_metal_kernel=True,
+    )
+
+    def run(inputs: tuple[Any, ...]) -> Any:
+        if len(inputs) != len(input_indices):
+            raise NativeTileLangRuntimeError(
+                f"native TileLang graph route expected {len(input_indices)} inputs, "
+                f"got {len(inputs)}"
+            )
+        for position, (value, index) in enumerate(zip(inputs, input_indices, strict=True)):
+            if tuple(value.shape) != shapes[index] or value.dtype != dtypes[index]:
+                raise NativeTileLangRuntimeError(
+                    "native TileLang graph route received a shape/dtype mismatch at "
+                    f"input {position}: got shape={tuple(value.shape)}, dtype={value.dtype}; "
+                    f"expected shape={shapes[index]}, dtype={dtypes[index]}"
+                )
+        return _normalize_graph_result(
+            adapter(
+                inputs=list(inputs),
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+                grid=grid,
+                threadgroup=threadgroup,
+            ),
+            output_count=len(output_names),
+        )
+
+    return run
+
+
 @dataclass(frozen=True)
 class NativeTileLangKernel:
     """Strict native wrapper for TileLang ``execution_backend="tvm_ffi"``.
 
-    The wrapper deliberately requires caller-owned ``out=`` buffers whenever
-    the PrimFunc has result indices. That keeps the boundary honest: no MSL
-    text rewrite, no ``mx.fast.metal_kernel`` allocation semantics, and no
-    hidden Python-side staging to satisfy a wrapper ABI.
+    The default native route deliberately requires caller-owned ``out=``
+    buffers whenever the PrimFunc has result indices. An explicit
+    ``allow_graph_outputs`` route is available for MLX graph transforms and
+    uses the separately constructed native graph runner; it is never selected
+    implicitly.
     """
 
     artifact: Any
@@ -182,6 +388,7 @@ class NativeTileLangKernel:
     num_params: int
     target: Any
     allow_graph_outputs: bool = False
+    graph_runner: Callable[[tuple[Any, ...]], Any] | None = None
 
     def __call__(
         self,
@@ -203,6 +410,16 @@ class NativeTileLangKernel:
                 "native TileLang TVM-FFI kernels require caller-owned out= "
                 "buffers by default; pass allow_graph_outputs=True only for "
                 "an explicit native MLX graph-output route"
+            )
+        if self.result_indices and out is None and not using_full_abi_outputs:
+            if self.graph_runner is None:
+                raise NativeTileLangRuntimeError(
+                    "native TileLang graph-output route was explicitly requested "
+                    "but no graph runner was constructed"
+                )
+            return _normalize_graph_result(
+                self.graph_runner(tuple(inputs)),
+                output_count=len(self.result_indices),
             )
 
         if out is not None and len(inputs) != expected_inputs:
@@ -642,6 +859,43 @@ def _rewrite_tilelang_metal_to_mlx(
     return source
 
 
+def _rewrite_tvm_bfloat16_graph_body(body: str) -> str:
+    """Translate TVM's private bf16 scalar ABI to MLX's native Metal ABI.
+
+    TVM CodeGenMetal declares data buffers as ``tvm_bfloat16`` and emits
+    explicit conversion helpers. ``mx.fast.metal_kernel`` rebuilds those
+    buffer declarations from MLX dtypes, so the same buffers are exposed to
+    the body as ``bfloat16_t``. Keep TVM's unused prelude intact, but make the
+    executable body consume and produce MLX's native scalar type.
+    """
+
+    if not re.search(r"\b(?:__tvm_bfloat16_to_float|tvm_bfloat16)\b", body):
+        return body
+
+    body = _rename_identifiers_in_code(
+        body,
+        {
+            "__tvm_bfloat16_to_float": "float",
+            "tvm_bfloat16": "bfloat16_t",
+        },
+    )
+    literal = re.compile(
+        r"(?P<number>(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?)[hH]\b"
+    )
+
+    def rewrite_segment(segment: str) -> str:
+        return literal.sub(r"bfloat16_t(\g<number>f)", segment)
+
+    chunks: list[str] = []
+    last = 0
+    for match in _COMMENT_OR_STRING_RE.finditer(body):
+        chunks.append(rewrite_segment(body[last : match.start()]))
+        chunks.append(match.group(0))
+        last = match.end()
+    chunks.append(rewrite_segment(body[last:]))
+    return "".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -879,6 +1133,7 @@ def wrap_tilelang_metal_kernel(
         rename[src_name] = mlx_name
 
     renamed_body = _rename_identifiers_in_code(body, rename)
+    renamed_body = _rewrite_tvm_bfloat16_graph_body(renamed_body)
 
     # The header for ``mx.fast.metal_kernel`` is the prelude (typedefs,
     # helper macros, constants) emitted before the kernel definition --

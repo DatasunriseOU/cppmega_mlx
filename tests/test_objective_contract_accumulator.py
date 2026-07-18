@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import pytest
+
+from cppmega_mlx.data.graph_recipe import stage1_graph_config_kwargs
+from cppmega_mlx.training.megatron_objectives import (
+    MaterializedMegatronDocument,
+    build_pre_materialized_objective_contract,
+)
+from cppmega_mlx.training.objective_contract_accumulator import (
+    ObjectiveContractAccumulator,
+    count_configured_graph_positive_edges,
+)
+from cppmega_mlx.training.objective_mixer import (
+    EligibilityAwareTaskMixer,
+    GraphAuxLossConfig,
+)
+from cppmega_mlx.training.task_mixer import STAGE1_DEFAULT_RATES, TaskKind
+
+
+def _stage1_graph_config() -> GraphAuxLossConfig:
+    return GraphAuxLossConfig(**stage1_graph_config_kwargs())
+
+
+def _document(
+    task: TaskKind,
+    *,
+    graph: bool = False,
+) -> MaterializedMegatronDocument:
+    token_ids = [101, 102, 103, 104]
+    loss_mask = [1, 1, 1, 0]
+    return MaterializedMegatronDocument(
+        objective_kind=task.value,
+        token_ids=token_ids,
+        loss_mask=loss_mask,
+        graph_edge_count=int(graph),
+        row={
+            "doc_ids": [1, 1, 1, 1],
+            "token_chunk_starts": [0, 2],
+            "token_chunk_ends": [2, 3],
+            "token_call_edges": [{"from": 1, "to": 0}] if graph else [],
+            "token_type_edges": [],
+            "token_domain_edges": [],
+            "token_build_edges": [],
+            "token_shell_edges": [],
+            "token_diagnostic_edges": [],
+            "token_cross_domain_edges": [],
+        },
+    )
+
+
+def test_incremental_contract_exactly_matches_reference_builder() -> None:
+    mixer = EligibilityAwareTaskMixer(STAGE1_DEFAULT_RATES, seed=17)
+    quotas = mixer.quotas(60)
+    documents = [
+        _document(task, graph=task is TaskKind.CAUSAL_LM and index == 0)
+        for task in TaskKind
+        for index in range(quotas[task])
+    ]
+    graph_config = _stage1_graph_config()
+
+    reference = build_pre_materialized_objective_contract(
+        documents,
+        rates=mixer.rates,
+        seed=17,
+        quota_window_samples=60,
+        graph_config=graph_config,
+        graph_weight=1.0,
+    )
+    accumulator = ObjectiveContractAccumulator(
+        rates=mixer.rates,
+        seed=17,
+        quota_window_samples=60,
+        graph_config=graph_config,
+        graph_weight=1.0,
+    )
+    for document in documents:
+        accumulator.add(document)
+
+    assert accumulator.finalize() == reference
+
+
+def test_full_span_chunk_edge_counts_without_cartesian_pair_storage() -> None:
+    input_length = 20_000
+    document = MaterializedMegatronDocument(
+        objective_kind=TaskKind.CAUSAL_LM.value,
+        token_ids=[1] * (input_length + 1),
+        loss_mask=[1] * input_length + [0],
+        graph_edge_count=1,
+        row={
+            "doc_ids": [7] * (input_length + 1),
+            "token_chunk_starts": [0],
+            "token_chunk_ends": [input_length],
+            "token_call_edges": [{"from": 0, "to": 0}],
+            "token_type_edges": [],
+        },
+    )
+
+    assert (
+        count_configured_graph_positive_edges(
+            document,
+            relations=("call", "type"),
+        )
+        == input_length * (input_length + 1) // 2
+    )
+
+
+def test_each_quota_window_requires_a_materialized_graph_positive() -> None:
+    tasks = (
+        TaskKind.CAUSAL_LM,
+        TaskKind.FIM,
+        TaskKind.AST_FIM,
+        TaskKind.IFIM,
+        TaskKind.COMMIT_DIFF,
+        TaskKind.PRE_TO_POST,
+    )
+    graph_config = _stage1_graph_config()
+    accumulator = ObjectiveContractAccumulator(
+        rates={task: 1 / len(tasks) for task in tasks},
+        seed=17,
+        quota_window_samples=len(tasks),
+        graph_config=graph_config,
+        graph_weight=1.0,
+    )
+    for task in tasks:
+        accumulator.add(_document(task, graph=task is TaskKind.CAUSAL_LM))
+
+    with pytest.raises(ValueError, match="quota window.*graph-positive"):
+        for task in tasks:
+            accumulator.add(_document(task, graph=False))

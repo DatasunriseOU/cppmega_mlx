@@ -146,7 +146,7 @@ def document_boundary_mask(
     mask.
     """
 
-    doc_id_array = _as_2d_integer_array("doc_ids", doc_ids, allow_negative=True)
+    doc_id_array = _as_2d_document_id_array("doc_ids", doc_ids)
     valid_doc = doc_id_array >= 0
     same_doc = doc_id_array[:, :, None] == doc_id_array[:, None, :]
     same_doc &= valid_doc[:, :, None] & valid_doc[:, None, :]
@@ -216,8 +216,19 @@ def mlx_document_boundary_mask(
 
     if len(doc_ids.shape) != 2:
         raise ValueError(f"doc_ids must be 2D, got shape {doc_ids.shape}")
+    if doc_ids.dtype not in (
+        mx.int8,
+        mx.int16,
+        mx.int32,
+        mx.int64,
+        mx.uint8,
+        mx.uint16,
+        mx.uint32,
+        mx.uint64,
+    ):
+        raise TypeError(f"doc_ids must use an integer dtype, got {doc_ids.dtype}")
 
-    doc_id_array = doc_ids.astype(mx.int32)
+    doc_id_array = doc_ids
     valid_doc = cast(mx.array, doc_id_array >= 0)
     same_doc = cast(mx.array, doc_id_array[:, :, None] == doc_id_array[:, None, :])
     same_doc = cast(
@@ -520,6 +531,18 @@ def _as_2d_integer_array(
         raise ValueError(f"{name} must be 2D, got shape {array.shape}")
     _require_integer_values(name, array, allow_negative=allow_negative)
     return array.astype(np.int32, copy=False)
+
+
+def _as_2d_document_id_array(
+    name: str,
+    values: Sequence[Sequence[int]] | np.ndarray,
+) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {array.shape}")
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"{name} must use an integer dtype")
+    return array
 
 
 def _as_2d_bool_array(

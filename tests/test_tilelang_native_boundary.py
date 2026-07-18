@@ -49,6 +49,101 @@ def test_native_kernel_requires_owner_outputs_by_default() -> None:
     assert artifact.calls == []
 
 
+def test_native_kernel_graph_output_route_is_explicit_and_skips_tvm_ffi() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import NativeTileLangKernel
+
+    artifact = _RecordingArtifact()
+    graph_calls: list[tuple[Any, ...]] = []
+
+    def graph_runner(inputs: tuple[Any, ...]) -> list[str]:
+        graph_calls.append(inputs)
+        return ["graph-result"]
+
+    kernel = NativeTileLangKernel(
+        artifact=artifact,
+        result_indices=(1,),
+        num_params=2,
+        target="metal",
+        allow_graph_outputs=True,
+        graph_runner=graph_runner,
+    )
+    source = object()
+
+    assert kernel(source) == "graph-result"
+    assert graph_calls == [(source,)]
+    assert artifact.calls == []
+
+
+def test_native_graph_launch_metadata_failure_is_not_reparsed_as_primfunc() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import _native_graph_launch_config
+
+    class _Adapter:
+        def _metal_launch_config(self):
+            raise RuntimeError("corrupt launch receipt")
+
+    artifact = types.SimpleNamespace(
+        adapter=_Adapter(),
+        prim_func=types.SimpleNamespace(
+            script=lambda: 'T.launch_thread("blockIdx.x", 8)'
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt launch receipt"):
+        _native_graph_launch_config(artifact)
+
+
+def test_native_graph_launch_metadata_is_validated_before_graph_launch() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        NativeTileLangRuntimeError,
+        _native_graph_launch_config,
+    )
+
+    class _Adapter:
+        def _metal_launch_config(self):
+            return (8, 1), (0, 1, 1)
+
+    artifact = types.SimpleNamespace(adapter=_Adapter())
+    with pytest.raises(NativeTileLangRuntimeError, match="positive extents"):
+        _native_graph_launch_config(artifact)
+
+
+def test_native_graph_launch_uses_primfunc_only_when_helper_declares_unavailable() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import _native_graph_launch_config
+
+    class _Adapter:
+        def _metal_launch_config(self):
+            raise NotImplementedError
+
+    artifact = types.SimpleNamespace(
+        adapter=_Adapter(),
+        prim_func=types.SimpleNamespace(
+            script=lambda: (
+                'T.launch_thread("blockIdx.x", 8)\n'
+                'T.launch_thread("threadIdx.x", 32)'
+            )
+        ),
+    )
+    assert _native_graph_launch_config(artifact) == ((8, 1, 1), (32, 1, 1))
+
+
+def test_native_graph_result_unwraps_single_output_and_validates_count() -> None:
+    from cppmega_mlx.nn._tilelang._mlx_runtime import (
+        NativeTileLangRuntimeError,
+        _normalize_graph_result,
+    )
+
+    output = object()
+    assert _normalize_graph_result([output], output_count=1) is output
+    assert _normalize_graph_result(output, output_count=1) is output
+    pair = [object(), object()]
+    assert _normalize_graph_result(pair, output_count=2) is pair
+
+    with pytest.raises(NativeTileLangRuntimeError, match="expected 1"):
+        _normalize_graph_result(pair, output_count=1)
+    with pytest.raises(NativeTileLangRuntimeError, match="expected 2"):
+        _normalize_graph_result(output, output_count=2)
+
+
 def test_native_kernel_dispatches_with_owner_output_and_checks_identity() -> None:
     from cppmega_mlx.nn._tilelang._mlx_runtime import NativeTileLangKernel
 

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -55,13 +56,12 @@ from scripts.m04_train_step import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "m04_train_step.py"
-PYTHON = ROOT / ".venv" / "bin" / "python"
+PYTHON = Path(sys.executable)
 DEFAULT_FUSION_COMPILE_RECEIPT = ROOT / "reports" / "path_c_fusion_compile_receipt.json"
 PRODUCTION_FUSION_COMPILE_RECEIPT = (
     ROOT / "reports" / "path_c_fusion_production_smoke_receipt.json"
 )
-LOCAL_MLX_PYTHON = Path("/Volumes/external/sources/mlx/python")
-LOCAL_MLX_LIB = LOCAL_MLX_PYTHON / "mlx" / "lib"
+LOCAL_MLX_SOURCE_ENV = "CPPMEGA_MLX_SOURCE_ROOT"
 BASELINE_RECEIPT = ROOT / "bench" / "baselines" / "m04_train_step.json"
 GB10_SAMPLE = (
     ROOT
@@ -81,6 +81,23 @@ REAL_PARQUET_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
 )
+
+
+def _subprocess_python_abi_tag() -> str:
+    interpreter = PYTHON
+    probe = "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')"
+    result = subprocess.run(
+        [str(interpreter), "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip().isdigit():
+        raise RuntimeError(
+            f"failed to inspect child Python ABI via {interpreter}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout.strip()
 
 
 def _write_m04_token_parquet(
@@ -138,6 +155,35 @@ def strip_known_tvm_stderr_noise(stderr: str) -> str:
         )
     ]
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+_TILELANG_WARNING_LINE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+"
+    r"\[TileLang:[^]]+:\s*(?:DEBUG|INFO|WARNING)\]"
+)
+_KNOWN_TILELANG_ENV_DIAGNOSTIC_PREFIXES = (
+    "Loading tilelang libs from dev root: ",
+    "CUTLASS is not installed or found in the expected path",
+    "Composable Kernel is not installed or found in the expected path",
+)
+
+
+def assert_json_subprocess_stderr_is_diagnostic_only(stderr: str) -> None:
+    """Allow known non-fatal TileLang diagnostics, but never swallow errors."""
+
+    unexpected = []
+    for line in stderr.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith(_KNOWN_TILELANG_ENV_DIAGNOSTIC_PREFIXES):
+            continue
+        if _TILELANG_WARNING_LINE.match(line):
+            continue
+        unexpected.append(line)
+    assert not unexpected, (
+        "unexpected subprocess stderr (JSON protocol diagnostics must remain "
+        f"allowlisted): {unexpected!r}"
+    )
 
 
 def canonical_allocation_probe(**overrides: Any) -> dict[str, Any]:
@@ -462,6 +508,29 @@ def test_fp8_path_policies_set_explicit_runtime_routes(tmp_path: Path) -> None:
             assert "CPPMEGA_MAMBA3_PATH_C_BWD" not in os.environ
 
 
+def test_hybrid_tiny_reference_scope_is_deterministic_and_preserves_explicit_path_c(
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--output", str(tmp_path / "tiny.json")]
+    )
+    policy_names = tuple(m04_train_step.HYBRID_TINY_REFERENCE_KERNEL_POLICY_ENV)
+    with temporary_env({name: "auto" for name in policy_names}):
+        with m04_train_step.hybrid_tiny_reference_kernel_policy(args):
+            assert {name: os.environ[name] for name in policy_names} == {
+                name: "ref" for name in policy_names
+            }
+        assert {name: os.environ[name] for name in policy_names} == {
+            name: "auto" for name in policy_names
+        }
+
+    with temporary_env({name: "path_c" for name in policy_names}):
+        with m04_train_step.hybrid_tiny_reference_kernel_policy(args):
+            assert {name: os.environ[name] for name in policy_names} == {
+                name: "path_c" for name in policy_names
+            }
+
+
 def test_fp8_path_c_direct_chain_capture_is_opt_in(tmp_path: Path) -> None:
     base_args = m04_train_step.build_parser().parse_args(
         ["--synthetic", "--dtype", "fp8_path_c", "--output", str(tmp_path / "base.json")]
@@ -512,6 +581,7 @@ def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) 
     (source_root / "3rdparty" / "tvm" / "python").mkdir(parents=True)
     (build_root / "lib").mkdir(parents=True)
     (build_root / "tvm").mkdir(parents=True)
+    (build_root / "lib" / "libtilelang.so").touch()
 
     with temporary_env(
         {
@@ -527,6 +597,36 @@ def test_tilelang_dev_env_points_to_build_root_and_runtime_libs(tmp_path: Path) 
         assert str(build_root / "lib") in os.environ["DYLD_LIBRARY_PATH"].split(
             os.pathsep
         )
+
+
+def test_tilelang_dev_env_rejects_stub_only_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "tl_apache_tvm_swap"
+    build_root = source_root / "build"
+    (source_root / "tilelang").mkdir(parents=True)
+    (build_root / "lib").mkdir(parents=True)
+    (build_root / "tvm").mkdir(parents=True)
+    (build_root / "lib" / "libcudart_stub.so").touch()
+    monkeypatch.setattr(
+        m04_train_step,
+        "_tilelang_dev_roots",
+        lambda: (source_root,),
+    )
+
+    with temporary_env(
+        {
+            "TILELANG_DEV_BUILD_ROOT": str(source_root),
+            "TVM_LIBRARY_PATH": None,
+            "DYLD_LIBRARY_PATH": None,
+        }
+    ):
+        m04_train_step.ensure_tilelang_dev_env_for_path_c()
+
+        assert os.environ["TILELANG_DEV_BUILD_ROOT"] == str(source_root)
+        assert "TVM_LIBRARY_PATH" not in os.environ
+        assert "DYLD_LIBRARY_PATH" not in os.environ
 
 
 def test_m04_import_preserves_recipes_package_exports() -> None:
@@ -606,19 +706,30 @@ def test_non_path_c_keeps_mlx_cache_default(tmp_path: Path) -> None:
 
 def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    pythonpath = [str(ROOT)]
-    if LOCAL_MLX_PYTHON.exists():
-        pythonpath.insert(0, str(LOCAL_MLX_PYTHON))
-    if env.get("PYTHONPATH"):
-        pythonpath.append(env["PYTHONPATH"])
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath)
-    if LOCAL_MLX_LIB.exists():
-        dyld_path = [str(LOCAL_MLX_LIB)]
-        if env.get("DYLD_LIBRARY_PATH"):
-            dyld_path.append(env["DYLD_LIBRARY_PATH"])
-        env["DYLD_LIBRARY_PATH"] = os.pathsep.join(dyld_path)
+    # Keep the child hermetic. An interactive shell may export a source-checkout
+    # MLX runtime whose dylib ABI does not match the pinned wheel in this venv.
+    # A source fork is opt-in and must match the exact test interpreter ABI.
+    env["PYTHONPATH"] = str(ROOT)
+    env.pop("DYLD_LIBRARY_PATH", None)
+    source_root_value = env.get(LOCAL_MLX_SOURCE_ENV)
+    if source_root_value:
+        source_root = Path(source_root_value).expanduser().resolve()
+        python_root = source_root / "python"
+        if (source_root / "mlx").is_dir():
+            python_root = source_root
+        abi_tag = _subprocess_python_abi_tag()
+        extension_name = f"core.cpython-{abi_tag}-darwin.so"
+        extension = python_root / "mlx" / extension_name
+        lib_root = python_root / "mlx" / "lib"
+        if not extension.is_file() or not (lib_root / "libmlx.dylib").is_file():
+            raise RuntimeError(
+                f"{LOCAL_MLX_SOURCE_ENV}={source_root} has no MLX runtime ABI "
+                f"for child Python ABI {abi_tag}"
+            )
+        env["PYTHONPATH"] = os.pathsep.join([str(python_root), str(ROOT)])
+        env["DYLD_LIBRARY_PATH"] = str(lib_root)
     result = subprocess.run(
-        [str(PYTHON if PYTHON.exists() else sys.executable), str(SCRIPT), *args],
+        [str(PYTHON), str(SCRIPT), *args],
         cwd=ROOT,
         env=env,
         text=True,
@@ -636,7 +747,7 @@ def run_script(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str
 
 def load_json_result(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     assert result.returncode == 0, result.stderr
-    assert not result.stderr
+    assert_json_subprocess_stderr_is_diagnostic_only(result.stderr)
     payload = json.loads(result.stdout)
     assert isinstance(payload, dict)
     return payload
@@ -678,6 +789,19 @@ def tiny_args(output: Path, *, steps: int = 1) -> list[str]:
         str(output),
         "--json",
     ]
+
+
+def test_run_script_rejects_explicit_mlx_source_with_wrong_child_abi(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "mlx-source"
+    lib_root = source_root / "python" / "mlx" / "lib"
+    lib_root.mkdir(parents=True)
+    (lib_root / "libmlx.dylib").touch()
+
+    with temporary_env({LOCAL_MLX_SOURCE_ENV: str(source_root)}):
+        with pytest.raises(RuntimeError, match="has no MLX runtime ABI"):
+            run_script(*tiny_args(tmp_path / "receipt.json"))
 
 
 def assert_m04_receipt_contract(payload: dict[str, Any]) -> None:
@@ -1326,6 +1450,13 @@ def test_synthetic_one_step_writes_finite_receipt(tmp_path: Path) -> None:
     assert payload["acceptance_gate"]["full_target_dataset_blocker"]
     assert payload["training"]["final_loss"] > 0
     assert payload["training"]["step_metrics"][0]["updated"] is True
+    assert payload["training"]["kernel_dispatch"] == [
+        {
+            "kernel_used": "reference_pure_mlx",
+            "op_name": "mamba3_mimo",
+            "path": "ref",
+        }
+    ]
     interpretation = payload["timing"]["throughput_interpretation"]
     assert interpretation["reported_tokens_per_second_kind"] == (
         "loss_target_tokens_per_second"
@@ -1414,7 +1545,7 @@ def test_require_loss_decrease_fails_single_step_but_writes_receipt(
     result = run_script(*tiny_args(output), "--require-loss-decrease")
 
     assert result.returncode == 2
-    assert not result.stderr
+    assert_json_subprocess_stderr_is_diagnostic_only(result.stderr)
     payload = json.loads(result.stdout)
     assert json.loads(output.read_text()) == payload
     assert_m04_receipt_contract(payload)
@@ -1464,7 +1595,7 @@ def test_fp8_path_c_training_dtype_route_blocks_missing_sparse_mla_producer(
     )
 
     assert result.returncode == 2, result.stderr
-    assert not result.stderr
+    assert_json_subprocess_stderr_is_diagnostic_only(result.stderr)
     payload = json.loads(result.stdout)
     assert json.loads(output.read_text()) == payload
     assert payload["status"] == "blocked"
@@ -1912,7 +2043,10 @@ def test_fp8_path_c_dsa_attention_route_metadata_is_configured(
     )
     assert set(
         route["path_c_fusion"]["production_schedule"]["brick_schedule_families"]
-    ) == {"loop_descriptor_dataflow"}
+    ) == {
+        "lane_sequential_reverse_scan",
+        "loop_descriptor_dataflow",
+    }
     assert "mamba3_mimo:descriptor_codegen_ready" in (
         route["path_c_fusion"]["production_schedule"]["brick_descriptor_statuses"]
     )
@@ -2372,6 +2506,61 @@ def test_fp8_path_c_route_metadata_fails_closed_when_planner_import_fails(
     )
 
 
+def test_inactive_path_c_route_does_not_plan_default_fusion_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        ["--synthetic", "--output", str(tmp_path / "tiny.json")]
+    )
+
+    def unexpected_planner(**_kwargs: Any) -> Mapping[str, Any]:
+        raise AssertionError("inactive Path C route must not invoke its planner")
+
+    monkeypatch.setattr(m04_train_step, "path_c_fusion_payload", unexpected_planner)
+    route = m04_train_step.fp8_path_c_training_route_payload(args)
+
+    assert route["requested"] is False
+    assert route["status"] == "not_requested"
+    assert route["path_c_fusion"]["status"] == "not_requested"
+    assert route["path_c_fusion"]["runtime_training_binding"]["status"] == (
+        "not_requested"
+    )
+    assert route["full_end_to_end_training_available"] is False
+
+
+def test_missing_fp8_producer_does_not_plan_default_fusion_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    args = m04_train_step.build_parser().parse_args(
+        [
+            "--synthetic",
+            "--dtype",
+            "fp8_path_c",
+            "--output",
+            str(tmp_path / "tiny.json"),
+        ]
+    )
+
+    def unexpected_planner(**_kwargs: Any) -> Mapping[str, Any]:
+        raise AssertionError(
+            "missing FP8 producer must block before invoking the Path C planner"
+        )
+
+    monkeypatch.setattr(m04_train_step, "path_c_fusion_payload", unexpected_planner)
+    route = m04_train_step.fp8_path_c_training_route_payload(args)
+
+    assert route["status"] == m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    assert route["selected_action"] == "fail_closed_producer_missing"
+    assert route["path_c_fusion"]["status"] == (
+        m04_train_step.FP8_PATH_C_PRODUCER_MISSING_STATUS
+    )
+    assert route["path_c_fusion"]["graph_construction"]["region_source"] == (
+        "producer_missing"
+    )
+
+
 def _model_route_direct_chain(
     model: Any | None = None,
     *,
@@ -2424,6 +2613,18 @@ def _model_route_direct_chain_mx_buffers(
         dtype = getattr(mx, str(spec.dtype))
         buffers[name] = mx.zeros(tuple(spec.shape), dtype=dtype)
     return buffers
+
+
+def _model_route_direct_chain_token_batch(
+    model: Any,
+    buffers: Mapping[str, mx.array],
+) -> dict[str, mx.array]:
+    seq_len = int(
+        buffers["local_gb10_quarter_brick_11_R_hidden_after"].shape[1]
+    )
+    tokens = mx.arange(seq_len + 1, dtype=mx.int32)[None, :]
+    tokens = tokens % mx.array(model.config.vocab_size, dtype=mx.int32)
+    return {"tokens": tokens}
 
 
 def _model_route_direct_chain_artifacts(
@@ -2883,7 +3084,7 @@ def test_path_c_direct_chain_runtime_value_and_grad_uses_loss_cotangent_bridge(
 
     (loss, ntokens), grads = runtime.value_and_grad(
         model,
-        {},
+        _model_route_direct_chain_token_batch(model, buffers),
         forbidden_loss_and_grad,
     )
     flat = dict(tree_flatten(grads))
@@ -2963,6 +3164,13 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
 
     artifacts = tuple(_artifact_for_segment(segment) for segment in chain.segments)
 
+    def _collapsed_segment_events(values: Sequence[str]) -> list[str]:
+        return [
+            value
+            for index, value in enumerate(values)
+            if index == 0 or values[index - 1] != value
+        ]
+
     class _ForwardBoundaryBridge(_ContractedLossCotangentBridge):
         def __call__(
             self,
@@ -2973,11 +3181,13 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
             required_loss_cotangent_buffers: Sequence[str],
             chain: Any,
         ) -> dict[str, Any]:
-            assert events == [
+            collapsed_forward_events = _collapsed_segment_events(events)
+            assert collapsed_forward_events == [
                 "segment:0:forward",
                 "segment:1:forward",
                 "segment:2:forward",
                 "segment:3:forward",
+                "segment:4:forward",
             ]
             events.append("loss_cotangent_bridge")
             return super().__call__(
@@ -3006,23 +3216,33 @@ def test_path_c_direct_chain_runtime_value_and_grad_bridges_after_forward_segmen
     def forbidden_loss_and_grad(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("Path C direct runtime must not delegate to eager")
 
-    runtime.value_and_grad(model, {}, forbidden_loss_and_grad)
+    runtime.value_and_grad(
+        model,
+        _model_route_direct_chain_token_batch(model, buffers),
+        forbidden_loss_and_grad,
+    )
 
-    # Metal forward fusion cap -> 4 forward segments (0-3) execute, then the loss
-    # cotangent bridge fires at the forward/backward boundary, then the 5 backward
-    # segments (4-8) run. The bridge boundary is unchanged; only the forward
-    # segment count grew (the 4-op forward mega-kernel is split into 4 segments).
-    assert events == [
+    # Metal forward fusion cap plus row-chunk isolation produces 5 forward
+    # segments. The backward cap produces 7 backward segments. Launcher-chunk
+    # segments may invoke their artifact repeatedly, but segment order and the
+    # single cotangent bridge boundary remain exact.
+    assert events.count("loss_cotangent_bridge") == 1
+    bridge_index = events.index("loss_cotangent_bridge")
+    assert _collapsed_segment_events(events[:bridge_index]) == [
         "segment:0:forward",
         "segment:1:forward",
         "segment:2:forward",
         "segment:3:forward",
-        "loss_cotangent_bridge",
-        "segment:4:backward",
+        "segment:4:forward",
+    ]
+    assert _collapsed_segment_events(events[bridge_index + 1 :]) == [
         "segment:5:backward",
         "segment:6:backward",
         "segment:7:backward",
         "segment:8:backward",
+        "segment:9:backward",
+        "segment:10:backward",
+        "segment:11:backward",
     ]
 
 
@@ -5570,19 +5790,26 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     ]
     audit = route["path_c_fusion"]["direct_chained_fusion"]["model_binding_audit"]
     assert audit["status"] == "runtime_backward_or_state_owner_missing"
-    # Metal forward fusion cap splits sparse_mla_fp8_apply into its own segment,
-    # so the int32 sparse-index scratch (path_c_int32_scratch_bank) is now fully
-    # internal to that kernel instead of a coalesced cross-segment scratch bank:
-    # one fewer runtime_activation_or_grad logical buffer (94 -> 93, 62 -> 61).
-    #
-    # Metal backward fusion cap (METAL_BACKWARD_MAX_SEGMENT_NODES = 1) then adds
-    # +5 cross-segment backward grads (qkv q/kv fp8+scale grads + R-brick
-    # residual_norm_hidden_grad) exposed by splitting the backward segment:
-    # required 93 -> 98, runtime_activation_or_grad 61 -> 66, backward_gradient
-    # 39 -> 44.
-    assert audit["required_logical_buffer_count"] == 98
+    chain = _model_route_direct_chain(model, sequence_length=config.seq_len)
+    required_specs = m04_train_step._path_c_direct_chain_required_logical_buffer_specs(
+        chain
+    )
+    # The current production schedule spills these four row-carry buffers out of
+    # reusable shared memory. They are therefore part of the model-derived direct
+    # ABI, rather than test-only padding or an expected-count adjustment.
+    assert {
+        "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_history",
+        "local_gb10_quarter_brick_11_R_m2rnn_h_state",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_history",
+    }.issubset(required_specs)
+    # The forward split removes the coalesced int32 scratch from the shared
+    # cross-segment set, while the backward cap exposes five cross-segment grads.
+    # The production row-carry spill then adds three activation buffers and one
+    # recurrent-state buffer: 98 -> 102, 66 -> 69, 22 -> 25, and 6 -> 7.
+    assert audit["required_logical_buffer_count"] == 102
     assert audit["model_parameter_or_constant_count"] == 26
-    assert audit["runtime_activation_or_grad_count"] == 66
+    assert audit["runtime_activation_or_grad_count"] == 69
     assert audit["backward_gradient_count"] == 44
     assert audit["forward_activation_probe_surface_available"] is True
     assert audit["parameter_gradient_probe_surface_available"] is True
@@ -5598,11 +5825,8 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     # activation grads, so they raise the uncovered (bridge-only) count.
     assert audit["backward_gradient_uncovered_count"] == 16
     assert audit["profile_brick_names_attached"] is True
-    # 22 (was 23): the int32 sparse-index scratch bank, previously a coalesced
-    # cross-segment forward/prepared scratch buffer, is now kernel-internal to
-    # the standalone sparse_mla_fp8_apply segment after the Metal forward split.
-    assert audit["forward_activation_or_prepared_count"] == 22
-    assert audit["runtime_state_count"] == 6
+    assert audit["forward_activation_or_prepared_count"] == 25
+    assert audit["runtime_state_count"] == 7
     pre_step_plan = route["path_c_fusion"]["direct_chained_fusion"][
         "pre_step_owner_plan"
     ]
@@ -5610,11 +5834,11 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     assert pre_step_plan["training_critical_path_ready"] is False
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
     assert pre_step_plan["model_parameter_or_constant_missing_count"] == 0
-    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 22
-    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 22
-    assert pre_step_plan["runtime_state_count"] == 6
-    assert pre_step_plan["runtime_state_missing_count"] == 6
-    assert pre_step_plan["pre_step_runtime_missing_count"] == 28
+    assert pre_step_plan["batch_dependent_forward_or_prepared_count"] == 25
+    assert pre_step_plan["batch_dependent_forward_or_prepared_missing_count"] == 25
+    assert pre_step_plan["runtime_state_count"] == 7
+    assert pre_step_plan["runtime_state_missing_count"] == 7
+    assert pre_step_plan["pre_step_runtime_missing_count"] == 32
     # 44 (was 39): +5 cross-segment backward grads from the Metal backward split.
     assert pre_step_plan["backward_workspace_gradient_count"] == 44
     assert (
@@ -5627,6 +5851,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
         "local_gb10_quarter_brick_10_M_state_in",
         "local_gb10_quarter_brick_11_R_m2rnn_conv_state",
         "local_gb10_quarter_brick_11_R_m2rnn_h0",
+        "local_gb10_quarter_brick_11_R_m2rnn_h_state",
         "mamba3_angle_grad_state",
     ]
     runtime_binding = route["path_c_fusion"]["direct_chained_fusion"][
@@ -5637,9 +5862,7 @@ def test_fp8_path_c_training_route_for_model_uses_model_derived_regions(
     )
     assert runtime_binding["provided_logical_buffer_count"] == 26
     assert runtime_binding["shape_mismatch_buffers"] == []
-    # 70 (was 65): int32 sparse-index scratch bank kernel-internal after the
-    # forward split, plus +5 cross-segment backward grads from the backward cap.
-    assert runtime_binding["missing_logical_buffer_count"] == 70
+    assert runtime_binding["missing_logical_buffer_count"] == 74
     assert (
         "local_gb10_quarter_brick_12_A_sparse_mla_fp8_apply_sparse_mla_sm_scale"
         in runtime_binding["missing_logical_buffers"]
@@ -5691,10 +5914,9 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     )
 
     assert owner.owner_name == "local_gb10_quarter.path_c_pre_step_runtime_buffers"
-    # 98 (was 93): the Metal forward split makes the int32 sparse-index scratch
-    # bank kernel-internal, and the Metal backward cap then exposes +5
-    # cross-segment backward grads (qkv q/kv fp8+scale + R residual_norm_hidden).
-    assert len(owner.buffers) == 98
+    # The four production row-carry spills are part of the owner in addition to
+    # the forward-split/backward-cap ABI surface: 98 -> 102 logical buffers.
+    assert len(owner.buffers) == 102
     assert owner.hidden_packing_performed is False
     assert owner.no_hidden_allocation_policy is True
     assert owner.buffers[
@@ -5706,18 +5928,14 @@ def test_path_c_direct_chain_pre_step_owner_is_dynamic_batch_abi(
     ] is parameters["layers.10.block.conv_weight"]
     assert binding["status"] == "ok"
     assert binding["runtime_uses_direct_fusion_chain"] is True
-    # 96 (was 91): the Metal backward cap exposes +5 cross-segment backward grads
-    # (qkv q/kv fp8+scale + R residual_norm_hidden) as caller-owned buffers.
-    assert binding["provided_logical_buffer_count"] == 96
+    assert binding["provided_logical_buffer_count"] == 100
     assert binding["missing_logical_buffer_count"] == 0
     assert binding["unexpected_logical_buffer_count"] == 0
     assert pre_step_plan["status"] == "pre_step_runtime_owner_ready"
     assert pre_step_plan["training_critical_path_ready"] is True
     assert pre_step_plan["model_parameter_or_constant_available_count"] == 26
-    # 22 (was 23): int32 sparse-index scratch bank is kernel-internal after the
-    # Metal forward split (see the model_derived_regions / capture-owners tests).
-    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 22
-    assert pre_step_plan["runtime_state_available_count"] == 6
+    assert pre_step_plan["batch_dependent_forward_or_prepared_available_count"] == 25
+    assert pre_step_plan["runtime_state_available_count"] == 7
     # 44 (was 39): +5 cross-segment backward grads from the Metal backward split.
     assert pre_step_plan["backward_workspace_gradient_available_count"] == 44
 
@@ -6251,9 +6469,12 @@ def test_path_c_direct_chain_runtime_capture_owners_reduce_binding_gap() -> None
     # turns those intermediate grads into caller-owned cross-segment buffers.
     assert runtime_binding["missing_logical_buffers"] == [
         "local_gb10_quarter_brick_10_M_entry_rmsnorm_hidden_grad",
+        "local_gb10_quarter_brick_10_M_mamba3_angle_cumsum",
+        "local_gb10_quarter_brick_10_M_mamba3_conv_history",
         "local_gb10_quarter_brick_10_M_mamba3_h0_grad",
         "local_gb10_quarter_brick_10_M_residual_norm_hidden_grad",
         "local_gb10_quarter_brick_10_M_state_in_grad",
+        "local_gb10_quarter_brick_11_R_m2rnn_conv_history",
         "local_gb10_quarter_brick_11_R_m2rnn_h0_grad",
         "local_gb10_quarter_brick_11_R_residual_norm_hidden_grad",
         "local_gb10_quarter_brick_12_A_qkv_projection_kv_fp8_grad",
@@ -6359,10 +6580,7 @@ def test_fp8_path_c_training_route_composes_model_and_runtime_logical_owners(
     )
     assert runtime_binding["hidden_packing_performed"] is False
     assert runtime_binding["provided_logical_buffer_count"] == 26
-    # 70 (was 65): int32 sparse-index scratch bank is kernel-internal after the
-    # Metal forward split, and the Metal backward cap exposes +5 cross-segment
-    # backward grads (see the capture-owners test).
-    assert runtime_binding["missing_logical_buffer_count"] == 70
+    assert runtime_binding["missing_logical_buffer_count"] == 74
     # Metal forward fusion cap + row-chunked forward op isolation -> 5 forward
     # segments; backward fusion cap -> 7 backward segments (see the segment_count
     # tests). Total = 12.

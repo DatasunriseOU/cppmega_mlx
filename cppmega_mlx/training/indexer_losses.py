@@ -31,6 +31,8 @@ from collections.abc import Sequence
 import mlx.core as mx
 import numpy as np
 
+from cppmega_mlx.data.batch import batch_values_are_prevalidated
+
 _EPS = 1e-9
 _NEG_INF = -1e9
 
@@ -109,6 +111,7 @@ def indexer_edge_bce_loss(
     indexer_scores: mx.array,
     edge_targets: mx.array,
     *,
+    pair_mask: mx.array | None = None,
     pos_weight: float = 1.0,
     loss_coeff: float = 1.0,
 ) -> mx.array:
@@ -134,6 +137,28 @@ def indexer_edge_bce_loss(
     logits = indexer_scores.astype(mx.float32)
     valid = (logits > (_NEG_INF / 2.0)).astype(mx.float32)
     targets = edge_targets.astype(mx.float32)
+    if not batch_values_are_prevalidated() and bool(
+        mx.any((targets != 0) & (targets != 1)).item()
+    ):
+        raise ValueError("indexer_edge_bce_loss: edge_targets must contain only 0/1")
+    if pair_mask is not None:
+        if tuple(pair_mask.shape) != (B, Tq, Sblk):
+            raise ValueError(
+                f"indexer_edge_bce_loss: pair_mask {tuple(pair_mask.shape)} must "
+                f"match indexer_scores ({B},{Tq},{Sblk})"
+            )
+        mask = pair_mask.astype(mx.float32)
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((mask != 0) & (mask != 1)).item()
+        ):
+            raise ValueError("indexer_edge_bce_loss: pair_mask must contain only 0/1")
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((targets > 0) & (mask <= 0)).item()
+        ):
+            raise ValueError(
+                "indexer_edge_bce_loss: positive edge outside pair_mask"
+            )
+        valid = valid * mask
     # numerically-stable BCE-with-logits, weighted on positives.
     max0 = mx.maximum(logits, mx.zeros_like(logits))
     log1pexp = mx.log1p(mx.exp(-mx.abs(logits)))
@@ -148,6 +173,7 @@ def indexer_coverage_hinge_loss(
     indexer_scores: mx.array,
     edge_targets: mx.array,
     *,
+    pair_mask: mx.array | None = None,
     topk: int,
     margin: float = 1.0,
     loss_coeff: float = 1.0,
@@ -177,6 +203,37 @@ def indexer_coverage_hinge_loss(
         raise ValueError(f"indexer_coverage_hinge_loss: topk must be >=1, got {topk}")
     logits = indexer_scores.astype(mx.float32)
     targets = edge_targets.astype(mx.float32)
+    if not batch_values_are_prevalidated() and bool(
+        mx.any((targets != 0) & (targets != 1)).item()
+    ):
+        raise ValueError(
+            "indexer_coverage_hinge_loss: edge_targets must contain only 0/1"
+        )
+    if pair_mask is not None:
+        if tuple(pair_mask.shape) != (B, Tq, Sblk):
+            raise ValueError(
+                f"indexer_coverage_hinge_loss: pair_mask "
+                f"{tuple(pair_mask.shape)} must match indexer_scores "
+                f"({B},{Tq},{Sblk})"
+            )
+        mask = pair_mask.astype(mx.float32)
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((mask != 0) & (mask != 1)).item()
+        ):
+            raise ValueError(
+                "indexer_coverage_hinge_loss: pair_mask must contain only 0/1"
+            )
+        if not batch_values_are_prevalidated() and bool(
+            mx.any((targets > 0) & (mask <= 0)).item()
+        ):
+            raise ValueError(
+                "indexer_coverage_hinge_loss: positive edge outside pair_mask"
+            )
+        logits = mx.where(
+            mask > 0,
+            logits,
+            mx.full(logits.shape, _NEG_INF, dtype=mx.float32),
+        )
     # The selection boundary is the highest score that is NOT selected, i.e. the
     # (k+1)-th largest score. A true-edge block is "covered" iff its score
     # strictly exceeds that boundary. We penalise true edges whose score is below
@@ -390,6 +447,7 @@ def total_indexer_loss(
     *,
     dense_attn_blocks: mx.array | None = None,
     edge_targets: mx.array | None = None,
+    edge_pair_mask: mx.array | None = None,
     topk: int,
     kl_coeff: float = 1.0,
     bce_coeff: float = 1.0,
@@ -414,13 +472,21 @@ def total_indexer_loss(
         total = total + kl
     if edge_targets is not None and bce_coeff:
         bce = indexer_edge_bce_loss(
-            indexer_scores, edge_targets, pos_weight=pos_weight, loss_coeff=bce_coeff
+            indexer_scores,
+            edge_targets,
+            pair_mask=edge_pair_mask,
+            pos_weight=pos_weight,
+            loss_coeff=bce_coeff,
         )
         components["bce"] = bce
         total = total + bce
     if edge_targets is not None and coverage_coeff:
         cov = indexer_coverage_hinge_loss(
-            indexer_scores, edge_targets, topk=topk, margin=margin,
+            indexer_scores,
+            edge_targets,
+            pair_mask=edge_pair_mask,
+            topk=topk,
+            margin=margin,
             loss_coeff=coverage_coeff,
         )
         components["coverage"] = cov

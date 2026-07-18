@@ -5,6 +5,14 @@ import json
 import sys
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+)
+
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
 PR_INGEST = MLX_ROOT / "scripts" / "pr_ingest"
@@ -63,6 +71,14 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
 
     assert result["n_shards"] == 1
     assert result["next_offset"] == 1
-    assert (out / "1024" / "pr_discussions_all_00000000.parquet").exists()
+    shard = out / "1024" / "pr_discussions_all_00000000.parquet"
+    assert shard.exists()
+    schema = pq.read_schema(shard)
+    assert schema.metadata is not None
+    assert schema.metadata[
+        SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    ] == str(SYMBOL_IDENTITY_SCHEMA_VERSION).encode("ascii")
+    identities = pq.read_table(shard, columns=[SYMBOL_IDENTITIES_COLUMN]).column(0)
+    assert identities.to_pylist() == [[]]
     blob = json.loads(manifest.read_text(encoding="utf-8"))
     assert "all:0" in blob["done"]

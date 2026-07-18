@@ -15,9 +15,14 @@ from cppmega_mlx.config.model import (
     LOCAL_PROFILE_VOCAB_SIZE,
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
-from cppmega_mlx.data.batch import LMTokenBatch
-from cppmega_mlx.data.graph_packet import EdgeIndex, GraphPacket
+from cppmega_mlx.data.batch import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+    LMTokenBatch,
+)
+from cppmega_mlx.data.domain_schema import DomainEdgeKind
+from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
 from cppmega_mlx.data.token_dataset import BatchCursor, TokenDatasetMetadata
+from cppmega_mlx.data.symbol_identity import SYMBOL_IDENTITY_SCHEMA_VERSION
 
 _INDEX_HEADER = b"MMIDIDX\x00\x00"
 _INDEX_VERSION = 1
@@ -37,6 +42,11 @@ _SEMANTIC_SIDE_CHANNEL_KEYS = (
     "type_refs",
     "def_use",
 )
+_SYMBOL_ID_SIDE_CHANNEL_KEYS = ("symbol_ids", "call_targets", "type_refs")
+_UINT64_ID_SIDE_CHANNEL_KEYS = (
+    *_SYMBOL_ID_SIDE_CHANNEL_KEYS,
+    "source_identity_ids",
+)
 _TEMPORAL_SIDE_CHANNEL_KEYS = (
     "change_mask_pre",
     "change_mask_post",
@@ -49,6 +59,7 @@ _DOMAIN_SIDE_CHANNEL_KEYS = (
     "entity_ids",
     "scope_ids",
     "source_doc_ids",
+    "source_identity_ids",
     "confidence_ids",
 )
 _SIDE_CHANNEL_KEYS = (
@@ -93,6 +104,7 @@ _SIDE_CHANNEL_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "entity_ids": ("token_entity_ids",),
     "scope_ids": ("token_scope_ids",),
     "source_doc_ids": ("token_source_doc_ids",),
+    "source_identity_ids": ("token_source_identity_ids",),
     "confidence_ids": ("token_confidence_ids",),
 }
 _DOCUMENT_ID_KEYS = ("document_ids", "doc_ids", "packing_document_ids")
@@ -141,6 +153,7 @@ _GRAPH_RELATION_BY_KEY = {
     "token_diagnostic_edges": "diagnostic",
     "token_cross_domain_edges": "cross_domain",
 }
+_KNOWN_GRAPH_EDGE_KIND_IDS = frozenset(int(kind) for kind in DomainEdgeKind)
 
 _INDEX_DTYPES: dict[int, np.dtype] = {
     1: np.dtype(np.uint8),
@@ -158,6 +171,7 @@ _NAMED_DTYPES: dict[str, np.dtype] = {
     "uint16": np.dtype(np.uint16),
     "int32": np.dtype(np.int32),
     "uint32": np.dtype(np.uint32),
+    "uint64": np.dtype(np.uint64),
     "int64": np.dtype(np.int64),
 }
 
@@ -331,6 +345,11 @@ class MegatronIndexedDataset:
             prefix=resolved.prefix,
             metadata_path=resolved.metadata_path,
             sequence_count=int(sequence_lengths.shape[0]),
+        )
+        self._graph_sidecar_schema = (
+            str(sidecar["graph_sidecar_schema"])
+            if self._graph_sidecars
+            else None
         )
         self.index_metadata = MegatronIndexedMetadata(
             bin_path=self.bin_path,
@@ -530,7 +549,16 @@ class MegatronIndexedDataset:
         return sequence_index
 
     def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
-        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+        return _lm_batch_from_numpy(
+            self._make_numpy_batch(sample_idx),
+            graph_batch=self._make_graph_batch(sample_idx),
+        )
+
+    def _make_graph_batch(self, sample_idx: np.ndarray) -> GraphBatch | None:
+        if not self._graph_sidecars:
+            return None
+        packets = [self.graph_route_packet_for_sample(int(index)) for index in sample_idx]
+        return _graph_batch_from_route_packets(packets)
 
     def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
         tokens = np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
@@ -543,8 +571,14 @@ class MegatronIndexedDataset:
         }
         if "hunk_ids" in side_channels:
             side_channels["hunk_ids"].fill(-1)
+        derived_attention_mask = np.zeros(
+            (sample_idx.shape[0], self.seq_len), dtype=np.float32
+        )
         document_ids = (
-            np.zeros((sample_idx.shape[0], self.seq_len), dtype=np.int32)
+            np.zeros(
+                (sample_idx.shape[0], self.seq_len),
+                dtype=self._document_ids.dtype,
+            )
             if self._document_ids is not None
             else None
         )
@@ -559,6 +593,7 @@ class MegatronIndexedDataset:
                 offset=byte_offset,
             )
             tokens[row, :window_length] = _to_int32_tokens(token_view)
+            derived_attention_mask[row, :window_length] = 1.0
             for key, storage in self._side_channels.items():
                 side_view = np.frombuffer(
                     storage.mmap,
@@ -577,6 +612,13 @@ class MegatronIndexedDataset:
                     offset=int(self._document_ids.windows[resolved_window]),
                 )
                 document_ids[row, :window_length] = _to_document_id_values(doc_view)
+
+        # Indexed windows know their exact real-token length even when the
+        # producer did not materialize an attention sidecar. Preserve that
+        # fact for graph pair masking; padding document id 0 is not a real
+        # document and must not become a pool of graph negatives.
+        if _ATTENTION_SIDE_CHANNEL_KEY not in side_channels:
+            side_channels[_ATTENTION_SIDE_CHANNEL_KEY] = derived_attention_mask
 
         batch: dict[str, np.ndarray] = {"tokens": tokens}
         for key in _SIDE_CHANNEL_KEYS:
@@ -634,7 +676,16 @@ class MegatronIndexedMultiShardDataset:
             for prefix in prefixes
         )
         schema = _validate_multishard_schema(self._shards)
-        self._side_channel_keys = schema.side_channel_keys
+        # Standalone shards may omit an on-disk attention sidecar; each shard
+        # derives one from its fixed window lengths at read time. Keep the
+        # multi-shard merge schema aware of that runtime-produced key.
+        runtime_side_channel_keys = {
+            *schema.side_channel_keys,
+            _ATTENTION_SIDE_CHANNEL_KEY,
+        }
+        self._side_channel_keys = tuple(
+            key for key in _SIDE_CHANNEL_KEYS if key in runtime_side_channel_keys
+        )
         self._document_ids_present = schema.document_ids_present
         self._batch_keys = (
             "tokens",
@@ -758,7 +809,16 @@ class MegatronIndexedMultiShardDataset:
         return self._shards[shard_index].graph_route_packet_for_sample(local_sample_index)
 
     def _make_batch(self, sample_idx: np.ndarray) -> LMTokenBatch:
-        return _lm_batch_from_numpy(self._make_numpy_batch(sample_idx))
+        return _lm_batch_from_numpy(
+            self._make_numpy_batch(sample_idx),
+            graph_batch=self._make_graph_batch(sample_idx),
+        )
+
+    def _make_graph_batch(self, sample_idx: np.ndarray) -> GraphBatch | None:
+        if not any(shard._graph_sidecars for shard in self._shards):
+            return None
+        packets = [self.graph_route_packet_for_sample(int(index)) for index in sample_idx]
+        return _graph_batch_from_route_packets(packets)
 
     def _make_numpy_batch(self, sample_idx: np.ndarray) -> dict[str, np.ndarray]:
         shard_indices = np.searchsorted(
@@ -806,12 +866,13 @@ def open_megatron_indexed_dataset(
     resume_batch: int = 0,
     metadata: TokenDatasetMetadata | None = None,
 ) -> MegatronIndexedDataset | MegatronIndexedMultiShardDataset:
-    """Open standalone local Megatron-indexed shards for CLI/training code.
+    """Open standalone, explicitly non-production Megatron-indexed shards.
 
-    This is the explicit fail-closed ingress for macOS/MLX paths that already
-    have Megatron .bin/.idx token shards.  It intentionally depends only on
-    the local reader, NumPy, and MLX; it does not import Megatron or Torch
-    runtime modules.
+    This bare-prefix API performs structural reader checks but deliberately has
+    no immutable-bundle or restore-receipt provenance contract. Production
+    Stage-1 callers must use ``open_production_megatron_bundle`` instead. It
+    intentionally depends only on the local reader, NumPy, and MLX; it does not
+    import Megatron or Torch runtime modules.
     """
 
     path = Path(path)
@@ -891,7 +952,32 @@ def megatron_indexed_graph_sidecar_schema() -> dict[str, dict[str, object]]:
     }
 
 
-def _lm_batch_from_numpy(arrays: dict[str, np.ndarray]) -> LMTokenBatch:
+def _graph_batch_from_route_packets(
+    packets: list[MegatronGraphRoutePacket],
+) -> GraphBatch | None:
+    if not packets:
+        return None
+    return GraphBatch(
+        graphs=tuple(packet.graph for packet in packets),
+        chunk_starts=tuple(mx.array(packet.chunk_starts) for packet in packets),
+        chunk_ends=tuple(mx.array(packet.chunk_ends) for packet in packets),
+        chunk_kinds=tuple(mx.array(packet.chunk_kinds) for packet in packets),
+        chunk_dep_levels=tuple(mx.array(packet.chunk_dep_levels) for packet in packets),
+        edge_kinds=tuple(
+            {
+                relation: mx.array(values, dtype=mx.int32)
+                for relation, values in packet.edge_kinds.items()
+            }
+            for packet in packets
+        ),
+    )
+
+
+def _lm_batch_from_numpy(
+    arrays: dict[str, np.ndarray],
+    *,
+    graph_batch: GraphBatch | None = None,
+) -> LMTokenBatch:
     kwargs = {
         key: mx.array(arrays[key])
         for key in _LM_BATCH_DIRECT_SIDE_CHANNEL_KEYS
@@ -914,6 +1000,7 @@ def _lm_batch_from_numpy(arrays: dict[str, np.ndarray]) -> LMTokenBatch:
     return LMTokenBatch(
         tokens=mx.array(arrays["tokens"]),
         document_ids=None if document_ids is None else mx.array(document_ids),
+        graph_batch=graph_batch,
         side_channels=side_channels or None,
         **kwargs,
     )
@@ -962,6 +1049,11 @@ class _MultiShardSchema:
     side_channel_dtypes: tuple[tuple[str, str], ...]
     document_ids_present: bool
     document_ids_dtype: str | None
+    graph_sidecars_present: bool
+    graph_sidecar_schema: str | None
+    graph_sidecar_keys: tuple[str, ...]
+    graph_sidecar_dtypes: tuple[tuple[str, str], ...]
+    graph_sidecar_coordinate_spaces: tuple[tuple[str, str | None], ...]
 
 
 def _find_multishard_prefixes(path: Path) -> tuple[Path, ...]:
@@ -990,7 +1082,9 @@ def _validate_multishard_schema(
         if schema != reference:
             raise ValueError(
                 "Megatron multi-shard schema mismatch: token dtype, side-channel "
-                "keys/dtypes, and document-id sidecars must match across shards"
+                "keys/dtypes, document-id sidecars, and graph sidecar "
+                "presence/schema/keys/dtypes/coordinate spaces must match "
+                "across shards"
             )
     return reference
 
@@ -1002,6 +1096,9 @@ def _single_shard_schema(shard: MegatronIndexedDataset) -> _MultiShardSchema:
     side_channel_dtypes = tuple(
         (key, shard._side_channels[key].dtype.name) for key in side_channel_keys
     )
+    graph_sidecar_keys = tuple(
+        key for key in _GRAPH_SIDECAR_KEYS if key in shard._graph_sidecars
+    )
     return _MultiShardSchema(
         token_dtype=shard.index_metadata.dtype,
         side_channel_keys=side_channel_keys,
@@ -1009,6 +1106,17 @@ def _single_shard_schema(shard: MegatronIndexedDataset) -> _MultiShardSchema:
         document_ids_present=shard._document_ids is not None,
         document_ids_dtype=(
             None if shard._document_ids is None else shard._document_ids.dtype.name
+        ),
+        graph_sidecars_present=bool(graph_sidecar_keys),
+        graph_sidecar_schema=shard._graph_sidecar_schema,
+        graph_sidecar_keys=graph_sidecar_keys,
+        graph_sidecar_dtypes=tuple(
+            (key, shard._graph_sidecars[key].dtype.name)
+            for key in graph_sidecar_keys
+        ),
+        graph_sidecar_coordinate_spaces=tuple(
+            (key, shard._graph_sidecars[key].coordinate_space)
+            for key in graph_sidecar_keys
         ),
     )
 
@@ -1110,6 +1218,21 @@ def _load_side_channels(
 ) -> dict[str, _SideChannelStorage]:
     _reject_ambiguous_side_channel_metadata(sidecar)
     entries = _side_channel_entries(sidecar)
+    if _LOSS_MASK_SIDE_CHANNEL_KEY in entries:
+        alignment = sidecar.get("loss_mask_alignment")
+        if alignment != LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1:
+            raise ValueError(
+                "loss_mask sidecar requires loss_mask_alignment="
+                f"{LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1!r}, "
+                f"got {alignment!r}"
+            )
+    if any(key in entries for key in _SYMBOL_ID_SIDE_CHANNEL_KEYS):
+        version = sidecar.get("symbol_identity_schema_version")
+        if version != SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise ValueError(
+                "semantic symbol sidecars require symbol_identity_schema_version="
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION}, got {version!r}"
+            )
     base_dir = metadata_path.parent if metadata_path is not None else prefix.parent
     storages: dict[str, _SideChannelStorage] = {}
     for key, entry in entries.items():
@@ -1310,6 +1433,16 @@ def _parse_graph_sidecar_entry(
         if expected_values == 0
         else np.memmap(data_path, mode="r", dtype=dtype)
     )
+    if key in _GRAPH_TRIPLE_EDGE_KEYS and expected_values:
+        kinds = np.asarray(data).reshape(-1, 3)[:, 2]
+        unknown = sorted(
+            set(int(value) for value in np.unique(kinds))
+            - _KNOWN_GRAPH_EDGE_KIND_IDS
+        )
+        if unknown:
+            raise ValueError(
+                f"{key} graph sidecar contains unsupported edge kind ids {unknown}"
+            )
     return _GraphSidecarStorage(
         key=key,
         kind=kind,
@@ -1495,6 +1628,12 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
         if dtype != np.dtype(np.float32):
             raise ValueError("attention_mask side-channel dtype must be float32")
         return dtype
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
+        if dtype != np.dtype(np.uint64):
+            raise ValueError(
+                f"{key} identity side-channel dtype must be uint64, got {dtype.name}"
+            )
+        return dtype
     if dtype.kind not in {"i", "u"}:
         raise ValueError(f"{key} side-channel dtype must be an integer dtype")
     if dtype.itemsize > np.dtype(np.int64).itemsize:
@@ -1505,18 +1644,24 @@ def _coerce_side_channel_dtype(key: str, value: Any | None) -> np.dtype:
 def _default_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
 def _target_side_channel_dtype(key: str) -> np.dtype:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return np.dtype(np.float32)
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
+        return np.dtype(np.uint64)
     return np.dtype(np.int32)
 
 
 def _allowed_side_channel_dtype_names(key: str) -> list[str]:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return ["float32"]
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
+        return ["uint64"]
     return [
         name
         for name, dtype in _SIDE_CHANNEL_NAMED_DTYPES.items()
@@ -1543,6 +1688,12 @@ def _side_channel_family(key: str) -> str:
 def _to_side_channel_values(key: str, values: np.ndarray) -> np.ndarray:
     if key == _ATTENTION_SIDE_CHANNEL_KEY:
         return values.astype(np.float32, copy=False)
+    if key in _UINT64_ID_SIDE_CHANNEL_KEYS:
+        if values.dtype.kind not in {"i", "u"}:
+            raise ValueError(f"{key} side-channel IDs must use an integer dtype")
+        if values.dtype.kind == "i" and np.any(values < 0):
+            raise ValueError(f"{key} side-channel IDs must be non-negative")
+        return values.astype(np.uint64, copy=False)
     if key != "hunk_ids" and np.any(values < 0):
         raise ValueError(f"{key} side-channel IDs must be non-negative")
     if key == "hunk_ids" and np.any(values < np.iinfo(np.int32).min):
@@ -1557,9 +1708,7 @@ def _to_document_id_values(values: np.ndarray) -> np.ndarray:
         raise ValueError("document_ids must use an integer dtype")
     if np.any(values < 0):
         raise ValueError("document_ids must be non-negative")
-    if np.any(values > np.iinfo(np.int32).max):
-        raise ValueError("document_ids exceed int32 range")
-    return values.astype(np.int32, copy=False)
+    return values
 
 
 def _declares_side_channel(value: Any) -> bool:
@@ -1730,9 +1879,18 @@ def _is_compact_fixed_row_shard(
 
     sequence_count = int(sequence_lengths.shape[0])
     expected_capacity = sequence_count * seq_len
-    if int(declared_capacity) != expected_capacity:
+    shifted_objective_capacity = sequence_count * (seq_len + 1)
+    capacity_is_valid = int(declared_capacity) == expected_capacity
+    if (
+        not capacity_is_valid
+        and int(declared_capacity) == shifted_objective_capacity
+        and _is_shifted_lm_objective_sidecar(sidecar, seq_len=seq_len)
+    ):
+        capacity_is_valid = True
+    if not capacity_is_valid:
         raise ValueError(
-            "source_capacity_token_count does not match sequence_count * seq_len"
+            "source_capacity_token_count does not match the declared compact-row "
+            "training contract"
         )
     if int(sidecar.get("document_count", -1)) != sequence_count:
         raise ValueError(
@@ -1748,6 +1906,25 @@ def _is_compact_fixed_row_shard(
             "compact fixed-row sequence lengths must satisfy 0 < length <= seq_len"
         )
     return True
+
+
+def _is_shifted_lm_objective_sidecar(
+    sidecar: dict[str, Any], *, seq_len: int
+) -> bool:
+    objective_contract = sidecar.get("objective_contract")
+    if not isinstance(objective_contract, dict):
+        return False
+    payload = objective_contract.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    materialization = payload.get("materialization")
+    source_snapshot = payload.get("source_snapshot")
+    return (
+        isinstance(materialization, dict)
+        and materialization.get("format") == "shifted_lm_document_v1"
+        and isinstance(source_snapshot, dict)
+        and source_snapshot.get("sequence_length") == seq_len
+    )
 
 
 def _build_windows(

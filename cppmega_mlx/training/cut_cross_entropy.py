@@ -39,20 +39,19 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-DEFAULT_CHUNK_ROWS = 128
+DEFAULT_CHUNK_ROWS = 8
 """Default rows-per-chunk.
 
 Chosen so that on the canonical large-V acceptance shape
 (B=4, T=512, V=65536, hidden=256, fp32) the chunked_eager_grad path
 meets the cppmega-mlx-c08.2 contract of >=4x peak-memory reduction
 vs ``mlx.nn.losses.cross_entropy`` for both forward and full
-forward+backward. On a local Apple M-series host
-(MLX 0.31.x, fp32) this measured ~4.45x fwd and ~4.19x fwd+bwd at
-chunk_rows=128, vs ~2.98x / ~2.26x at chunk_rows=256. Smaller
-values squeeze peak further but add launch-loop overhead; 128 is
-the smallest setting that keeps each [chunk_rows, V=65536] fp32
-tile at ~32 MiB while still landing comfortably above the 4x
-reduction floor.
+forward+backward on the pinned MLX 0.32 runtime. The current local
+receipt measures about 7.0x forward and 4.3x forward+backward at
+chunk_rows=32. MLX allocator behavior changed between 0.31 and 0.32:
+the former default of 128 rows fell below the backward 4x floor.
+Smaller values reduce peak further but add launch-loop overhead; callers
+can override ``chunk_rows`` when a larger memory budget is intentional.
 """
 
 _VALID_REDUCTIONS = ("mean", "sum", "none")

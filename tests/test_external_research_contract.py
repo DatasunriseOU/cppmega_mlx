@@ -67,7 +67,17 @@ def _collected_test_files() -> list[str]:
             seen.add(path)
             collected.append(path)
     assert collected, result.stdout
-    return collected
+
+    # A module-level pytest.importorskip (for example the CUDA-only Triton
+    # bridge on macOS) removes the file from --collect-only output even
+    # though it is still part of the repository's test surface. Collection
+    # must succeed; the filesystem is authoritative for the complete file
+    # inventory and keeps the docs check platform-independent.
+    test_files = sorted(
+        path.relative_to(ROOT).as_posix() for path in (ROOT / "tests").glob("test_*.py")
+    )
+    assert set(collected) <= set(test_files)
+    return test_files
 
 
 def test_external_framework_decisions_keep_mlx_native_contract() -> None:
@@ -221,7 +231,10 @@ def test_package_dependency_contract_matches_documented_runtime() -> None:
     assert isinstance(project, dict)
     dependencies = project["dependencies"]
     assert isinstance(dependencies, list)
-    dependency_names = {str(item).split(">=", maxsplit=1)[0] for item in dependencies}
+    dependency_names = {
+        re.split(r"[<>=!~;\s]", str(item), maxsplit=1)[0]
+        for item in dependencies
+    }
 
     assert {"mlx", "mlx-lm", "numpy", "safetensors"} <= dependency_names
 
@@ -304,7 +317,10 @@ def test_no_tracked_parquet_samples_or_runtime_overclaims() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.splitlines()
-    assert all(path.startswith("tests/fixtures/parquet/") for path in tracked_parquet)
+    assert all(
+        path.startswith(("tests/fixtures/parquet/", "tests/fixtures/golden_mini/"))
+        for path in tracked_parquet
+    )
     assert not any(path.startswith("data/parquet_samples/") for path in tracked_parquet)
 
     forbidden_overclaims = (

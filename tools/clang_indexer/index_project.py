@@ -16,10 +16,10 @@ Architecture:
 
 Usage:
   # With compile_commands.json (best quality):
-  python index_project.py --project-dir /path/to/project --output chunks.jsonl
+  python index_project.py --project-dir /path/to/project --project-id owner/repo --output chunks.jsonl
 
   # Without build system (fallback mode):
-  python index_project.py --project-dir /path/to/project --output chunks.jsonl --no-compile-db
+  python index_project.py --project-dir /path/to/project --project-id owner/repo --output chunks.jsonl --no-compile-db
 
   # Process multiple projects in parallel:
   python index_project.py --projects-list projects.txt --output chunks.jsonl --workers 48
@@ -32,7 +32,9 @@ import glob
 import importlib
 import json
 import os
+import posixpath
 import re
+import shutil
 import sqlite3
 import sys
 import hashlib
@@ -44,7 +46,7 @@ sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -56,7 +58,20 @@ from cppmega_mlx.data.nanochat_pipeline.build_context import (
     find_compile_commands_file,
     load_compile_commands_file,
 )
+from cppmega_mlx.data.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SYMBOL_ID_MAX,  # noqa: F401 - re-exported for global index consumers
+    SymbolIdentityError,
+    SymbolIdentityRegistry,
+    compute_symbol_id,
+    is_repo_file_location_identity,
+    parse_repo_file_location_identity,
+    require_project_identity,
+)
+from cppmega_mlx.data.source_identity import source_identity, source_identity_for_path
 from scripts.nanochat_data.memory_guard import check_memory_limit, start_memory_guard
+from scripts.nanochat_data.atomic_publish import atomic_output_file
 
 if TYPE_CHECKING:
     import clang.cindex as clang_cindex  # pyright: ignore[reportMissingImports]
@@ -231,6 +246,8 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
         try:
             clang_config_cls.set_library_file(candidate)
             index_cls.create()
+        except SymbolIdentityError:
+            raise
         except Exception as exc:  # pragma: no cover - runtime-specific
             last_error = exc
             continue
@@ -240,6 +257,8 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 
     try:
         index_cls.create()
+    except SymbolIdentityError:
+        raise
     except Exception as exc:
         last_error = exc
     else:
@@ -259,12 +278,43 @@ def _configure_libclang(libclang_path: str | None = None) -> str | None:
 # marker like 'crosslib:<repo>' (None / absent for normal local parts). Macro
 # chunks may append a 7th element with scanner provenance so domain route edges
 # point to the precise conditional/redefinition/include-order macro nodes rather
-# than being re-derived from assembled text. Builders accept all forms.
+# than being re-derived from assembled text. Symbol-bearing chunks may append an
+# 8th element with canonical identity metadata and a 9th source-path field.
+# Builders accept all historical forms.
 PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str, int, int, str, str | None, str | None
 ] | tuple[
     str, int, int, str, str | None, str | None, dict[str, object] | None
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
+    dict[str, object] | None,
+    str,
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+] | tuple[
+    str,
+    int,
+    int,
+    str,
+    str | None,
+    str | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+    str,
 ]
+SymbolReference: TypeAlias = dict[str, object]
 
 
 def _part_dep_source(part: tuple) -> str | None:
@@ -277,6 +327,283 @@ def _part_macro_provenance(part: tuple) -> dict[str, object] | None:
     """Scanner-derived macro provenance of a doc part, when present."""
     value = part[6] if len(part) >= 7 else None
     return value if isinstance(value, dict) else None
+
+
+def _symbol_part_metadata(
+    symbol_key: str | None,
+    *,
+    qname: str | None = None,
+    symbol_id: int | None = None,
+    canonical_signature: str | None = None,
+    usr: str | None = None,
+    kind: str | None = None,
+    provider: str | None = None,
+    include_provenance: str | None = None,
+) -> dict[str, object] | None:
+    if not symbol_key:
+        return None
+    return {
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+        "symbol_key": symbol_key,
+        "symbol_id": int(symbol_id if symbol_id is not None else _compute_symbol_id(symbol_key)),
+        "qname": qname or "",
+        "canonical_signature": canonical_signature or "",
+        "usr": usr or "",
+        "kind": kind or "",
+        "provider": provider or "",
+        "include_provenance": include_provenance or "",
+    }
+
+
+def _function_part(
+    func: "FunctionDef",
+    *,
+    kind: int = 2,
+    dep_source: str | None = None,
+) -> PartInfo:
+    return (
+        func.text,
+        kind,
+        func.dep_level,
+        func.name,
+        func.qualified_name,
+        dep_source,
+        None,
+        _symbol_part_metadata(
+            func.symbol_key,
+            qname=func.qualified_name,
+            symbol_id=func.symbol_id,
+            canonical_signature=func.canonical_signature,
+            usr=func.usr,
+            kind=func.symbol_kind,
+        ),
+        func.file,
+    )
+
+
+def _typedef_part(td: "TypeDef") -> PartInfo:
+    return (
+        td.text,
+        td.kind,
+        0,
+        td.name,
+        td.qualified_name,
+        None,
+        None,
+        _symbol_part_metadata(
+            td.symbol_key,
+            qname=td.qualified_name,
+            symbol_id=td.symbol_id,
+            canonical_signature=td.canonical_signature,
+            usr=td.usr,
+            kind=td.symbol_kind,
+        ),
+        td.file,
+    )
+
+
+def _macro_part(macro: "MacroDef") -> PartInfo:
+    return (
+        macro.text,
+        MACRO_KIND,
+        0,
+        macro.name,
+        macro.name,
+        None,
+        _macro_part_metadata(macro),
+        _symbol_part_metadata(
+            macro.symbol_key,
+            qname=macro.name,
+            symbol_id=macro.symbol_id,
+            canonical_signature="(" + ",".join(macro.params) + ")",
+            kind="MACRO_DEFINITION",
+        ),
+        macro.file,
+    )
+
+
+def _global_symbol_part(record: dict[str, object], dep_level: int) -> PartInfo:
+    qname = str(record.get("qname") or "")
+    return (
+        str(record.get("text") or ""),
+        2,
+        dep_level,
+        qname.split("::")[-1],
+        qname,
+        f"crosslib:{record.get('base_repo')}",
+        None,
+        _symbol_part_metadata(
+            str(record.get("symbol_key") or ""),
+            qname=qname,
+            canonical_signature=str(record.get("canonical_signature") or ""),
+            usr=str(record.get("usr") or ""),
+            kind=str(record.get("symbol_kind") or ""),
+            provider=str(record.get("provider") or ""),
+            include_provenance=str(record.get("include_provenance") or ""),
+        ),
+        str(
+            record.get("file")
+            or f"crosslib://{record.get('base_repo')}/{qname}"
+        ),
+    )
+
+
+def _part_symbol_metadata(part: tuple) -> dict[str, object] | None:
+    value = part[7] if len(part) >= 8 else None
+    return value if isinstance(value, dict) else None
+
+
+def _part_symbol_key(part: tuple) -> str | None:
+    metadata = _part_symbol_metadata(part)
+    if metadata is None:
+        return None
+    value = metadata.get("symbol_key")
+    return value if isinstance(value, str) and value else None
+
+
+def _document_symbol_identities(
+    parts_info: Sequence[tuple],
+    index: "ProjectIndex",
+    *symbol_id_sequences: Iterable[int],
+    source: str,
+) -> list[dict[str, object]]:
+    """Return complete, collision-checked ID/key claims used by one document."""
+
+    registry = SymbolIdentityRegistry()
+    part_symbol_ids: set[int] = set()
+    for part_index, part in enumerate(parts_info):
+        metadata = _part_symbol_metadata(part)
+        if metadata is None:
+            continue
+        symbol_key = metadata.get("symbol_key")
+        symbol_id = metadata.get("symbol_id")
+        if not isinstance(symbol_key, str) or symbol_id is None:
+            raise SymbolIdentityError(
+                f"{source}: part {part_index} has incomplete canonical symbol metadata"
+            )
+        registry.register(
+            symbol_key,
+            symbol_id=int(symbol_id),
+            source=f"{source}:part[{part_index}]",
+        )
+        part_symbol_ids.add(int(symbol_id))
+
+    used_ids = part_symbol_ids | {
+        int(symbol_id)
+        for sequence in symbol_id_sequences
+        for symbol_id in sequence
+        if int(symbol_id) != 0
+    }
+    for symbol_id in sorted(used_ids):
+        if symbol_id in registry.keys_by_id:
+            continue
+        symbol_key = index.symbol_id_keys.get(symbol_id)
+        if symbol_key is None:
+            raise SymbolIdentityError(
+                f"{source}: semantic symbol ID {symbol_id} has no canonical identity key"
+            )
+        registry.register(
+            symbol_key,
+            symbol_id=symbol_id,
+            source=f"{source}:ProjectIndex",
+        )
+    registry.require_ids(used_ids, source=source)
+    return registry.records(used_ids)
+
+
+def _semantic_identity_records_for_arrays(
+    semantic_metadata: dict[str, object],
+    *semantic_arrays: Iterable[int],
+    source: str,
+) -> list[dict[str, object]]:
+    """Select the canonical claims needed by sliced semantic arrays."""
+
+    registry = SymbolIdentityRegistry()
+    registry.register_records(
+        semantic_metadata.get(SYMBOL_IDENTITIES_COLUMN, []),
+        source=source,
+    )
+    used_ids = {
+        int(symbol_id)
+        for values in semantic_arrays
+        for symbol_id in values
+        if int(symbol_id) != 0
+    }
+    registry.require_ids(used_ids, source=source)
+    return registry.records(used_ids)
+
+
+def _part_source_path(
+    part: tuple,
+    index: "ProjectIndex",
+    fallback: str,
+) -> str:
+    explicit = (
+        part[8]
+        if len(part) >= 9
+        else part[7]
+        if len(part) >= 8 and isinstance(part[7], str)
+        else None
+    )
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    metadata = _part_macro_provenance(part)
+    if metadata is not None and isinstance(metadata.get("file"), str):
+        return cast(str, metadata["file"])
+    symbol_key = _part_symbol_key(part)
+    qname = part[4] if len(part) >= 5 else None
+    if symbol_key or isinstance(qname, str):
+        function_key = index.resolve_function_key(symbol_key or qname)
+        function = index.functions.get(function_key) if function_key else None
+        if function is not None:
+            return function.file
+        type_key = index.resolve_type_key(symbol_key or qname)
+        typedef = index.typedefs.get(type_key) if type_key else None
+        if typedef is not None:
+            return typedef.file
+    return fallback
+
+
+def _stable_repo_id(repo_name: str) -> str:
+    return hashlib.sha1(repo_name.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_filepath_id(repo_name: str, filepath: str) -> str:
+    return hashlib.sha1(f"{repo_name}\0{filepath}".encode("utf-8")).hexdigest()[:16]
+
+
+def _canonical_project_path(filepath: str) -> str:
+    if "://" in filepath:
+        return filepath
+    normalized = os.path.normpath(filepath).replace(os.sep, "/")
+    return normalized.removeprefix("./")
+
+
+def _project_path_provenance(project_id: str, filepath: str) -> dict[str, str]:
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"source provenance for {filepath}",
+    )
+    canonical_filepath = _canonical_project_path(filepath)
+    return {
+        "repo": stable_project_id,
+        "filepath": canonical_filepath,
+        "repo_stable_id": _stable_repo_id(stable_project_id),
+        "filepath_stable_id": _stable_filepath_id(
+            stable_project_id,
+            canonical_filepath,
+        ),
+    }
+
+
+def _source_identity_for_project_path(
+    filepath: str,
+    *,
+    project_id: str | None,
+):
+    if project_id is None:
+        return source_identity_for_path(filepath)
+    return source_identity(_project_path_provenance(project_id, filepath))
 
 
 # C++ source file extensions
@@ -324,11 +651,11 @@ BUILD_NAME_KINDS: dict[str, str] = {
     "GNUmakefile": "make",
     "makefile": "make",
     # Autotools
-    "configure": "autotools",
-    "configure.ac": "autotools",
-    "configure.in": "autotools",
-    "Makefile.am": "autotools",
-    "Makefile.in": "autotools",
+    "configure": "configure",
+    "configure.ac": "autoconf",
+    "configure.in": "autoconf",
+    "Makefile.am": "automake",
+    "Makefile.in": "automake",
     # Bazel
     "BUILD": "bazel",
     "BUILD.bazel": "bazel",
@@ -352,15 +679,23 @@ BUILD_NAME_KINDS: dict[str, str] = {
 BUILD_EXT_KINDS: dict[str, str] = {
     ".cmake": "cmake",
     ".mk": "make",
-    ".m4": "autotools",
+    ".m4": "autoconf",
     ".bzl": "bazel",
     ".ninja": "ninja",
     ".vcxproj": "msvc",
     ".sln": "msvc",
 }
-# Cap the build slice to a sane share of corpus tokens so a giant build tree can
-# never dominate the LM corpus. Applied at discovery (see find_build_files).
-BUILD_FILE_SIZE_CAP = 500_000  # bytes; mirror find_cpp_files' per-file cap
+# Hard cap for each emitted build/domain document. Legitimate larger text files
+# are streamed into chunks at this size instead of aborting repository ingestion.
+BUILD_FILE_SIZE_CAP = 500_000
+SHELL_EXT_KINDS: dict[str, str] = {
+    ".bash": "bash",
+    ".ksh": "ksh",
+    ".sh": "sh",
+    ".zsh": "zsh",
+    ".csh": "tcsh",
+    ".tcsh": "tcsh",
+}
 
 # Source structure ids.  The first 0-8 values are the historical code kinds used
 # by build_enriched_doc; build/domain docs extended that with BUILD_KIND=9.  Header
@@ -407,7 +742,20 @@ SYSTEM_PREFIXES = (
 # include libc-style bare names here (memcpy/strlen/...) because those are not in
 # the A1 selection and would only add noise; only the namespaced base libs.
 CROSSLINKABLE_NS_PREFIXES = ('std::', 'boost::')
-_STD_INLINE_NAMESPACE_SEGMENTS = frozenset({'__1', '__2', '__3', '__cxx11'})
+_STD_INLINE_NAMESPACE_SEGMENTS = ('__1', '__2', '__3', '__cxx11', '__ndk1')
+_STD_INLINE_NAMESPACE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])std::(?:"
+    + "|".join(map(re.escape, _STD_INLINE_NAMESPACE_SEGMENTS))
+    + r")::"
+)
+
+
+def _normalize_inline_namespace_text(value: str) -> str:
+    previous = None
+    while value != previous:
+        previous = value
+        value = _STD_INLINE_NAMESPACE_RE.sub("std::", value)
+    return value
 
 
 def normalize_inline_namespace_qname(qname: str) -> str:
@@ -420,10 +768,619 @@ def normalize_inline_namespace_qname(qname: str) -> str:
     """
     if not qname.startswith('std::'):
         return qname
-    return '::'.join(
-        part for part in qname.split('::')
-        if part not in _STD_INLINE_NAMESPACE_SEGMENTS
+    return _normalize_inline_namespace_text(qname)
+
+
+def _normalize_signature_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return _normalize_inline_namespace_text(
+        re.sub(r"\s+", " ", str(value)).strip()
     )
+
+
+_PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("libc++", ("/libcxx/include/", "/include/c++/v1/")),
+    (
+        "libstdc++",
+        ("/libstdc++-v3/include/", "/libstdc++-v3/libsupc++/", "/include/c++/"),
+    ),
+    ("msvc-stl", ("/stl/inc/", "/microsoft visual studio/")),
+    ("boost", ("/boost/",)),
+)
+_PROVIDER_PROJECT_IDENTITIES = {
+    "libc++": "llvm/llvm-project",
+    "libstdc++": "gcc-mirror/gcc",
+    "msvc-stl": "microsoft/STL",
+    "boost": "boostorg/boost",
+}
+
+
+def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
+    """Return authoritative implementation provider and provider-relative include."""
+
+    if not file_path:
+        return "", ""
+    raw_path = str(file_path).replace("\\", "/").strip("/")
+    if raw_path.startswith("@provider/"):
+        parts = raw_path.split("/", 2)
+        if (
+            len(parts) == 3
+            and parts[1] in _PROVIDER_PROJECT_IDENTITIES
+            and parts[2]
+        ):
+            return parts[1], parts[2]
+        return "", ""
+    normalized = "/" + raw_path
+    lowered = normalized.lower()
+    for provider, markers in _PROVIDER_PATH_MARKERS:
+        for marker in markers:
+            offset = lowered.rfind(marker) if provider == "boost" else lowered.find(marker)
+            if offset < 0:
+                continue
+            include_path = normalized[offset + len(marker) :]
+            if provider == "libstdc++" and marker == "/include/c++/":
+                parts = include_path.split("/", 1)
+                if len(parts) == 2 and re.fullmatch(r"[0-9.]+", parts[0]):
+                    include_path = parts[1]
+            elif provider == "msvc-stl" and marker == "/microsoft visual studio/":
+                include_marker = "/include/"
+                include_offset = include_path.lower().rfind(include_marker)
+                if include_offset < 0:
+                    return provider, ""
+                include_path = include_path[include_offset + len(include_marker) :]
+            elif provider == "boost":
+                include_path = "boost/" + include_path
+            return provider, include_path.strip("/")
+    return "", ""
+
+
+def normalize_qualified_name(qname: str) -> str:
+    """Return the stable qualified-name spelling used by fallback identity."""
+
+    normalized = _normalize_signature_text(qname)
+    normalized = re.sub(r"\s*::\s*", "::", normalized)
+    return normalize_inline_namespace_qname(normalized)
+
+
+def _cursor_kind(cursor: Cursor):
+    """Return a binding-known CursorKind, or None for newer opaque kinds.
+
+    Some libclang releases emit cursor IDs that their bundled Python cindex
+    table does not register.  Accessing ``cursor.kind`` then raises ValueError;
+    those cursors are non-semantic attributes for our purposes and must not
+    abort the translation unit.
+    """
+    try:
+        return cursor.kind
+    except ValueError:
+        return None
+
+
+def _cursor_kind_name(cursor: Cursor) -> str:
+    kind = _cursor_kind(cursor)
+    if kind is None:
+        raw_kind = getattr(cursor, "_kind_id", None)
+        return f"UNKNOWN_CURSOR_{raw_kind}" if raw_kind is not None else "UNKNOWN_CURSOR"
+    name = getattr(kind, "name", None)
+    if isinstance(name, str):
+        return name
+    text = str(kind or "")
+    return text.rsplit(".", 1)[-1]
+
+
+def _cursor_usr(cursor: Cursor) -> str:
+    get_usr = getattr(cursor, "get_usr", None)
+    if not callable(get_usr):
+        return ""
+    try:
+        usr = str(get_usr() or "")
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        raise SymbolIdentityError("clang USR extraction failed") from exc
+    # Clang can surface empty/placeholder USRs for unexposed/local constructs.
+    if not usr or usr.startswith("<") or "invalid" in usr.lower():
+        return ""
+    return usr
+
+
+def _cursor_canonical_signature(cursor: Cursor) -> str:
+    """Return a stable, clang-derived signature string for identity fallback."""
+    try:
+        return _cursor_canonical_signature_unchecked(cursor)
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        raise SymbolIdentityError(
+            "clang canonical signature extraction failed"
+        ) from exc
+
+
+def _cursor_exception_specification_name(cursor: Cursor) -> str:
+    """Return a stable exception-spec name across libclang/binding skew."""
+    try:
+        exception_kind = getattr(cursor, "exception_specification_kind", None)
+    except ValueError as exc:
+        raw_id: int | None = None
+        if clang_cindex_module is not None and isinstance(cursor, Cursor):
+            conf = getattr(clang_cindex_module, "conf", None)
+            lib = getattr(conf, "lib", None)
+            getter = getattr(lib, "clang_getCursorExceptionSpecificationType", None)
+            if callable(getter):
+                raw_id = int(getter(cursor))
+        if raw_id is None:
+            match = re.search(r"(-?\d+)\D*$", str(exc))
+            if match is not None:
+                raw_id = int(match.group(1))
+        return f"UNKNOWN_{raw_id}" if raw_id is not None else "UNKNOWN"
+
+    name = getattr(exception_kind, "name", "") or str(exception_kind or "")
+    return name.rsplit(".", 1)[-1]
+
+
+def _cursor_canonical_signature_unchecked(cursor: Cursor) -> str:
+    pieces: list[str] = []
+    display = _normalize_signature_text(getattr(cursor, "displayname", "") or "")
+    if display:
+        pieces.append(f"display={display}")
+    cursor_type = getattr(cursor, "type", None)
+    canonical_type = cursor_type
+    get_canonical = getattr(cursor_type, "get_canonical", None)
+    if callable(get_canonical):
+        canonical_type = get_canonical()
+    type_spelling = _normalize_signature_text(
+        getattr(canonical_type, "spelling", "")
+        or getattr(cursor_type, "spelling", "")
+        or ""
+    )
+    if type_spelling:
+        pieces.append(f"type={type_spelling}")
+    result_type = getattr(cursor, "result_type", None)
+    canonical_result = result_type
+    get_canonical_result = getattr(result_type, "get_canonical", None)
+    if callable(get_canonical_result):
+        canonical_result = get_canonical_result()
+    result_spelling = _normalize_signature_text(
+        getattr(canonical_result, "spelling", "")
+        or getattr(result_type, "spelling", "")
+        or ""
+    )
+    if result_spelling:
+        pieces.append(f"result={result_spelling}")
+    arg_types: list[str] = []
+    get_arguments = getattr(cursor, "get_arguments", None)
+    if callable(get_arguments):
+        for arg in get_arguments():
+            arg_type = getattr(arg, "type", None)
+            canonical_arg = arg_type
+            get_canonical_arg = getattr(arg_type, "get_canonical", None)
+            if callable(get_canonical_arg):
+                canonical_arg = get_canonical_arg()
+            arg_types.append(
+                _normalize_signature_text(
+                    getattr(canonical_arg, "spelling", "")
+                    or getattr(arg_type, "spelling", "")
+                    or ""
+                )
+            )
+    if arg_types:
+        pieces.append("args=(" + ",".join(arg_types) + ")")
+    exception_name = _cursor_exception_specification_name(cursor)
+    if pieces and exception_name:
+        pieces.append(f"exception={exception_name.rsplit('.', 1)[-1]}")
+    return "|".join(pieces)
+
+
+def _identity_scope_key(
+    *,
+    project: str | None = None,
+    file: str | None = None,
+    line: int | None = None,
+    force_file_scope: bool = False,
+) -> str:
+    parts: list[str] = []
+    if project:
+        parts.append(f"project={project}")
+    if file and force_file_scope:
+        parts.append(f"file={file}")
+    if line is not None and line > 0 and force_file_scope:
+        parts.append(f"line={int(line)}")
+    return "|".join(parts)
+
+
+def canonical_symbol_identity(
+    *,
+    qname: str,
+    kind: str,
+    usr: str | None = None,
+    canonical_signature: str | None = None,
+    project: str | None = None,
+    repo: str | None = None,
+    file: str | None = None,
+    line: int | None = None,
+    column: int | None = None,
+    force_file_scope: bool = False,
+    repo_file_location_fallback: bool = False,
+) -> str:
+    """Canonical symbol identity.
+
+    Stable clang USR wins when present and is namespaced by the owning project so
+    independent repositories cannot alias. A canonical signature keeps the
+    existing fallback contract. Clang cursor callers can require a typed
+    repo/file/location fallback when neither is usable, preventing qname-only
+    collisions without claiming cross-repo or cross-revision authority.
+    """
+    normalized_kind = _normalize_signature_text(kind or "symbol")
+    normalized_signature = _normalize_signature_text(canonical_signature)
+    normalized_usr = _normalize_signature_text(usr)
+    normalized_qname = normalize_qualified_name(qname)
+    raw_project = project or repo
+    owning_project = (
+        require_project_identity(raw_project, source="canonical_symbol_identity")
+        if raw_project
+        else ""
+    )
+    if normalized_usr:
+        project_scope = f"project={owning_project}\x1f" if owning_project else ""
+        return (
+            f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+            f"{project_scope}usr={normalized_usr}"
+        )
+    if repo_file_location_fallback and not normalized_signature:
+        normalized_file = _normalize_repo_relative_identity_file(file)
+        try:
+            normalized_line = int(line or 0)
+            normalized_column = int(column or 0)
+        except (TypeError, ValueError) as exc:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires an integer declaration location"
+            ) from exc
+        if not owning_project:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires a canonical project"
+            )
+        if not normalized_file or normalized_line <= 0:
+            raise SymbolIdentityError(
+                "repo_file_location identity requires a repo-relative file and line"
+            )
+        payload = [f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}"]
+        if owning_project:
+            payload.append(f"project={owning_project}")
+        payload.extend(
+            [
+                f"file={normalized_file}",
+                f"line={normalized_line}",
+            ]
+        )
+        if normalized_column > 0:
+            payload.append(f"column={normalized_column}")
+        payload.extend(
+            [
+                f"kind={normalized_kind}",
+                f"qname={normalized_qname}",
+            ]
+        )
+        identity_key = "repo_file_location:" + "\x1f".join(payload)
+        parse_repo_file_location_identity(
+            identity_key, source="canonical_symbol_identity"
+        )
+        return identity_key
+    scope = _identity_scope_key(
+        project=owning_project,
+        file=file,
+        line=line,
+        force_file_scope=force_file_scope,
+    )
+    payload = [
+        f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}",
+        f"qname={normalized_qname}",
+        f"kind={normalized_kind}",
+        f"sig={normalized_signature}",
+    ]
+    if scope:
+        payload.append(f"scope={scope}")
+    return "fallback:" + "\x1f".join(payload)
+
+
+_WINDOWS_ABSOLUTE_IDENTITY_PATH_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def _normalize_identity_path(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = posixpath.normpath(str(value).replace("\\", "/"))
+    if normalized == ".":
+        return ""
+    if _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(normalized):
+        normalized = normalized.casefold()
+    return normalized.removeprefix("./")
+
+
+def _is_absolute_identity_path(value: str) -> bool:
+    return posixpath.isabs(value) or bool(
+        _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(value)
+    )
+
+
+def _normalize_repo_relative_identity_file(file: str | None) -> str:
+    normalized = _normalize_identity_path(file)
+    if normalized and _is_absolute_identity_path(normalized):
+        raise SymbolIdentityError(
+            "repo_file_location identity cannot contain an absolute path"
+        )
+    if any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise SymbolIdentityError(
+            "repo_file_location identity requires a canonical repo-relative file"
+        )
+    return normalized
+
+
+def validate_repo_file_location_identity_claim(
+    symbol_key: str,
+    *,
+    project: str,
+    file: str,
+    line: int,
+    kind: str,
+    qname: str,
+    source: str,
+) -> None:
+    """Require an explicit location key to agree with its serialized record."""
+
+    identity = parse_repo_file_location_identity(symbol_key, source=source)
+    expected = {
+        "project": require_project_identity(project, source=f"{source}:project"),
+        "file": _normalize_repo_relative_identity_file(file),
+        "line": int(line),
+        "kind": _normalize_signature_text(kind),
+        "qname": normalize_qualified_name(qname),
+    }
+    actual = {
+        "project": identity.project,
+        "file": identity.file,
+        "line": identity.line,
+        "kind": identity.kind,
+        "qname": identity.qname,
+    }
+    if actual != expected:
+        raise SymbolIdentityError(
+            f"{source}: repo_file_location key does not match serialized fields: "
+            f"expected={expected!r} actual={actual!r}"
+        )
+
+
+def _cursor_repo_file_location_identity(
+    cursor: Cursor,
+    *,
+    project_dir: str | None,
+    project: str | None,
+    fallback_file: str | None,
+) -> tuple[str, str]:
+    """Return a stable file/project pair for explicit location identity."""
+
+    location = getattr(cursor, "location", None)
+    location_file = getattr(location, "file", None)
+    location_name = getattr(location_file, "name", None)
+    candidate = _normalize_identity_path(
+        str(location_name) if location_name else fallback_file
+    )
+    project_path = _normalize_identity_path(project_dir)
+    if not _is_absolute_identity_path(candidate):
+        return _normalize_repo_relative_identity_file(candidate), str(project or "")
+
+    relative_file = ""
+    if project_path and _is_absolute_identity_path(project_path):
+        candidate_is_windows = bool(
+            _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(candidate)
+        )
+        project_is_windows = bool(
+            _WINDOWS_ABSOLUTE_IDENTITY_PATH_RE.match(project_path)
+        )
+        same_root_kind = candidate_is_windows == project_is_windows
+        same_drive = (
+            not candidate_is_windows or candidate[:2] == project_path[:2]
+        )
+        if same_root_kind and same_drive:
+            relative_file = posixpath.relpath(candidate, project_path)
+            if relative_file == ".." or relative_file.startswith("../"):
+                relative_file = ""
+    if relative_file:
+        return _normalize_repo_relative_identity_file(relative_file), str(project or "")
+
+    provider, include_provenance = symbol_provider_provenance(candidate)
+    provider_project = _PROVIDER_PROJECT_IDENTITIES.get(provider, "")
+    if provider_project and include_provenance:
+        return f"@provider/{provider}/{include_provenance}", provider_project
+    raise SymbolIdentityError(
+        "external declaration without USR or canonical signature requires a "
+        f"stable provider identity, got path={candidate!r}"
+    )
+
+
+def _cursor_identity_location(
+    cursor: Cursor,
+    *,
+    project_dir: str | None,
+    fallback_file: str | None,
+) -> tuple[str, bool]:
+    """Return identity file plus whether clang locates it inside project_dir."""
+    rel_file = fallback_file or ""
+    location = getattr(cursor, "location", None)
+    location_file = getattr(location, "file", None)
+    location_name = getattr(location_file, "name", None)
+    if not location_name:
+        return rel_file, True
+    if not project_dir:
+        return str(location_name), True
+    try:
+        absolute_file = os.path.abspath(str(location_name))
+        absolute_project = os.path.abspath(project_dir)
+        is_project_local = os.path.commonpath(
+            (absolute_file, absolute_project)
+        ) == absolute_project
+        rel_file = os.path.relpath(absolute_file, absolute_project)
+    except (OSError, ValueError):
+        return fallback_file or str(location_name), False
+    return rel_file, is_project_local
+
+
+def symbol_identity_for_cursor(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+    force_file_scope: bool = False,
+) -> tuple[str, str, str]:
+    """Return ``(identity_key, usr, canonical_signature)`` for a clang cursor."""
+    qname = get_qualified_name(cursor)
+    usr = _cursor_usr(cursor)
+    signature = _cursor_canonical_signature(cursor)
+    file_scope = force_file_scope
+    uses_repo_file_location = not usr and not signature
+    if uses_repo_file_location:
+        rel_file, identity_project = _cursor_repo_file_location_identity(
+            cursor,
+            project_dir=project_dir,
+            project=project or repo,
+            fallback_file=fallback_file,
+        )
+    else:
+        rel_file, is_project_local = _cursor_identity_location(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        identity_project = (project or repo) if is_project_local else None
+    loc = getattr(cursor, "location", None)
+    linkage = getattr(cursor, "linkage", None)
+    linkage_name = getattr(linkage, "name", "") or str(linkage or "")
+    storage = getattr(cursor, "storage_class", None)
+    storage_name = getattr(storage, "name", "") or str(storage or "")
+    semantic_parent = getattr(cursor, "semantic_parent", None)
+    parent_kind = _cursor_kind_name(semantic_parent) if semantic_parent is not None else ""
+    is_local = parent_kind in {
+        "FUNCTION_DECL",
+        "FUNCTION_TEMPLATE",
+        "CXX_METHOD",
+        "CONSTRUCTOR",
+        "DESTRUCTOR",
+        "CONVERSION_FUNCTION",
+        "LAMBDA_EXPR",
+    }
+    if "INTERNAL" in linkage_name or storage_name == "STATIC" or is_local:
+        file_scope = True
+    identity_key = canonical_symbol_identity(
+        qname=qname,
+        kind=_cursor_kind_name(cursor),
+        usr=usr,
+        canonical_signature=signature,
+        project=identity_project,
+        file=rel_file,
+        line=getattr(loc, "line", None),
+        column=getattr(loc, "column", None),
+        force_file_scope=file_scope,
+        repo_file_location_fallback=uses_repo_file_location,
+    )
+    return identity_key, usr, signature
+
+
+def symbol_reference_for_cursor(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+    force_file_scope: bool = False,
+) -> SymbolReference:
+    key, usr, signature = symbol_identity_for_cursor(
+        cursor,
+        project_dir=project_dir,
+        project=project_id,
+        fallback_file=fallback_file,
+        force_file_scope=force_file_scope,
+    )
+    location = getattr(cursor, "location", None)
+    if is_repo_file_location_identity(key):
+        location_identity = parse_repo_file_location_identity(
+            key, source="symbol_reference_for_cursor"
+        )
+        relative_file = location_identity.file
+        reference_project = location_identity.project
+        reference_line = location_identity.line
+    else:
+        relative_file, is_project_local = _cursor_identity_location(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        reference_project = project_id if is_project_local else ""
+        reference_line = int(getattr(location, "line", 0) or 0)
+    provider, include_provenance = symbol_provider_provenance(relative_file)
+    return {
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+        "symbol_key": key,
+        "symbol_id": _compute_symbol_id(key),
+        "qname": get_qualified_name(cursor),
+        "usr": usr,
+        "canonical_signature": signature,
+        "symbol_kind": _cursor_kind_name(cursor),
+        "project": reference_project,
+        "file": relative_file,
+        "line": reference_line,
+        "provider": provider,
+        "include_provenance": include_provenance,
+    }
+
+
+def _normalize_symbol_reference(value: object) -> SymbolReference | None:
+    if not isinstance(value, dict):
+        return None
+    key = value.get("symbol_key")
+    qname = value.get("qname")
+    if not isinstance(key, str) or not key:
+        return None
+    if not isinstance(qname, str):
+        qname = ""
+    identity_version = int(
+        value.get("symbol_identity_schema_version") or SYMBOL_IDENTITY_SCHEMA_VERSION
+    )
+    if identity_version != SYMBOL_IDENTITY_SCHEMA_VERSION:
+        raise SymbolIdentityError(
+            "symbol reference uses incompatible identity schema: "
+            f"got v{identity_version}, expected v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+        )
+    expected_symbol_id = _compute_symbol_id(key)
+    claimed_symbol_id = value.get("symbol_id")
+    if claimed_symbol_id is not None and int(claimed_symbol_id) != expected_symbol_id:
+        raise SymbolIdentityError(
+            "symbol reference ID does not match canonical key: "
+            f"claimed={claimed_symbol_id} expected={expected_symbol_id} key={key!r}"
+        )
+    return {
+        "symbol_identity_schema_version": identity_version,
+        "symbol_key": key,
+        "symbol_id": expected_symbol_id,
+        "qname": normalize_qualified_name(qname),
+        "usr": str(value.get("usr") or ""),
+        "canonical_signature": _normalize_signature_text(
+            str(value.get("canonical_signature") or "")
+        ),
+        "symbol_kind": str(value.get("symbol_kind") or value.get("kind") or ""),
+        "project": str(value.get("project") or ""),
+        "file": str(value.get("file") or ""),
+        "line": int(value.get("line") or 0),
+        "provider": str(value.get("provider") or ""),
+        "include_provenance": str(value.get("include_provenance") or ""),
+    }
+
+
+def _compute_symbol_id(symbol_key: str) -> int:
+    """Deterministic unsigned 64-bit ID from a canonical symbol identity."""
+
+    return compute_symbol_id(symbol_key)
 
 
 class FunctionDef:
@@ -431,7 +1388,12 @@ class FunctionDef:
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
                  'callees', 'referenced_types', 'dep_level', 'is_definition',
                  'ast_depth', 'sibling_index', 'ast_node_type',
-                 'baselib_callees']
+                 'baselib_callees', 'symbol_key', 'symbol_id', 'usr',
+                 'canonical_signature', 'symbol_kind', 'callee_keys',
+                 'referenced_type_keys', 'callee_refs', 'baselib_callee_refs',
+                 'referenced_type_refs', 'semantic_symbol_ids',
+                 'semantic_call_targets', 'semantic_type_refs',
+                 'semantic_def_use', 'semantic_symbol_identities']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
                  text: str, callees: list, is_definition: bool = True,
@@ -439,23 +1401,74 @@ class FunctionDef:
                  sibling_index: list[int] | None = None,
                  ast_node_type: list[int] | None = None,
                  referenced_types: list | None = None,
-                 baselib_callees: list | None = None):
+                 baselib_callees: list | None = None,
+                 symbol_key: str | None = None,
+                 usr: str | None = None,
+                 canonical_signature: str | None = None,
+                 symbol_kind: str = "function",
+                 callee_keys: list | None = None,
+                 referenced_type_keys: list | None = None,
+                 callee_refs: list[SymbolReference] | None = None,
+                 baselib_callee_refs: list[SymbolReference] | None = None,
+                 referenced_type_refs: list[SymbolReference] | None = None,
+                 semantic_symbol_ids: list[int] | None = None,
+                 semantic_call_targets: list[int] | None = None,
+                 semantic_type_refs: list[int] | None = None,
+                 semantic_def_use: list[int] | None = None,
+                 semantic_symbol_identities: list[dict[str, object]] | None = None):
         self.name = name
-        self.qualified_name = qualified_name
+        self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
-        self.callees = callees  # list of qualified names called
+        self.callees = [normalize_qualified_name(value) for value in callees]
         # qualified names of record/enum/typedef types referenced by this
         # function (params, return, locals, member access) -- captured during the
         # SAME libclang parse as callees so it round-trips IPC and feeds the
         # offline type_refs/type_edges builders. Mirrors `callees`.
-        self.referenced_types = list(referenced_types or [])
+        self.referenced_types = [
+            normalize_qualified_name(value) for value in (referenced_types or [])
+        ]
         # Cross-linkable base-lib callees (std::/boost::) dropped from `callees`
         # by the normal system-prefix filter, kept SEPARATELY for the optional
         # cross-repo linker. Empty/ignored unless --global-symbol-index is given.
-        self.baselib_callees = list(baselib_callees or [])
+        self.baselib_callees = [
+            normalize_qualified_name(value) for value in (baselib_callees or [])
+        ]
+        self.usr = str(usr or "")
+        self.canonical_signature = _normalize_signature_text(canonical_signature)
+        self.symbol_kind = str(symbol_kind or "function")
+        self.symbol_key = symbol_key or canonical_symbol_identity(
+            qname=qualified_name,
+            kind=self.symbol_kind,
+            canonical_signature=self.canonical_signature,
+            file=file,
+            line=line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
+        # Identity-key mirrors of display qnames. Parsed clang paths populate
+        # these with canonical identities; legacy/manual tests may leave them
+        # empty and ProjectIndex will resolve unique qnames as a compatibility
+        # fallback.
+        self.callee_keys = list(callee_keys or [])
+        self.referenced_type_keys = list(referenced_type_keys or [])
+        self.callee_refs = [
+            normalized
+            for value in (callee_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
+        self.baselib_callee_refs = [
+            normalized
+            for value in (baselib_callee_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
+        self.referenced_type_refs = [
+            normalized
+            for value in (referenced_type_refs or [])
+            if (normalized := _normalize_symbol_reference(value)) is not None
+        ]
         self.dep_level = 0
         self.is_definition = is_definition
         # Store per-character AST sidecars compactly in the repo-wide index.
@@ -465,6 +1478,15 @@ class FunctionDef:
         self.ast_depth = array('H', ast_depth or [])
         self.sibling_index = array('H', sibling_index or [])
         self.ast_node_type = array('H', ast_node_type or [])
+        self.semantic_symbol_ids = array('Q', semantic_symbol_ids or [])
+        self.semantic_call_targets = array('Q', semantic_call_targets or [])
+        self.semantic_type_refs = array('Q', semantic_type_refs or [])
+        self.semantic_def_use = array('B', semantic_def_use or [])
+        identity_registry = SymbolIdentityRegistry()
+        self.semantic_symbol_identities = identity_registry.register_records(
+            semantic_symbol_identities or [],
+            source=f"FunctionDef({self.qualified_name})",
+        )
 
     def to_dict(self) -> dict:
         """Serialize for multiprocessing IPC."""
@@ -478,6 +1500,20 @@ class FunctionDef:
             'ast_node_type': self.ast_node_type,
             'referenced_types': self.referenced_types,
             'baselib_callees': self.baselib_callees,
+            'symbol_key': self.symbol_key,
+            'usr': self.usr,
+            'canonical_signature': self.canonical_signature,
+            'symbol_kind': self.symbol_kind,
+            'callee_keys': self.callee_keys,
+            'referenced_type_keys': self.referenced_type_keys,
+            'callee_refs': self.callee_refs,
+            'baselib_callee_refs': self.baselib_callee_refs,
+            'referenced_type_refs': self.referenced_type_refs,
+            'semantic_symbol_ids': self.semantic_symbol_ids,
+            'semantic_call_targets': self.semantic_call_targets,
+            'semantic_type_refs': self.semantic_type_refs,
+            'semantic_def_use': self.semantic_def_use,
+            'semantic_symbol_identities': self.semantic_symbol_identities,
         }
 
     @classmethod
@@ -495,24 +1531,44 @@ class TypeDef:
     headers, which is why headers are now part of the index file set.
     """
     __slots__ = ['name', 'qualified_name', 'file', 'line', 'end_line', 'text',
-                 'kind']
+                 'kind', 'symbol_key', 'symbol_id', 'usr',
+                 'canonical_signature', 'symbol_kind']
 
     def __init__(self, name: str, qualified_name: str, file: str, line: int,
-                 text: str, kind: int, end_line: int = 0):
+                 text: str, kind: int, end_line: int = 0,
+                 symbol_key: str | None = None, usr: str | None = None,
+                 canonical_signature: str | None = None,
+                 symbol_kind: str = "type"):
         self.name = name
-        self.qualified_name = qualified_name
+        self.qualified_name = normalize_qualified_name(qualified_name)
         self.file = file
         self.line = line
         self.end_line = end_line or (line + text.count('\n'))
         self.text = text
         # node-bucket kind for parts_info (4=class/struct, 7=typedef/using)
         self.kind = kind
+        self.usr = str(usr or "")
+        self.canonical_signature = _normalize_signature_text(canonical_signature)
+        self.symbol_kind = str(symbol_kind or "type")
+        self.symbol_key = symbol_key or canonical_symbol_identity(
+            qname=qualified_name,
+            kind=self.symbol_kind,
+            canonical_signature=self.canonical_signature,
+            file=file,
+            line=line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
 
     def to_dict(self) -> dict:
         return {
             'name': self.name, 'qualified_name': self.qualified_name,
             'file': self.file, 'line': self.line, 'text': self.text,
             'kind': self.kind, 'end_line': self.end_line,
+            'symbol_key': self.symbol_key,
+            'usr': self.usr,
+            'canonical_signature': self.canonical_signature,
+            'symbol_kind': self.symbol_kind,
         }
 
     @classmethod
@@ -536,6 +1592,9 @@ class MacroDef:
         'condition_lines',
         'undef_text',
         'previous',
+        'project_id',
+        'symbol_key',
+        'symbol_id',
     ]
 
     def __init__(
@@ -546,6 +1605,7 @@ class MacroDef:
         text: str,
         params: list[str] | None = None,
         *,
+        project_id: str,
         visible_in_file: str | None = None,
         visible_line: int | None = None,
         sequence: int = 0,
@@ -559,6 +1619,10 @@ class MacroDef:
         self.line = line
         self.text = text
         self.params = list(params or [])
+        self.project_id = require_project_identity(
+            project_id,
+            source=f"MacroDef({name})",
+        )
         self.visible_in_file = visible_in_file or file
         self.visible_line = visible_line if visible_line is not None else line
         self.sequence = int(sequence)
@@ -566,54 +1630,83 @@ class MacroDef:
         self.condition_lines = list(condition_lines or [])
         self.undef_text = undef_text
         self.previous = previous
+        self.symbol_key = canonical_symbol_identity(
+            qname=name,
+            kind="macro",
+            canonical_signature="(" + ",".join(self.params) + ")",
+            project=self.project_id,
+            file=self.file,
+            line=self.line,
+            force_file_scope=True,
+        )
+        self.symbol_id = _compute_symbol_id(self.symbol_key)
 
 
 class ProjectIndex:
     """Cross-file function index for a single project."""
 
     def __init__(self):
-        # qualified_name -> FunctionDef (definitions only)
+        # canonical symbol identity -> FunctionDef (definitions only).
+        # qname remains display/search metadata; qname indexes below are only
+        # compatibility/lookup aids and can be ambiguous.
         self.functions: dict[str, FunctionDef] = {}
-        # file -> list of function qualified_names defined there
+        self.function_qnames: dict[str, list[str]] = defaultdict(list)
+        # file -> list of function symbol identities defined there
         self.file_functions: dict[str, list[str]] = defaultdict(list)
         # file -> preamble text (includes, typedefs, forward decls)
         self.file_preambles: dict[str, str] = {}
-        # qualified_name -> list of qualified_names that call it
+        # callee symbol identity -> list of caller symbol identities
         self.callers: dict[str, list[str]] = defaultdict(list)
-        # qualified_name -> TypeDef (struct/class/enum/union/typedef/using).
+        # symbol identity -> TypeDef (struct/class/enum/union/typedef/using).
         # Separate from `functions` so the call graph is untouched; consulted
         # when building docs to pull a referenced type's DEFINITION in as a
         # type-edge target chunk.
         self.typedefs: dict[str, TypeDef] = {}
+        self.typedef_qnames: dict[str, list[str]] = defaultdict(list)
         # macro name -> latest MacroDef plus full definition history. Header macro
         # definitions are not clang AST nodes, so they live in a small side registry
         # used for standalone macro docs and same-document invocation routes.
         self.macros: dict[str, MacroDef] = {}
         self.macros_by_name: dict[str, list[MacroDef]] = defaultdict(list)
         self.macro_definitions: list[MacroDef] = []
+        self._macro_occurrence_keys: set[tuple[str, str, str, int, int]] = set()
+        self.symbol_id_registry = SymbolIdentityRegistry()
+        self.symbol_id_keys = self.symbol_id_registry.keys_by_id
+
+    def _register_symbol_key(self, symbol_key: str) -> None:
+        if not symbol_key:
+            return
+        self.symbol_id_registry.register(symbol_key, source="ProjectIndex")
 
     def add_typedef(self, td: TypeDef):
         """Register a type definition. First definition with text wins; never
         overwrite a real definition with a shorter/forward one."""
-        key = td.qualified_name
+        key = td.symbol_key
         if not key:
             return
+        self._register_symbol_key(key)
         existing = self.typedefs.get(key)
         if existing is not None and len(existing.text) >= len(td.text):
             return
         self.typedefs[key] = td
+        qname = normalize_inline_namespace_qname(td.qualified_name)
+        if qname and key not in self.typedef_qnames[qname]:
+            self.typedef_qnames[qname].append(key)
 
     def add_macro(self, macro: MacroDef):
         if not macro.name:
             return
-        for existing in self.macros_by_name.get(macro.name, []):
-            if (
-                existing.file == macro.file
-                and existing.line == macro.line
-                and existing.visible_in_file == macro.visible_in_file
-                and existing.sequence == macro.sequence
-            ):
-                return
+        self._register_symbol_key(macro.symbol_key)
+        occurrence_key = (
+            macro.name,
+            macro.visible_in_file,
+            macro.file,
+            macro.line,
+            macro.sequence,
+        )
+        if occurrence_key in self._macro_occurrence_keys:
+            return
+        self._macro_occurrence_keys.add(occurrence_key)
         existing = self.macros.get(macro.name)
         if (
             existing is not None
@@ -629,41 +1722,169 @@ class ProjectIndex:
 
     def add_function(self, func: FunctionDef):
         """Add a function definition to the index."""
-        key = func.qualified_name
+        key = func.symbol_key
+        self._register_symbol_key(key)
+        self.symbol_id_registry.register_records(
+            func.semantic_symbol_identities,
+            source=f"ProjectIndex:{func.file}:{func.line}:{func.qualified_name}",
+        )
+        for ref in (
+            list(getattr(func, "callee_refs", []))
+            + list(getattr(func, "baselib_callee_refs", []))
+            + list(getattr(func, "referenced_type_refs", []))
+        ):
+            ref_key = ref.get("symbol_key")
+            if isinstance(ref_key, str):
+                self._register_symbol_key(ref_key)
         if key in self.functions and self.functions[key].is_definition:
             return  # don't overwrite definitions with declarations
         self.functions[key] = func
+        qname = normalize_inline_namespace_qname(func.qualified_name)
+        if qname and key not in self.function_qnames[qname]:
+            self.function_qnames[qname].append(key)
         if func.is_definition:
             self.file_functions[func.file].append(key)
+
+    def resolve_function_key(
+        self, ref: str | SymbolReference | None
+    ) -> str | None:
+        """Resolve an identity/reference or an unambiguous display qname."""
+        if not ref:
+            return None
+        if isinstance(ref, dict):
+            normalized = _normalize_symbol_reference(ref)
+            if normalized is None:
+                return None
+            symbol_key = str(normalized["symbol_key"])
+            if symbol_key in self.functions:
+                return symbol_key
+            candidates = list(
+                self.function_qnames.get(
+                    normalize_inline_namespace_qname(str(normalized["qname"])), []
+                )
+            )
+            usr = str(normalized.get("usr") or "")
+            if usr:
+                candidates = [key for key in candidates if self.functions[key].usr == usr]
+            signature = str(normalized.get("canonical_signature") or "")
+            if signature:
+                candidates = [
+                    key
+                    for key in candidates
+                    if self.functions[key].canonical_signature == signature
+                ]
+            symbol_kind = str(normalized.get("symbol_kind") or "")
+            if symbol_kind:
+                candidates = [
+                    key for key in candidates if self.functions[key].symbol_kind == symbol_kind
+                ]
+            return candidates[0] if len(candidates) == 1 else None
+        if ref in self.functions:
+            return ref
+        keys = self.function_qnames.get(normalize_inline_namespace_qname(ref), [])
+        if len(keys) == 1:
+            return keys[0]
+        return None
+
+    def resolve_type_key(self, ref: str | SymbolReference | None) -> str | None:
+        if not ref:
+            return None
+        if isinstance(ref, dict):
+            normalized = _normalize_symbol_reference(ref)
+            if normalized is None:
+                return None
+            symbol_key = str(normalized["symbol_key"])
+            if symbol_key in self.typedefs:
+                return symbol_key
+            candidates = list(
+                self.typedef_qnames.get(
+                    normalize_inline_namespace_qname(str(normalized["qname"])), []
+                )
+            )
+            usr = str(normalized.get("usr") or "")
+            if usr:
+                candidates = [key for key in candidates if self.typedefs[key].usr == usr]
+            signature = str(normalized.get("canonical_signature") or "")
+            if signature:
+                candidates = [
+                    key
+                    for key in candidates
+                    if self.typedefs[key].canonical_signature == signature
+                ]
+            symbol_kind = str(normalized.get("symbol_kind") or "")
+            if symbol_kind:
+                candidates = [
+                    key for key in candidates if self.typedefs[key].symbol_kind == symbol_kind
+                ]
+            return candidates[0] if len(candidates) == 1 else None
+        if ref in self.typedefs:
+            return ref
+        keys = self.typedef_qnames.get(normalize_inline_namespace_qname(ref), [])
+        if len(keys) == 1:
+            return keys[0]
+        return None
+
+    def _function_callee_keys(self, func: FunctionDef) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        refs: list[str | SymbolReference] = list(getattr(func, "callee_refs", []) or [])
+        refs.extend(list(getattr(func, "callee_keys", []) or []))
+        refs.extend(func.callees)
+        for ref in refs:
+            key = self.resolve_function_key(ref)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
+
+    def _function_referenced_type_keys(self, func: FunctionDef) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        refs: list[str | SymbolReference] = list(
+            getattr(func, "referenced_type_refs", []) or []
+        )
+        refs.extend(list(getattr(func, "referenced_type_keys", []) or []))
+        refs.extend(list(getattr(func, "referenced_types", []) or []))
+        for ref in refs:
+            key = self.resolve_type_key(ref)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
 
     def build_reverse_edges(self):
         """Build caller -> callee reverse edges for dep level computation."""
         self.callers.clear()
-        for qname, func in self.functions.items():
-            for callee in func.callees:
+        for symbol_key, func in self.functions.items():
+            for callee in self._function_callee_keys(func):
                 if callee in self.functions:
-                    self.callers[callee].append(qname)
+                    self.callers[callee].append(symbol_key)
 
     def compute_dep_levels(self):
         """Compute dependency levels via BFS from leaves."""
         # Find leaves: functions with no callees in the index
         in_degree = {}
-        for qname, func in self.functions.items():
-            local_callees = [c for c in func.callees if c in self.functions and c != qname]
-            in_degree[qname] = len(local_callees)
+        for symbol_key, func in self.functions.items():
+            local_callees = [
+                c for c in self._function_callee_keys(func)
+                if c in self.functions and c != symbol_key
+            ]
+            in_degree[symbol_key] = len(local_callees)
 
         queue = deque()
-        for qname, deg in in_degree.items():
+        for symbol_key, deg in in_degree.items():
             if deg == 0:
-                self.functions[qname].dep_level = 0
-                queue.append(qname)
+                self.functions[symbol_key].dep_level = 0
+                queue.append(symbol_key)
 
         self.build_reverse_edges()
 
         while queue:
-            qname = queue.popleft()
-            level = self.functions[qname].dep_level
-            for caller_name in self.callers.get(qname, []):
+            symbol_key = queue.popleft()
+            level = self.functions[symbol_key].dep_level
+            for caller_name in self.callers.get(symbol_key, []):
                 new_level = level + 1
                 if new_level > self.functions[caller_name].dep_level:
                     self.functions[caller_name].dep_level = new_level
@@ -673,9 +1894,9 @@ class ProjectIndex:
 
         # Handle cycles
         max_level = max((f.dep_level for f in self.functions.values()), default=0)
-        for qname, deg in in_degree.items():
+        for symbol_key, deg in in_degree.items():
             if deg > 0:
-                self.functions[qname].dep_level = max_level + 1
+                self.functions[symbol_key].dep_level = max_level + 1
 
     def stats(self) -> dict:
         """Return index statistics."""
@@ -774,6 +1995,8 @@ def get_function_text(cursor: Cursor, tu: TranslationUnit) -> str:
         end_offset = end.offset
         if start_offset < len(content) and end_offset <= len(content):
             return content[start_offset:end_offset]
+    except SymbolIdentityError:
+        raise
     except Exception:
         pass
     return ""
@@ -937,7 +2160,7 @@ def extract_clang_ast_metadata(
         if offsets is not None:
             start, end = offsets
             end = min(end, text_len)
-            bucket = _bucket_clang_cursor_kind(cursor.kind)
+            bucket = _bucket_clang_cursor_kind(_cursor_kind(cursor))
             clamped_depth = min(depth, 65535)
             clamped_sib = min(sib_idx, 65535)
             for char_idx in range(start, end):
@@ -1001,7 +2224,7 @@ def extract_callees(cursor: Cursor) -> tuple[list[str], list[str]]:
     baselib_callees: set[str] = set()
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.CALL_EXPR:
+        if _cursor_kind(node) == CursorKind.CALL_EXPR:
             ref = node.referenced
             if ref and ref.spelling:
                 # Get fully qualified name
@@ -1018,6 +2241,63 @@ def extract_callees(cursor: Cursor) -> tuple[list[str], list[str]]:
     return list(callees), list(baselib_callees)
 
 
+def extract_callee_symbol_keys(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+) -> list[str]:
+    """Extract canonical identity keys for non-system call targets."""
+    return [
+        str(ref["symbol_key"])
+        for ref in extract_callee_references(
+            cursor,
+            project_dir=project_dir,
+            project_id=repo,
+            fallback_file=fallback_file,
+        )[0]
+    ]
+
+
+def extract_callee_references(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+) -> tuple[list[SymbolReference], list[SymbolReference]]:
+    """Return resolved local and base-library call references from one AST walk."""
+    local: dict[str, SymbolReference] = {}
+    baselib: dict[str, SymbolReference] = {}
+
+    def walk(node: Cursor):
+        if _cursor_kind(node) == CursorKind.CALL_EXPR:
+            ref = node.referenced
+            if ref and ref.spelling:
+                qname = get_qualified_name(ref)
+                if qname:
+                    reference = symbol_reference_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project_id=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    key = str(reference["symbol_key"])
+                    if not is_system_function(qname):
+                        local[key] = reference
+                    elif is_crosslinkable_baselib(qname):
+                        baselib[key] = reference
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return (
+        [local[key] for key in sorted(local)],
+        [baselib[key] for key in sorted(baselib)],
+    )
+
+
 _REFERENCED_TYPE_DECL_KINDS = frozenset({
     CursorKind.STRUCT_DECL,
     CursorKind.CLASS_DECL,
@@ -1029,6 +2309,10 @@ _REFERENCED_TYPE_DECL_KINDS = frozenset({
     CursorKind.TYPE_ALIAS_DECL,
     CursorKind.TYPE_ALIAS_TEMPLATE_DECL,
 })
+_REFERENCED_TYPE_CURSOR_KINDS = frozenset({
+    CursorKind.TYPE_REF,
+    CursorKind.TEMPLATE_REF,
+})
 
 
 def extract_referenced_types(cursor: Cursor) -> list[str]:
@@ -1037,16 +2321,21 @@ def extract_referenced_types(cursor: Cursor) -> list[str]:
 
     Mirrors :func:`extract_callees` but for TYPE relationships — captured during
     the SAME libclang parse pass and persisted on ``FunctionDef.referenced_types``
-    so the offline doc-build path can emit ``type_refs``/``type_edges``. TYPE_REF
-    cursors are clang's explicit type-usage markers; we resolve each to its
-    declaring record/enum/typedef qname and drop system types.
+    so the offline doc-build path can emit ``type_refs``/``type_edges``.
+    TYPE_REF and TEMPLATE_REF cursors are clang's explicit type-usage markers;
+    we resolve each to its declaring record/enum/typedef qname and drop system
+    types.
     """
     types: set[str] = set()
 
     def walk(node: Cursor):
-        if node.kind == CursorKind.TYPE_REF:
+        if _cursor_kind(node) in _REFERENCED_TYPE_CURSOR_KINDS:
             ref = node.referenced
-            if ref is not None and ref.spelling and ref.kind in _REFERENCED_TYPE_DECL_KINDS:
+            if (
+                ref is not None
+                and ref.spelling
+                and _cursor_kind(ref) in _REFERENCED_TYPE_DECL_KINDS
+            ):
                 qname = get_qualified_name(ref)
                 if qname and not is_system_function(qname):
                     types.add(qname)
@@ -1057,11 +2346,64 @@ def extract_referenced_types(cursor: Cursor) -> list[str]:
     return list(types)
 
 
+def extract_referenced_type_keys(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    repo: str | None = None,
+    fallback_file: str | None = None,
+) -> list[str]:
+    """Extract canonical identity keys of referenced record/enum/typedef types."""
+    return [
+        str(ref["symbol_key"])
+        for ref in extract_referenced_type_references(
+            cursor,
+            project_dir=project_dir,
+            project_id=repo,
+            fallback_file=fallback_file,
+        )
+    ]
+
+
+def extract_referenced_type_references(
+    cursor: Cursor,
+    *,
+    project_dir: str | None = None,
+    project_id: str | None = None,
+    fallback_file: str | None = None,
+) -> list[SymbolReference]:
+    """Return canonical references for non-system record/enum/typedef uses."""
+    refs: dict[str, SymbolReference] = {}
+
+    def walk(node: Cursor):
+        if _cursor_kind(node) in _REFERENCED_TYPE_CURSOR_KINDS:
+            ref = node.referenced
+            if (
+                ref is not None
+                and ref.spelling
+                and _cursor_kind(ref) in _REFERENCED_TYPE_DECL_KINDS
+            ):
+                qname = get_qualified_name(ref)
+                if qname and not is_system_function(qname):
+                    reference = symbol_reference_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project_id=project_id,
+                        fallback_file=fallback_file,
+                    )
+                    refs[str(reference["symbol_key"])] = reference
+        for child in node.get_children():
+            walk(child)
+
+    walk(cursor)
+    return [refs[key] for key in sorted(refs)]
+
+
 def get_qualified_name(cursor: Cursor) -> str:
     """Get the fully qualified name of a cursor (namespace::class::func)."""
     parts = []
     c = cursor
-    while c and c.kind != CursorKind.TRANSLATION_UNIT:
+    while c and _cursor_kind(c) != CursorKind.TRANSLATION_UNIT:
         if c.spelling:
             parts.append(c.spelling)
         c = c.semantic_parent
@@ -1075,12 +2417,14 @@ def extract_preamble(tu: TranslationUnit, filename: str) -> str:
     for cursor in tu.cursor.get_children():
         if cursor.location.file and cursor.location.file.name != filename:
             continue
-        if cursor.kind in (CursorKind.INCLUSION_DIRECTIVE,
-                           CursorKind.USING_DIRECTIVE,
-                           CursorKind.USING_DECLARATION,
-                           CursorKind.TYPEDEF_DECL,
-                           CursorKind.TYPE_ALIAS_DECL,
-                           CursorKind.NAMESPACE_ALIAS):
+        if _cursor_kind(cursor) in (
+            CursorKind.INCLUSION_DIRECTIVE,
+            CursorKind.USING_DIRECTIVE,
+            CursorKind.USING_DECLARATION,
+            CursorKind.TYPEDEF_DECL,
+            CursorKind.TYPE_ALIAS_DECL,
+            CursorKind.NAMESPACE_ALIAS,
+        ):
             text = get_function_text(cursor, tu)
             if text:
                 preamble_parts.append(text)
@@ -1130,9 +2474,10 @@ def _header_decl_kind(cursor, text: str, *, in_primary_file: bool) -> int | None
     """Return a structure kind for trainable non-type header declarations."""
     if not in_primary_file:
         return None
-    if cursor.kind == _CONCEPT_DECL_KIND:
+    kind = _cursor_kind(cursor)
+    if kind == _CONCEPT_DECL_KIND:
         return HEADER_FRAGMENT_KIND
-    if cursor.kind not in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND}:
+    if kind not in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND}:
         return None
     stripped = text.lstrip()
     padded = f" {stripped} "
@@ -1151,6 +2496,8 @@ def parse_translation_unit(
     compile_args: list[str],
     project_dir: str,
     allow_system_types: bool = False,
+    *,
+    project_id: str,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -1173,6 +2520,10 @@ def parse_translation_unit(
     """
     functions: list[FunctionDef] = []
     typedefs: list[TypeDef] = []
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"parse_translation_unit({filepath})",
+    )
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
             source = source_file.read()
@@ -1188,15 +2539,24 @@ def parse_translation_unit(
             # make many parallel clang workers retain large buffers.
             options=TranslationUnit.PARSE_INCOMPLETE,
         )
-    except Exception as e:
-        print(f"  WARN: Failed to parse {filepath}: {e}", file=sys.stderr)
-        return functions, typedefs
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
 
     rel_path = os.path.relpath(filepath, project_dir)
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
         source,
         tu,
         filepath,
+    )
+    semantic_meta = extract_semantic_metadata(
+        source,
+        tu,
+        filepath,
+        project_dir=project_dir,
+        project_id=stable_project_id,
+        fallback_file=rel_path,
     )
     byte_to_char = _byte_to_char_mapper(source)
     project_dir_abs = os.path.abspath(project_dir)
@@ -1226,6 +2586,8 @@ def parse_translation_unit(
             return rel_path
         try:
             return os.path.relpath(loc.name, project_dir)
+        except SymbolIdentityError:
+            raise
         except Exception:
             return rel_path
 
@@ -1235,8 +2597,8 @@ def parse_translation_unit(
         Functions are captured only from the primary file (``== filepath``) to
         avoid duplicating inline defs across every TU that includes the header.
         Type DEFINITIONS are captured from any project-local file (incl. headers
-        pulled in via #include); duplicates across TUs are deduped by qname in
-        ``ProjectIndex.add_typedef``.
+        pulled in via #include); duplicates across TUs are deduped by canonical
+        symbol identity in ``ProjectIndex.add_typedef``.
         """
         loc = cursor.location.file
         if loc is None:
@@ -1246,8 +2608,9 @@ def parse_translation_unit(
         if not in_project:
             return  # skip system/third-party headers entirely
 
-        if in_primary_file and cursor.kind in FUNCTION_KINDS and cursor.is_definition():
-            text, func_ast_depth, func_sibling_index, func_ast_node_type, _offsets = (
+        kind = _cursor_kind(cursor)
+        if in_primary_file and kind in FUNCTION_KINDS and cursor.is_definition():
+            text, func_ast_depth, func_sibling_index, func_ast_node_type, offsets = (
                 _cursor_text_and_metadata(
                     cursor,
                     source,
@@ -1259,9 +2622,42 @@ def parse_translation_unit(
                 )
             )
             if text and len(text) >= 20:
-                callees, baselib_callees = extract_callees(cursor)
-                referenced_types = extract_referenced_types(cursor)
+                callee_refs, baselib_callee_refs = extract_callee_references(
+                    cursor,
+                    project_dir=project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                referenced_type_refs = extract_referenced_type_references(
+                    cursor,
+                    project_dir=project_dir,
+                    project_id=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                callees = [str(ref["qname"]) for ref in callee_refs]
+                baselib_callees = [str(ref["qname"]) for ref in baselib_callee_refs]
+                callee_keys = [str(ref["symbol_key"]) for ref in callee_refs]
+                referenced_types = [str(ref["qname"]) for ref in referenced_type_refs]
+                referenced_type_keys = [
+                    str(ref["symbol_key"]) for ref in referenced_type_refs
+                ]
                 qname = get_qualified_name(cursor)
+                symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=stable_project_id,
+                    fallback_file=rel_path,
+                )
+                sem_symbol_ids: list[int] = []
+                sem_call_targets: list[int] = []
+                sem_type_refs: list[int] = []
+                sem_def_use: list[int] = []
+                if offsets is not None:
+                    s0, s1 = offsets
+                    sem_symbol_ids = list(semantic_meta["symbol_ids"][s0:s1])
+                    sem_call_targets = list(semantic_meta["call_targets"][s0:s1])
+                    sem_type_refs = list(semantic_meta["type_refs"][s0:s1])
+                    sem_def_use = list(semantic_meta["def_use"][s0:s1])
                 functions.append(FunctionDef(
                     name=cursor.spelling,
                     qualified_name=qname,
@@ -1276,13 +2672,33 @@ def parse_translation_unit(
                     ast_node_type=func_ast_node_type,
                     referenced_types=referenced_types,
                     baselib_callees=baselib_callees,
+                    symbol_key=symbol_key,
+                    usr=usr,
+                    canonical_signature=canonical_signature,
+                    symbol_kind=_cursor_kind_name(cursor),
+                    callee_keys=callee_keys,
+                    referenced_type_keys=referenced_type_keys,
+                    callee_refs=callee_refs,
+                    baselib_callee_refs=baselib_callee_refs,
+                    referenced_type_refs=referenced_type_refs,
+                    semantic_symbol_ids=sem_symbol_ids,
+                    semantic_call_targets=sem_call_targets,
+                    semantic_type_refs=sem_type_refs,
+                    semantic_def_use=sem_def_use,
+                    semantic_symbol_identities=_semantic_identity_records_for_arrays(
+                        semantic_meta,
+                        sem_symbol_ids,
+                        sem_call_targets,
+                        sem_type_refs,
+                        source=f"{rel_path}:{cursor.location.line}:{qname}",
+                    ),
                 ))
             return
 
         # Register type DEFINITIONS (struct/class/enum/union/typedef/using) as
         # type-edge target chunks. We require an actual definition so a forward
         # declaration never shadows the real body.
-        type_bucket = _TYPE_DEF_KIND_BUCKET.get(cursor.kind)
+        type_bucket = _TYPE_DEF_KIND_BUCKET.get(kind)
         if type_bucket is not None and cursor.is_definition():
             qname = get_qualified_name(cursor)
             # Normal path drops std::/boost:: ("system") type names; the std
@@ -1291,6 +2707,12 @@ def parse_translation_unit(
             if qname and (allow_system_types or not is_system_function(qname)):
                 td_text = get_function_text(cursor, tu)
                 if td_text and len(td_text) >= 8:
+                    symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                        cursor,
+                        project_dir=project_dir,
+                        project=stable_project_id,
+                        fallback_file=_cursor_rel_file(cursor),
+                    )
                     typedefs.append(TypeDef(
                         name=cursor.spelling,
                         qualified_name=qname,
@@ -1299,12 +2721,16 @@ def parse_translation_unit(
                         text=td_text,
                         kind=type_bucket,
                         end_line=cursor.extent.end.line,
+                        symbol_key=symbol_key,
+                        usr=usr,
+                        canonical_signature=canonical_signature,
+                        symbol_kind=_cursor_kind_name(cursor),
                     ))
             # Records (class/struct) can contain nested types/methods — recurse.
 
         header_decl_text = ""
         header_decl_kind = None
-        if cursor.kind in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND, _CONCEPT_DECL_KIND}:
+        if kind in {CursorKind.VAR_DECL, _UNEXPOSED_DECL_KIND, _CONCEPT_DECL_KIND}:
             header_decl_text = get_function_text(cursor, tu)
             if header_decl_text:
                 header_decl_kind = _header_decl_kind(
@@ -1315,6 +2741,12 @@ def parse_translation_unit(
         if header_decl_kind is not None and header_decl_text and len(header_decl_text) >= 8:
             qname = get_qualified_name(cursor)
             if qname and (allow_system_types or not is_system_function(qname)):
+                symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=stable_project_id,
+                    fallback_file=_cursor_rel_file(cursor),
+                )
                 typedefs.append(TypeDef(
                     name=cursor.spelling,
                     qualified_name=qname,
@@ -1323,9 +2755,13 @@ def parse_translation_unit(
                     text=header_decl_text,
                     kind=header_decl_kind,
                     end_line=cursor.extent.end.line,
+                    symbol_key=symbol_key,
+                    usr=usr,
+                    canonical_signature=canonical_signature,
+                    symbol_kind=_cursor_kind_name(cursor),
                 ))
 
-        if cursor.kind in CONTAINER_KINDS:
+        if kind in CONTAINER_KINDS:
             # Recurse into namespaces, classes, structs for nested defs.
             for child in cursor.get_children():
                 visit(child)
@@ -1377,16 +2813,15 @@ def find_build_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
 ) -> list[tuple[str, str]]:
-    """Find build/compilation files. Sibling of ``find_cpp_files``.
+    """Find build/domain text files. Sibling of ``find_cpp_files``.
 
     Returns a list of ``(abs_path, build_kind)`` tuples so the build-system tag
-    (cmake/make/bazel/ninja/meson/...) is known at discovery time. Same
-    ``os.walk``/skip-dir/size-cap logic as ``find_cpp_files``. Note: build files
-    legitimately live under dirs that code discovery prunes (e.g. ``build/`` for
-    ``compile_commands.json``, ``third_party/`` for vendored CMake), so we do NOT
-    apply ``_DEFAULT_SKIP_DIRS`` here -- only ``.git`` and the caller's extra
-    excludes -- otherwise the richest platform signal (compile_commands.json in
-    ``build/``) would be silently dropped.
+    (cmake/make/bazel/ninja/meson/...) is known at discovery time. Compilation
+    databases are structured inputs consumed separately by
+    ``load_compile_commands`` and are never returned as build/domain text. Build
+    files legitimately live under dirs that code discovery prunes (e.g.
+    ``third_party/`` for vendored CMake), so only ``.git`` and the caller's extra
+    excludes are pruned here.
     """
     skip_dirs = {'.git'} | (extra_exclude_dirs or set())
     files: list[tuple[str, str]] = []
@@ -1396,13 +2831,76 @@ def find_build_files(
             build_kind = classify_build_file(fname)
             if build_kind is None:
                 continue
+            if build_kind == "compile_commands":
+                continue
             filepath = os.path.join(root, fname)
             try:
-                if os.path.getsize(filepath) > BUILD_FILE_SIZE_CAP:
-                    continue
-            except OSError:
-                continue
+                _ = os.path.getsize(filepath)
+            except OSError as exc:
+                raise OSError(f"failed to stat build/domain input {filepath}: {exc}") from exc
             files.append((filepath, build_kind))
+    return files
+
+
+def _classify_shell_file(filepath: str, fname: str) -> str | None:
+    if classify_build_file(fname) is not None:
+        return None
+    suffix = os.path.splitext(fname)[1].lower()
+    extension_kind = SHELL_EXT_KINDS.get(suffix)
+    if extension_kind is None and suffix:
+        return None
+    try:
+        with Path(filepath).open("rb") as fh:
+            first_line_bytes = fh.readline(512)
+    except OSError as exc:
+        if extension_kind is not None:
+            raise OSError(f"failed to read shell/domain input {filepath}: {exc}") from exc
+        return None
+    if b"\0" in first_line_bytes:
+        if extension_kind is not None:
+            raise ValueError(f"binary shell/domain input contains NUL byte: {filepath}")
+        return None
+    try:
+        first_line = first_line_bytes.decode("utf-8", errors="strict").lower()
+    except UnicodeDecodeError as exc:
+        if extension_kind is not None:
+            raise ValueError(f"invalid UTF-8 shell/domain input {filepath}: {exc}") from exc
+        return None
+    if first_line.startswith("#!"):
+        words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
+        for shell in ("tcsh", "csh", "zsh", "bash", "ksh", "sh"):
+            if shell in words:
+                return "tcsh" if shell == "csh" else shell
+    return extension_kind
+
+
+def find_shell_files(
+    project_dir: str,
+    extra_exclude_dirs: set[str] | None = None,
+    invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
+) -> list[tuple[str, str]]:
+    """Find shell sources, including extensionless files with a shell shebang."""
+
+    skip_dirs = {'.git'} | (extra_exclude_dirs or set())
+    files: list[tuple[str, str]] = []
+    for root, dirs, filenames in os.walk(project_dir):
+        dirs[:] = [directory for directory in dirs if directory not in skip_dirs]
+        for fname in filenames:
+            filepath = os.path.join(root, fname)
+            try:
+                shell_kind = _classify_shell_file(filepath, fname)
+            except ValueError as exc:
+                if invalid_input_handler is not None:
+                    invalid_input_handler(Path(filepath), exc)
+                    continue
+                raise
+            if shell_kind is None:
+                continue
+            try:
+                _ = os.path.getsize(filepath)
+            except OSError as exc:
+                raise OSError(f"failed to stat shell/domain input {filepath}: {exc}") from exc
+            files.append((filepath, shell_kind))
     return files
 
 
@@ -1464,8 +2962,39 @@ def _is_sane_compile_args(args: list[str]) -> bool:
 
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
 DEFAULT_PARSE_BATCH_FILES = 25
+PARSE_SUBMIT_WINDOW_PER_WORKER = 2
+PARSE_MAX_BATCHES_PER_WORKER = 64
 PARSE_HEARTBEAT_FILES = 25
 PARSE_HEARTBEAT_SECONDS = 30.0
+DOCUMENT_HEARTBEAT_ITEMS = 100
+DOCUMENT_HEARTBEAT_SECONDS = 30.0
+_CPP_SOURCE_MARKER_RE = re.compile(
+    r"::\s*(?:new|delete)|\b(?:class|namespace|template|nullptr|"
+    r"static_cast|reinterpret_cast|dynamic_cast|const_cast)\b"
+)
+
+
+def _progress_heartbeat(
+    label: str,
+    completed: int,
+    total: int | None,
+    last_heartbeat: float,
+    *,
+    every_items: int = DOCUMENT_HEARTBEAT_ITEMS,
+    interval_s: float = DOCUMENT_HEARTBEAT_SECONDS,
+    force: bool = False,
+    now: float | None = None,
+) -> float:
+    """Emit a flushed stderr heartbeat for long, otherwise silent loops."""
+    current = time.monotonic() if now is None else now
+    item_due = every_items > 0 and completed > 0 and completed % every_items == 0
+    time_due = interval_s > 0 and current - last_heartbeat >= interval_s
+    done = total is not None and completed >= total
+    if not (force or item_due or time_due or done):
+        return last_heartbeat
+    progress = f"{completed}/{total}" if total is not None else str(completed)
+    print(f"  {label} heartbeat: {progress}", file=sys.stderr, flush=True)
+    return current
 
 
 def compute_parse_batch_size(
@@ -1491,6 +3020,25 @@ def compute_parse_batch_size(
     return min(max_batch_files, nominal)
 
 
+def make_parse_executor(
+    max_workers: int,
+    *,
+    max_tasks_per_child: int = PARSE_MAX_BATCHES_PER_WORKER,
+) -> ProcessPoolExecutor:
+    """Create a bounded-lifetime parser pool for libclang translation units."""
+    if max_workers <= 0:
+        raise ValueError(f"max_workers must be positive, got {max_workers}")
+    if max_tasks_per_child <= 0:
+        raise ValueError(
+            "max_tasks_per_child must be positive, got "
+            f"{max_tasks_per_child}"
+        )
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        max_tasks_per_child=max_tasks_per_child,
+    )
+
+
 def get_default_compile_args(project_dir: str) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
     _platform_info, args, _compile_index = detect_build_context(project_dir)
@@ -1508,21 +3056,48 @@ def get_default_compile_args(project_dir: str) -> list[str]:
     return result
 
 
+def _source_looks_like_cpp(filepath: str) -> bool:
+    """Detect legacy C++ compiler tests stored under a ``.c`` suffix."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
+            source = source_file.read(1_048_576)
+    except OSError:
+        return False
+    return _CPP_SOURCE_MARKER_RE.search(source) is not None
+
+
 def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
-    """Adapt compile args based on file extension — .c files need C mode, not C++,
-    and headers must be parsed as ``-x c++-header`` (otherwise libclang fails to
-    parse a standalone .h/.hpp as a translation unit)."""
+    """Adapt compile args while preserving C++ syntax in legacy ``.c`` files.
+
+    Most ``.c`` files must remain C. A few compiler test suites intentionally use
+    a ``.c`` suffix for C++ regression cases; forcing those files through C11 can
+    make libclang loop on otherwise bounded input. Only an explicit C++ mode or
+    a C++ project standard plus a source marker opts into C++ mode.
+    """
     ext = os.path.splitext(filepath)[1].lower()
     if ext in HEADER_EXTENSIONS:
-        # Force C++ header mode so struct/class/enum/typedef DEFINITIONS in
-        # header-only files parse and become type-def chunks. Strip any existing
-        # -x <lang> pair / joined -x form first so it doesn't conflict.  Standalone
-        # header parsing must understand C++20/23 header-only declarations
-        # (concepts, inline variable templates) even when the repo has no
-        # compile_commands.json and the old fallback would have been c++17.
+        explicit_language: str | None = None
+        for arg_index, arg in enumerate(args):
+            if arg == '-x' and arg_index + 1 < len(args):
+                explicit_language = args[arg_index + 1].lower()
+            elif arg.startswith('-x') and arg != '-x':
+                explicit_language = arg[2:].lower()
+        is_c_header = explicit_language in {'c', 'c-header'}
+        if explicit_language is None:
+            is_c_header = any(
+                arg.startswith('-std=c') and not arg.startswith('-std=c++')
+                for arg in args
+            )
+
+        # Change only the language form. The compile database or detected project
+        # context owns the dialect flag, including C++20/C++23/C++26.
         adapted = []
         skip_next = False
-        for arg in args:
+        standard_indexes = [
+            index for index, arg in enumerate(args) if arg.startswith('-std=')
+        ]
+        last_standard_index = standard_indexes[-1] if standard_indexes else None
+        for arg_index, arg in enumerate(args):
             if skip_next:
                 skip_next = False
                 continue
@@ -1531,11 +3106,37 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 continue
             if arg.startswith('-x') and arg != '-x':
                 continue
-            if arg.startswith('-std='):
+            if arg.startswith('-std=') and arg_index != last_standard_index:
                 continue
             adapted.append(arg)
-        return ['-x', 'c++-header', '-std=c++23'] + adapted
+        header_language = 'c-header' if is_c_header else 'c++-header'
+        return ['-x', header_language] + adapted
     if ext in C_EXTENSIONS:
+        explicit_language: str | None = None
+        for arg_index, arg in enumerate(args):
+            if arg == '-x' and arg_index + 1 < len(args):
+                explicit_language = args[arg_index + 1].lower()
+            elif arg.startswith('-x') and arg != '-x':
+                explicit_language = arg[2:].lower()
+        has_cpp_standard = any(arg.startswith('-std=c++') for arg in args)
+        use_cpp_mode = explicit_language in {'c++', 'c++-cpp', 'objective-c++'}
+        if explicit_language is None and has_cpp_standard:
+            use_cpp_mode = _source_looks_like_cpp(filepath)
+        if use_cpp_mode:
+            adapted: list[str] = []
+            skip_next = False
+            for arg in args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == '-x':
+                    skip_next = True
+                    continue
+                if arg.startswith('-x') and arg != '-x':
+                    continue
+                adapted.append(arg)
+            return ['-x', 'c++'] + adapted
+
         adapted = []
         skip_next = False
         for arg in args:
@@ -1584,12 +3185,24 @@ def estimate_tokens(text: str) -> int:
 # --------------------------------------------------------------------------- #
 CROSSLINK_MAX_DEPS_PER_DOC = 12
 CROSSLINK_TOKEN_BUDGET_PER_DOC = 6144
+GLOBAL_SYMBOL_DB_SCHEMA_VERSION = 4
+
+
+class AmbiguousGlobalSymbolError(SymbolIdentityError):
+    """Raised when authoritative global-symbol fields do not select one provider."""
 
 
 class CrossLinkBudget:
     """Per-document bound on cross-lib pulls (count + token budget)."""
 
-    __slots__ = ["max_deps", "token_budget", "used_deps", "used_tokens"]
+    __slots__ = [
+        "max_deps",
+        "token_budget",
+        "used_deps",
+        "used_tokens",
+        "ambiguous_lookups",
+        "ambiguity_examples",
+    ]
 
     def __init__(self, max_deps: int = CROSSLINK_MAX_DEPS_PER_DOC,
                  token_budget: int = CROSSLINK_TOKEN_BUDGET_PER_DOC):
@@ -1597,6 +3210,8 @@ class CrossLinkBudget:
         self.token_budget = token_budget
         self.used_deps = 0
         self.used_tokens = 0
+        self.ambiguous_lookups = 0
+        self.ambiguity_examples: list[str] = []
 
     def has_room(self) -> bool:
         return self.used_deps < self.max_deps and self.used_tokens < self.token_budget
@@ -1608,6 +3223,11 @@ class CrossLinkBudget:
     def spend(self, tok: int) -> None:
         self.used_deps += 1
         self.used_tokens += tok
+
+    def note_ambiguity(self, qname: str) -> None:
+        self.ambiguous_lookups += 1
+        if qname and qname not in self.ambiguity_examples and len(self.ambiguity_examples) < 8:
+            self.ambiguity_examples.append(qname)
 
 
 class GlobalSymbolReader:
@@ -1632,50 +3252,209 @@ class GlobalSymbolReader:
             for row in self._conn.execute("PRAGMA table_info(symbols)").fetchall()
         }
         if "symbol_uid" not in cols:
-            raise RuntimeError(
+            raise SymbolIdentityError(
                 f"--global-symbol-index uses old qname-only schema: {path}. "
                 "Rebuild it with scripts/crossrepo/build_global_symbol_index.py "
                 "so overloaded symbols and multi-implementation std symbols are "
                 "not collapsed."
             )
-        self._cache: dict[str, dict | None] = {}
+        required = {
+            "symbol_key",
+            "symbol_id",
+            "usr",
+            "canonical_signature",
+            "symbol_kind",
+            "identity_schema_version",
+            "provider",
+            "include_provenance",
+        }
+        missing = sorted(required - cols)
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if missing or version != GLOBAL_SYMBOL_DB_SCHEMA_VERSION:
+            raise SymbolIdentityError(
+                f"--global-symbol-index schema is incompatible: {path}; "
+                f"user_version={version}, missing_columns={missing}. Migrate only "
+                "when provider provenance is reconstructable, or rebuild it."
+            )
+        incompatible_rows = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM symbols "
+                "WHERE identity_schema_version!=? OR symbol_key='' OR symbol_id='' "
+                "OR symbol_kind='' OR (usr='' AND canonical_signature='' "
+                "AND symbol_key NOT LIKE 'repo_file_location:%') "
+                "OR canonical_signature LIKE 'legacy-kind=%text-sha1=%' "
+                "OR provider='' OR include_provenance=''",
+                (SYMBOL_IDENTITY_SCHEMA_VERSION,),
+            ).fetchone()[0]
+        )
+        if incompatible_rows:
+            raise SymbolIdentityError(
+                f"--global-symbol-index has incompatible symbol identity rows: {path}; "
+                f"count={incompatible_rows}, expected_version="
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION}. Migrate or rebuild the index."
+            )
+        for row in self._conn.execute(
+            "SELECT symbol_uid, symbol_key, qname, base_repo, file, line, symbol_kind "
+            "FROM symbols WHERE usr='' AND canonical_signature=''"
+        ):
+            symbol_uid, symbol_key, qname, project_id, file, line, symbol_kind = row
+            validate_repo_file_location_identity_claim(
+                str(symbol_key),
+                project=str(project_id),
+                file=str(file),
+                line=int(line),
+                kind=str(symbol_kind),
+                qname=str(qname),
+                source=f"global symbol index {path}:{symbol_uid}",
+            )
+        for (project_id,) in self._conn.execute(
+            "SELECT DISTINCT base_repo FROM symbols"
+        ):
+            require_project_identity(
+                project_id, source=f"global symbol index {path}"
+            )
+        missing_std_provenance = self._conn.execute(
+            "SELECT symbol_uid, file FROM symbols WHERE base_lib='std' "
+            "AND (provider NOT IN ('libc++', 'libstdc++', 'msvc-stl') "
+            "OR include_provenance='') LIMIT 1"
+        ).fetchone()
+        if missing_std_provenance is not None:
+            raise SymbolIdentityError(
+                f"{path}: std symbol lacks authoritative provider/include provenance: "
+                f"uid={missing_std_provenance[0]} file={missing_std_provenance[1]!r}"
+            )
+        registry_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='symbol_identities'"
+        ).fetchone()
+        if registry_table is None:
+            raise SymbolIdentityError(
+                f"--global-symbol-index has no corpus collision registry: {path}. "
+                "Migrate or rebuild the index."
+            )
+        unregistered_rows = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM symbols AS s "
+                "LEFT JOIN symbol_identities AS i "
+                "ON i.symbol_id=s.symbol_id AND i.symbol_key=s.symbol_key "
+                "WHERE i.symbol_id IS NULL"
+            ).fetchone()[0]
+        )
+        if unregistered_rows:
+            raise SymbolIdentityError(
+                f"--global-symbol-index has unregistered symbol IDs: {path}; "
+                f"count={unregistered_rows}. Migrate or rebuild the index."
+            )
+        self._cache: dict[str, tuple[dict[str, object], ...]] = {}
 
-    def lookup(self, qname: str) -> dict | None:
-        """Return the base-lib FUNCTION def for ``qname`` or None.
-
-        Returns a dict with at least: base_repo, base_lib, text, token_est, kind.
-        Cached per-process; the store is read-only at doc-build time.
-        """
+    def lookup_candidates(self, qname: str) -> list[dict[str, object]]:
+        """Return every function candidate for a display/search qname."""
         key = normalize_inline_namespace_qname(qname)
         if key in self._cache:
-            return self._cache[key]
-        row = self._conn.execute(
-            "SELECT base_lib, base_repo, text, token_est, kind "
+            return [dict(record) for record in self._cache[key]]
+        rows = self._conn.execute(
+            "SELECT symbol_uid, symbol_key, symbol_id, qname, base_lib, base_repo, text, "
+            "token_est, kind, file, line, end_line, usr, canonical_signature, "
+            "symbol_kind, identity_schema_version, provider, include_provenance "
             "FROM symbols WHERE qname=? AND sym_type='func' "
-            "ORDER BY token_est DESC, body_len DESC, base_repo, file, line LIMIT 1",
+            "ORDER BY base_repo, file, line, symbol_uid",
             (key,),
-        ).fetchone()
-        if row is None:
-            self._cache[key] = None
-            return None
-        rec = {
-            "base_lib": row[0], "base_repo": row[1], "text": row[2],
-            "token_est": row[3], "kind": row[4],
-        }
-        self._cache[key] = rec
-        return rec
+        ).fetchall()
+        records = tuple(
+            {
+                "symbol_uid": row[0],
+                "symbol_key": row[1],
+                "symbol_id": int(str(row[2]), 16),
+                "qname": row[3],
+                "base_lib": row[4],
+                "base_repo": row[5],
+                "text": row[6],
+                "token_est": row[7],
+                "kind": row[8],
+                "file": row[9],
+                "line": row[10],
+                "end_line": row[11],
+                "usr": row[12],
+                "canonical_signature": row[13],
+                "symbol_kind": row[14],
+                "identity_schema_version": row[15],
+                "provider": row[16],
+                "include_provenance": row[17],
+            }
+            for row in rows
+        )
+        self._cache[key] = records
+        return [dict(record) for record in records]
+
+    def lookup(
+        self,
+        qname: str,
+        *,
+        symbol_key: str | None = None,
+        usr: str | None = None,
+        canonical_signature: str | None = None,
+        symbol_kind: str | None = None,
+        project: str | None = None,
+        file: str | None = None,
+        provider: str | None = None,
+        include_provenance: str | None = None,
+    ) -> dict[str, object] | None:
+        """Resolve one exact candidate and fail closed on ambiguity."""
+        all_candidates = self.lookup_candidates(qname)
+        candidates = list(all_candidates)
+        if usr:
+            candidates = [row for row in candidates if row["usr"] == usr]
+        else:
+            fallback_used = False
+            if canonical_signature:
+                fallback_used = True
+                signature = _normalize_signature_text(canonical_signature)
+                candidates = [
+                    row
+                    for row in candidates
+                    if _normalize_signature_text(str(row["canonical_signature"])) == signature
+                ]
+            if symbol_kind:
+                fallback_used = True
+                candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+            if not fallback_used and symbol_key:
+                candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
+        if project:
+            candidates = [row for row in candidates if row["base_repo"] == project]
+        if file:
+            candidates = [row for row in candidates if row["file"] == file]
+        if provider:
+            candidates = [row for row in candidates if row["provider"] == provider]
+        if include_provenance:
+            candidates = [
+                row
+                for row in candidates
+                if row["include_provenance"] == include_provenance
+            ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            preview = [
+                f"{row['base_repo']}:{row['file']}:{row['line']}"
+                for row in candidates[:8]
+            ]
+            raise AmbiguousGlobalSymbolError(
+                "ambiguous global symbol lookup: "
+                f"qname={qname!r} usr={usr or ''!r} provider={provider or ''!r} "
+                f"include={include_provenance or ''!r} candidates={preview}"
+            )
+        return None
 
     def close(self) -> None:
         self._conn.close()
 
 
 def collect_transitive_deps(
-    root_qname: str,
+    root_symbol: str,
     index: ProjectIndex,
     max_depth: int = 5,
     *,
     global_symbols: "GlobalSymbolReader | None" = None,
-    crosslink_visited: set[str] | None = None,
+    crosslink_visited: dict[str, dict[str, object]] | None = None,
     crosslink_budget: "CrossLinkBudget | None" = None,
 ) -> list[str]:
     """BFS to collect transitive dependencies of a function.
@@ -1683,7 +3462,7 @@ def collect_transitive_deps(
     When ``global_symbols`` is supplied (the optional cross-repo base-lib symbol
     index), an UNRESOLVED callee — one that is NOT in the local repo index — is
     looked up in the global index. If it is a selected base-lib symbol it is
-    recorded as a CROSS-LIB pull in ``crosslink_visited`` (qnames) under HARD
+    recorded as a CROSS-LIB pull in ``crosslink_visited`` (symbol UIDs) under HARD
     BOUNDS enforced by ``crosslink_budget`` (cross-lib depth = 1, a per-doc cap
     on the number of cross-lib deps, and a per-doc cross-lib token budget). We do
     NOT recurse into a pulled base-lib function's own transitive closure inside
@@ -1696,51 +3475,106 @@ def collect_transitive_deps(
         and crosslink_budget is not None
     )
 
-    def _try_crosslink(callee: str) -> None:
+    def _try_crosslink(reference: str | SymbolReference) -> None:
         # Depth-1 only: a pulled base-lib def is a LEAF; we never enqueue it, so
         # its base-lib-internal callees are not followed. Bounds (count + token
         # budget) are enforced by crosslink_budget. ONE clear path; a miss (not a
         # selected base-lib symbol) is simply a no-op, never a fallback.
-        if callee in crosslink_visited:
-            return
         if not crosslink_budget.has_room():
             return
-        hit = global_symbols.lookup(callee)
+        try:
+            if isinstance(reference, dict):
+                qname = str(reference.get("qname") or "")
+                reference_project = (
+                    None
+                    if is_crosslinkable_baselib(qname)
+                    else str(reference.get("project") or "") or None
+                )
+                hit = global_symbols.lookup(
+                    qname,
+                    symbol_key=(
+                        str(reference.get("symbol_key") or "") or None
+                        if reference_project
+                        else None
+                    ),
+                    usr=str(reference.get("usr") or "") or None,
+                    canonical_signature=(
+                        str(reference.get("canonical_signature") or "") or None
+                    ),
+                    symbol_kind=str(reference.get("symbol_kind") or "") or None,
+                    project=reference_project,
+                    file=(str(reference.get("file") or "") or None)
+                    if reference_project
+                    else None,
+                    provider=str(reference.get("provider") or "") or None,
+                    include_provenance=(
+                        str(reference.get("include_provenance") or "") or None
+                    ),
+                )
+            else:
+                qname = reference
+                hit = global_symbols.lookup(qname)
+        except AmbiguousGlobalSymbolError:
+            # Cross-repo enrichment is optional context. Never guess a provider:
+            # leave the route unresolved and emit an aggregate audit receipt.
+            crosslink_budget.note_ambiguity(qname)
+            return
         if hit is None:
+            return
+        target_key = hit.get("symbol_key")
+        if not isinstance(target_key, str) or not target_key:
+            return
+        index._register_symbol_key(target_key)
+        uid = str(hit["symbol_uid"])
+        if uid in crosslink_visited:
             return
         if not crosslink_budget.can_afford(hit["token_est"]):
             return
-        crosslink_visited.add(callee)
+        crosslink_visited[uid] = hit
         crosslink_budget.spend(hit["token_est"])
 
-    visited = {root_qname}
-    queue = deque([(root_qname, 0)])
+    resolved_root = index.resolve_function_key(root_symbol)
+    if resolved_root is None:
+        return []
+    visited = {resolved_root}
+    queue = deque([(resolved_root, 0)])
     deps = []
 
     while queue:
-        qname, depth = queue.popleft()
+        symbol_key, depth = queue.popleft()
         if depth >= max_depth:
             continue
-        func = index.functions.get(qname)
+        func = index.functions.get(symbol_key)
         if not func:
             continue
-        for callee in func.callees:
-            if callee in visited:
+        local_refs: list[str | SymbolReference] = list(
+            getattr(func, "callee_refs", []) or []
+        )
+        if not local_refs:
+            local_refs = list(getattr(func, "callee_keys", []) or []) + list(func.callees)
+        for reference in local_refs:
+            callee = index.resolve_function_key(reference)
+            if callee is not None and callee in visited:
                 continue
-            if callee in index.functions:
+            if callee is not None:
                 visited.add(callee)
                 deps.append(callee)
                 queue.append((callee, depth + 1))
             elif crosslink_active:
                 # An unresolved callee (not local) MIGHT be a base-lib symbol
                 # (e.g. a vendored/forward-declared libc-style name). Try it.
-                _try_crosslink(callee)
+                _try_crosslink(reference)
         # Base-lib-namespaced callees (std::/boost::) were filtered out of
         # `callees` by the normal system-prefix filter and live here. They are
         # the PRIMARY cross-link source. Only consulted when cross-linking is on.
         if crosslink_active:
-            for callee in func.baselib_callees:
-                _try_crosslink(callee)
+            base_refs: list[str | SymbolReference] = list(
+                getattr(func, "baselib_callee_refs", []) or []
+            )
+            if not base_refs:
+                base_refs = list(func.baselib_callees)
+            for reference in base_refs:
+                _try_crosslink(reference)
 
     return deps
 
@@ -1780,7 +3614,7 @@ def extract_ast_metadata_from_parts(
     offset = 0
 
     for part_index, part in enumerate(parts_info):
-        part_text, kind, dep_level, _name, _qname = (
+        part_text, kind, _dep_level, _name, display_qname = (
             part[0], part[1], part[2], part[3], part[4]
         )
         part_len = len(part_text)
@@ -1789,7 +3623,13 @@ def extract_ast_metadata_from_parts(
         end = min(offset + part_len, text_len)
         if offset >= text_len or offset >= end:
             break
-        func = index.functions.get(_qname) if index is not None and _qname else None
+        func = None
+        if index is not None:
+            key = _part_symbol_key(part) or (
+                display_qname if isinstance(display_qname, str) else None
+            )
+            resolved = index.resolve_function_key(key)
+            func = index.functions.get(resolved) if resolved is not None else None
         if (
             func is not None
             and len(func.ast_depth) == part_len
@@ -1851,7 +3691,6 @@ _CALL_KINDS = {
 _TYPE_REF_KINDS = {
     CursorKind.TYPE_REF,
     CursorKind.TEMPLATE_REF,
-    CursorKind.NAMESPACE_REF,
 }
 
 _REFERENCE_KINDS = {
@@ -1866,23 +3705,14 @@ _REFERENCE_KINDS = {
 }
 
 
-def _compute_symbol_id(qname: str) -> int:
-    """Deterministic 32-bit symbol ID from a qualified name.
-
-    Uses the lower 31 bits of md5, leaving 0 as the sentinel for 'no symbol'.
-    """
-    if not qname:
-        return 0
-    h = int(hashlib.md5(qname.encode("utf-8", errors="replace")).hexdigest(), 16)
-    # Mask to 31 bits (positive int32), reserve 0 for no-symbol
-    result = (h & 0x7FFFFFFF) or 1
-    return result
-
-
 def extract_semantic_metadata(
     source: str,
     tu: 'TranslationUnit',
     filename: str,
+    *,
+    project_dir: str | None = None,
+    project_id: str,
+    fallback_file: str | None = None,
 ) -> dict:
     """Extract per-character semantic metadata from a translation unit.
 
@@ -1890,9 +3720,9 @@ def extract_semantic_metadata(
 
     - symbol_ids:   per-char deterministic hash of the symbol's qualified name
                     (0 = no symbol)
-    - call_targets: per-char symbol ID of the call target for CALL_EXPR tokens
+    - call_targets: per-char symbol ID on the explicit callee token
                     (0 = not a call)
-    - type_refs:    per-char symbol ID of the referenced type for TYPE_REF tokens
+    - type_refs:    per-char symbol ID on TYPE_REF/TEMPLATE_REF name tokens
                     (0 = not a type reference)
     - def_use:      per-char def/use marker (0=none, 1=def, 2=use)
 
@@ -1900,11 +3730,16 @@ def extract_semantic_metadata(
         dict with keys 'symbol_ids', 'call_targets', 'type_refs', 'def_use',
         each a list[int] of length len(source).
     """
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"extract_semantic_metadata({filename})",
+    )
     text_len = len(source)
     symbol_ids = [0] * text_len
     call_targets = [0] * text_len
     type_refs = [0] * text_len
     def_use = [0] * text_len
+    identity_registry = SymbolIdentityRegistry()
 
     if text_len == 0 or tu is None:
         return {
@@ -1912,6 +3747,7 @@ def extract_semantic_metadata(
             "call_targets": call_targets,
             "type_refs": type_refs,
             "def_use": def_use,
+            SYMBOL_IDENTITIES_COLUMN: [],
         }
 
     source_bytes = source.encode("utf-8")
@@ -1937,6 +3773,102 @@ def extract_semantic_metadata(
             return text_len
         return byte_to_char[byte_off]
 
+    def _register_symbol_key(symbol_key: str, cursor: Cursor) -> int:
+        return identity_registry.register(
+            symbol_key,
+            source=(
+                f"{filename}:{int(getattr(cursor.location, 'line', 0) or 0)}:"
+                f"{_cursor_kind_name(cursor)}"
+            ),
+        )
+
+    def _char_span(byte_start: int, byte_end: int) -> tuple[int, int] | None:
+        char_start = _byte_to_char_offset(byte_start)
+        char_end = _byte_to_char_offset(byte_end)
+        if char_start >= text_len or char_start >= char_end:
+            return None
+        return char_start, min(char_end, text_len)
+
+    def _cursor_name_spans(cursor: Cursor, spelling: str) -> list[tuple[int, int]]:
+        """Return only the source token(s) that spell a cursor's name."""
+        if not spelling:
+            return []
+        location = getattr(cursor, "location", None)
+        raw_location_offset = getattr(location, "offset", None)
+        location_offset = (
+            int(raw_location_offset) if raw_location_offset is not None else -1
+        )
+        spelling_bytes = spelling.encode("utf-8")
+        if (
+            location_offset >= 0
+            and source_bytes[location_offset:location_offset + len(spelling_bytes)]
+            == spelling_bytes
+        ):
+            span = _char_span(
+                location_offset,
+                location_offset + len(spelling_bytes),
+            )
+            return [span] if span is not None else []
+
+        token_spellings = {spelling}
+        if spelling.startswith("operator"):
+            operator_token = spelling.removeprefix("operator").strip()
+            if operator_token:
+                token_spellings.add(operator_token)
+        matches: list[tuple[int, int]] = []
+        for token in cursor.get_tokens():
+            if token.spelling not in token_spellings:
+                continue
+            span = _char_span(token.extent.start.offset, token.extent.end.offset)
+            if span is not None:
+                matches.append(span)
+        return matches[:1]
+
+    def _symbol_key_for_reference(ref: Cursor) -> str:
+        return symbol_identity_for_cursor(
+            ref,
+            project_dir=project_dir,
+            project=stable_project_id,
+            fallback_file=fallback_file,
+        )[0]
+
+    def _call_target_spans(
+        call_cursor: Cursor,
+        target: Cursor,
+        target_key: str,
+    ) -> list[tuple[int, int]]:
+        def find_reference(node: Cursor) -> list[tuple[int, int]]:
+            for child in node.get_children():
+                child_kind = _cursor_kind(child)
+                if child_kind in _REFERENCE_KINDS:
+                    child_target = child.referenced
+                    if (
+                        child_target is not None
+                        and child_target.spelling
+                        and _symbol_key_for_reference(child_target) == target_key
+                    ):
+                        spans = _cursor_name_spans(child, child_target.spelling)
+                        if spans:
+                            return spans
+                if child_kind not in _CALL_KINDS:
+                    spans = find_reference(child)
+                    if spans:
+                        return spans
+            return []
+
+        return find_reference(call_cursor) or _cursor_name_spans(
+            call_cursor,
+            target.spelling,
+        )
+
+    def _annotate(
+        values: list[int],
+        spans: Iterable[tuple[int, int]],
+        value: int,
+    ) -> None:
+        for span_start, span_end in spans:
+            values[span_start:span_end] = [value] * (span_end - span_start)
+
     def _visit(cursor):
         """Walk the AST and annotate char ranges."""
         loc = cursor.location
@@ -1945,43 +3877,39 @@ def extract_semantic_metadata(
         if loc.file.name != filename:
             return
 
-        extent = cursor.extent
-        if not extent:
-            return
-
-        start_offset = extent.start.offset
-        end_offset = extent.end.offset
-        if start_offset >= end_offset:
-            return
-
-        # Convert to char offsets
-        char_start = _byte_to_char_offset(start_offset)
-        char_end = _byte_to_char_offset(end_offset)
-        if char_start >= text_len or char_start >= char_end:
-            return
-
-        char_end = min(char_end, text_len)
-        kind = cursor.kind
+        kind = _cursor_kind(cursor)
 
         # Symbol identification: get qualified name for definitions and refs
         qname = ""
         if kind in _DEFINITION_KINDS and cursor.is_definition():
             qname = get_qualified_name(cursor)
             if qname:
-                sym_id = _compute_symbol_id(qname)
-                for ci in range(char_start, char_end):
-                    symbol_ids[ci] = sym_id
-                    def_use[ci] = DEF_USE_DEF
+                symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                    cursor,
+                    project_dir=project_dir,
+                    project=stable_project_id,
+                    fallback_file=fallback_file,
+                )
+                sym_id = _register_symbol_key(symbol_key, cursor)
+                spans = _cursor_name_spans(cursor, cursor.spelling)
+                _annotate(symbol_ids, spans, sym_id)
+                _annotate(def_use, spans, DEF_USE_DEF)
 
         elif kind in _REFERENCE_KINDS:
             ref = cursor.referenced
             if ref and ref.spelling:
                 qname = get_qualified_name(ref)
                 if qname:
-                    sym_id = _compute_symbol_id(qname)
-                    for ci in range(char_start, char_end):
-                        symbol_ids[ci] = sym_id
-                        def_use[ci] = DEF_USE_USE
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=stable_project_id,
+                        fallback_file=fallback_file,
+                    )
+                    sym_id = _register_symbol_key(symbol_key, ref)
+                    spans = _cursor_name_spans(cursor, ref.spelling)
+                    _annotate(symbol_ids, spans, sym_id)
+                    _annotate(def_use, spans, DEF_USE_USE)
 
         # Call target annotation
         if kind in _CALL_KINDS:
@@ -1989,9 +3917,18 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 target_qname = get_qualified_name(ref)
                 if target_qname:
-                    target_id = _compute_symbol_id(target_qname)
-                    for ci in range(char_start, char_end):
-                        call_targets[ci] = target_id
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=stable_project_id,
+                        fallback_file=fallback_file,
+                    )
+                    target_id = _register_symbol_key(symbol_key, ref)
+                    _annotate(
+                        call_targets,
+                        _call_target_spans(cursor, ref, symbol_key),
+                        target_id,
+                    )
 
         # Type reference annotation
         if kind in _TYPE_REF_KINDS:
@@ -1999,26 +3936,32 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 ref_qname = get_qualified_name(ref)
                 if ref_qname:
-                    ref_id = _compute_symbol_id(ref_qname)
-                    for ci in range(char_start, char_end):
-                        type_refs[ci] = ref_id
+                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                        ref,
+                        project_dir=project_dir,
+                        project=stable_project_id,
+                        fallback_file=fallback_file,
+                    )
+                    ref_id = _register_symbol_key(symbol_key, ref)
+                    _annotate(
+                        type_refs,
+                        _cursor_name_spans(cursor, ref.spelling),
+                        ref_id,
+                    )
 
         # Recurse into children
         for child in cursor.get_children():
             _visit(child)
 
-    try:
-        for child in tu.cursor.get_children():
-            _visit(child)
-    except (RecursionError, Exception):
-        # Graceful degradation: return whatever we have so far
-        pass
+    for child in tu.cursor.get_children():
+        _visit(child)
 
     return {
         "symbol_ids": symbol_ids,
         "call_targets": call_targets,
         "type_refs": type_refs,
         "def_use": def_use,
+        SYMBOL_IDENTITIES_COLUMN: identity_registry.records(),
     }
 
 
@@ -2026,13 +3969,16 @@ def extract_semantic_metadata_from_parts(
     full_text: str,
     parts_info: list[PartInfo],
     index: ProjectIndex,
+    part_functions: dict[int, FunctionDef] | None = None,
+    part_semantic_arrays: dict[int, dict[str, object]] | None = None,
 ) -> dict:
     """Produce semantic metadata from pre-extracted parts without running libclang.
 
     This is the offline path used when the enriched doc is built from
     already-parsed FunctionDef objects. It assigns symbol_ids and def_use
-    based on the parts_info metadata (qname, kind) and the call graph in
-    the ProjectIndex.
+    based on canonical part metadata and the call graph in the ProjectIndex.
+    A display qname may resolve an already-indexed unique symbol but never
+    synthesizes identity on its own.
 
     Returns:
         dict with keys 'symbol_ids', 'call_targets', 'type_refs', 'def_use',
@@ -2044,6 +3990,26 @@ def extract_semantic_metadata_from_parts(
     type_refs = [0] * text_len
     def_use_arr = [0] * text_len
 
+    def _named_token_spans(text: str, name: str) -> list[tuple[int, int]]:
+        simple_name = name.split("::")[-1]
+        if not simple_name:
+            return []
+        return [
+            (match.start(), match.end())
+            for match in _iter_code_identifiers(text)
+            if match.group(0) == simple_name
+        ]
+
+    def _annotate_part_spans(
+        values: list[int],
+        spans: Iterable[tuple[int, int]],
+        value: int,
+        *,
+        part_offset: int,
+    ) -> None:
+        for start, end in spans:
+            values[part_offset + start:part_offset + end] = [value] * (end - start)
+
     offset = 0
     for i, part in enumerate(parts_info):
         part_text = part[0]
@@ -2053,36 +4019,102 @@ def extract_semantic_metadata_from_parts(
             break
 
         qname = part[4] if len(part) > 4 else None
+        symbol_key = _part_symbol_key(part) or (
+            index.resolve_function_key(qname) if isinstance(qname, str) else None
+        ) or (
+            index.resolve_type_key(qname) if isinstance(qname, str) else None
+        )
+
+        exact_semantics = (part_semantic_arrays or {}).get(i)
+        exact_applied = False
+        if exact_semantics is not None:
+            exact_values = (
+                exact_semantics.get("symbol_ids"),
+                exact_semantics.get("call_targets"),
+                exact_semantics.get("type_refs"),
+                exact_semantics.get("def_use"),
+            )
+            if all(value is not None and len(value) == part_len for value in exact_values):
+                symbol_ids[offset:offset + part_len] = list(exact_values[0])
+                call_targets[offset:offset + part_len] = list(exact_values[1])
+                type_refs[offset:offset + part_len] = list(exact_values[2])
+                def_use_arr[offset:offset + part_len] = list(exact_values[3])
+                exact_applied = True
 
         if qname:
-            sym_id = _compute_symbol_id(qname)
-            # Function parts are definition sites
-            for ci in range(offset, offset + part_len):
-                symbol_ids[ci] = sym_id
-                def_use_arr[ci] = DEF_USE_DEF
+            func_def = (part_functions or {}).get(i)
+            if func_def is None:
+                func_key = index.resolve_function_key(symbol_key) or index.resolve_function_key(qname)
+                func_def = index.functions.get(func_key) if func_key is not None else None
+            if not exact_applied and (
+                func_def is not None
+                and len(func_def.semantic_symbol_ids) == part_len
+                and len(func_def.semantic_call_targets) == part_len
+                and len(func_def.semantic_type_refs) == part_len
+                and len(func_def.semantic_def_use) == part_len
+            ):
+                symbol_ids[offset:offset + part_len] = func_def.semantic_symbol_ids[:]
+                call_targets[offset:offset + part_len] = func_def.semantic_call_targets[:]
+                type_refs[offset:offset + part_len] = func_def.semantic_type_refs[:]
+                def_use_arr[offset:offset + part_len] = func_def.semantic_def_use[:]
+            elif not exact_applied and symbol_key:
+                sym_id = _compute_symbol_id(symbol_key)
+                definition_spans = _named_token_spans(part_text, str(part[3]))
+                if func_def is not None and definition_spans:
+                    open_paren = part_text.find("(")
+                    before_parameters = [
+                        span for span in definition_spans if span[0] < open_paren
+                    ]
+                    definition_spans = [
+                        (before_parameters or definition_spans)[-1]
+                    ]
+                elif definition_spans:
+                    definition_spans = definition_spans[:1]
+                _annotate_part_spans(
+                    symbol_ids,
+                    definition_spans,
+                    sym_id,
+                    part_offset=offset,
+                )
+                _annotate_part_spans(
+                    def_use_arr,
+                    definition_spans,
+                    DEF_USE_DEF,
+                    part_offset=offset,
+                )
 
-            # Annotate call_targets + type_refs by marking each referenced
-            # name's occurrences within this part (approximate call-site / type-
-            # use spans; exact char offsets would need a re-parse). This replaces
-            # the old 1-char-per-callee stub and the never-written type_refs.
-            func_def = index.functions.get(qname)
-            if func_def:
+            if (
+                not exact_applied
+                and func_def
+                and not any(call_targets[offset:offset + part_len])
+            ):
                 def _mark(arr, name, value):
                     if not name or not value:
                         return
-                    s = 0
-                    plen = len(name)
-                    while True:
-                        idx = part_text.find(name, s)
-                        if idx < 0:
-                            break
-                        for ci in range(offset + idx, min(offset + idx + plen, offset + part_len)):
-                            arr[ci] = value
-                        s = idx + plen
+                    _annotate_part_spans(
+                        arr,
+                        _named_token_spans(part_text, name),
+                        value,
+                        part_offset=offset,
+                    )
                 for callee_qname in func_def.callees:
-                    _mark(call_targets, callee_qname.split('::')[-1], _compute_symbol_id(callee_qname))
+                    callee_key = index.resolve_function_key(callee_qname)
+                    if callee_key is None:
+                        continue
+                    _mark(
+                        call_targets,
+                        callee_qname.split('::')[-1],
+                        _compute_symbol_id(callee_key),
+                    )
                 for type_qname in getattr(func_def, 'referenced_types', []):
-                    _mark(type_refs, type_qname.split('::')[-1], _compute_symbol_id(type_qname))
+                    type_key = index.resolve_type_key(type_qname)
+                    if type_key is None:
+                        continue
+                    _mark(
+                        type_refs,
+                        type_qname.split('::')[-1],
+                        _compute_symbol_id(type_key),
+                    )
 
         elif kind == 1:  # PREAMBLE
             # Preamble: mark as use sites (references to included entities)
@@ -2102,6 +4134,139 @@ def extract_semantic_metadata_from_parts(
 
 
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_RAW_LITERAL_PREFIXES = ('u8R"', 'uR"', 'UR"', 'LR"', 'R"')
+_QUOTED_LITERAL_PREFIXES = (
+    'u8"', "u8'", 'u"', "u'", 'U"', "U'", 'L"', "L'", '"', "'",
+)
+_IDENTIFIER_CHARS = frozenset(
+    "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
+
+
+def _mask_non_code(text: str) -> str:
+    """Blank comments and literals while preserving offsets and newlines."""
+    masked = list(text)
+    text_len = len(text)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, min(end, text_len)):
+            if text[index] not in "\r\n":
+                masked[index] = " "
+
+    def prefixed_at(index: int, prefixes: Sequence[str]) -> str | None:
+        for prefix in prefixes:
+            if not text.startswith(prefix, index):
+                continue
+            if (
+                prefix[0].isalpha()
+                and index > 0
+                and text[index - 1] in _IDENTIFIER_CHARS
+            ):
+                continue
+            return prefix
+        return None
+
+    def include_literal_suffix(end: int) -> int:
+        while end < text_len and text[end] in _IDENTIFIER_CHARS:
+            end += 1
+        return end
+
+    index = 0
+    while index < text_len:
+        if text.startswith("//", index):
+            end = index + 2
+            while True:
+                newline = text.find("\n", end)
+                if newline < 0:
+                    end = text_len
+                    break
+                slash_index = newline - 1
+                if slash_index >= index and text[slash_index] == "\r":
+                    slash_index -= 1
+                continued = slash_index >= index and text[slash_index] == "\\"
+                end = newline + 1
+                if not continued:
+                    break
+            blank(index, end)
+            index = end
+            continue
+
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            end = text_len if close < 0 else close + 2
+            blank(index, end)
+            index = end
+            continue
+
+        raw_prefix = prefixed_at(index, _RAW_LITERAL_PREFIXES)
+        if raw_prefix is not None:
+            delimiter_start = index + len(raw_prefix)
+            open_paren = text.find("(", delimiter_start, delimiter_start + 17)
+            if open_paren >= 0:
+                delimiter = text[delimiter_start:open_paren]
+                if not any(char in " ()\\\t\v\f\r\n" for char in delimiter):
+                    marker = ")" + delimiter + '"'
+                    close = text.find(marker, open_paren + 1)
+                    end = text_len if close < 0 else close + len(marker)
+                    end = include_literal_suffix(end)
+                    blank(index, end)
+                    index = end
+                    continue
+
+        quoted_prefix = prefixed_at(index, _QUOTED_LITERAL_PREFIXES)
+        if quoted_prefix is not None:
+            quote = quoted_prefix[-1]
+            end = index + len(quoted_prefix)
+            while end < text_len:
+                char = text[end]
+                if char == "\\":
+                    if end + 1 < text_len and text[end + 1] == "\r":
+                        end += 3 if end + 2 < text_len and text[end + 2] == "\n" else 2
+                    else:
+                        end += 2
+                    continue
+                if char == quote:
+                    end += 1
+                    break
+                if char in "\r\n":
+                    break
+                end += 1
+            end = include_literal_suffix(end)
+            blank(index, end)
+            index = end
+            continue
+
+        index += 1
+
+    return "".join(masked)
+
+
+def _split_source_and_masked_lines(text: str) -> tuple[list[str], list[str]]:
+    """Split source and its mask at the exact same physical boundaries."""
+
+    masked = _mask_non_code(text)
+    if len(masked) != len(text):
+        raise RuntimeError(
+            "non-code mask changed source length: "
+            f"source={len(text)} masked={len(masked)}"
+        )
+    source_lines = text.splitlines(keepends=True)
+    code_lines: list[str] = []
+    offset = 0
+    for line in source_lines:
+        end = offset + len(line)
+        code_lines.append(masked[offset:end])
+        offset = end
+    if offset != len(text):
+        raise RuntimeError(
+            "source line split did not cover complete input: "
+            f"covered={offset} source={len(text)}"
+        )
+    return source_lines, code_lines
+
+
+def _iter_code_identifiers(text: str) -> Iterator[re.Match[str]]:
+    return _IDENTIFIER_RE.finditer(_mask_non_code(text))
 
 
 def _apply_char_span(values: list[int], start: int, end: int, value: int) -> None:
@@ -2188,7 +4353,7 @@ def _macro_body_dependency_names(
     out: list[str] = []
     seen: set[str] = set()
     body = source[body_start:]
-    for match in _IDENTIFIER_RE.finditer(body):
+    for match in _iter_code_identifiers(body):
         dep_name = match.group(0)
         if dep_name in ignored or dep_name.lower() in _CONDITION_SKIP_IDENTIFIERS:
             continue
@@ -2205,6 +4370,7 @@ def _macro_part_metadata(macro: MacroDef) -> dict[str, object]:
         "name": macro.name,
         "file": macro.file,
         "line": macro.line,
+        "project_id": macro.project_id,
         "visible_in_file": macro.visible_in_file,
         "visible_line": macro.visible_line,
         "sequence": macro.sequence,
@@ -2244,7 +4410,7 @@ def _macro_route_part(
         condition_spans: list[dict[str, object]] = []
         if condition_name_set:
             prefix = part_text[:start]
-            for match in _IDENTIFIER_RE.finditer(prefix):
+            for match in _iter_code_identifiers(prefix):
                 if match.group(0) not in condition_name_set:
                     continue
                 condition_spans.append(
@@ -2319,7 +4485,7 @@ def _macro_invocation_route_parts(
         (start, end) for start, end, _name, _macro_text in extract_macro_blocks(part_text)
     ]
     routes: list[dict[str, object]] = []
-    for match in _IDENTIFIER_RE.finditer(part_text):
+    for match in _iter_code_identifiers(part_text):
         if any(start <= match.start() < end for start, end in macro_ranges):
             continue
         source_line = _source_line_for_text_offset(
@@ -2350,6 +4516,12 @@ def _cpp_domain_sidecars(
     text: str,
     index: ProjectIndex | None = None,
     *,
+    source_doc_id: int | None = None,
+    source_path: str = "assembled.cpp",
+    project_id: str | None = None,
+    fragment_sources: list[
+        tuple[int, int, str, int] | tuple[int, int, str, int, str | None]
+    ] | None = None,
     macro_parts: list[dict[str, object]] | None = None,
     macro_invocations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
@@ -2369,6 +4541,7 @@ def _cpp_domain_sidecars(
     )
 
     text_len = len(text)
+    resolved_source_doc_id = int(source_doc_id or 1)
     domain = int(DomainKind.CPP)
     role_ids = [0] * text_len
     entity_ids = [0] * text_len
@@ -2386,7 +4559,7 @@ def _cpp_domain_sidecars(
         for line_match in re.finditer(r"(?m)^\s*#\s*(if|ifdef|ifndef|elif)\b.*$", prefix):
             line = line_match.group(0)
             abs_line_start = block_start + line_match.start()
-            for ident in _IDENTIFIER_RE.finditer(line):
+            for ident in _iter_code_identifiers(line):
                 name = ident.group(0)
                 if name.lower() in _CONDITION_SKIP_IDENTIFIERS or name in {
                     "if",
@@ -2429,7 +4602,7 @@ def _cpp_domain_sidecars(
             )
             _apply_char_span(entity_ids, start + param_start, start + param_end, param_entity)
             body = macro_text[body_start:]
-            for use in _IDENTIFIER_RE.finditer(body):
+            for use in _iter_code_identifiers(body):
                 if use.group(0) != param_name:
                     continue
                 use_start = start + body_start + use.start()
@@ -2656,7 +4829,7 @@ def _cpp_domain_sidecars(
             )
             routed_invocation_spans.add((use_start, use_end))
 
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             if (match.start(), match.end()) in routed_invocation_spans:
                 continue
             definitions = by_name.get(match.group(0), [])
@@ -2692,7 +4865,7 @@ def _cpp_domain_sidecars(
                 )
 
     if not use_precise_macro_graph and index is not None and macro_definitions_by_name:
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             definitions = macro_definitions_by_name.get(match.group(0), [])
             if not definitions:
                 continue
@@ -2726,19 +4899,80 @@ def _cpp_domain_sidecars(
         seen_edges.add(key)
         deduped_domain_edges.append(edge)
 
+    from cppmega_mlx.data.domain_ingestion import parse_domain_document
+
+    lexical = parse_domain_document(
+        source_path,
+        text,
+        source_doc_id=resolved_source_doc_id,
+    ).to_enriched_document()
+    if fragment_sources:
+        source_doc_ids = [0] * text_len
+        source_identity_ids = [0] * text_len
+        registry: dict[int, dict[str, int | str]] = {}
+        for fragment in fragment_sources:
+            start, end, fragment_path, row_local_id = fragment[:4]
+            fragment_project_id = fragment[4] if len(fragment) >= 5 else project_id
+            identity = _source_identity_for_project_path(
+                fragment_path,
+                project_id=fragment_project_id,
+            )
+            entry = identity.as_dict()
+            previous = registry.get(identity.source_identity_id)
+            if previous is not None and previous != entry:
+                raise ValueError(
+                    f"source identity uint64 collision for id {identity.source_identity_id}"
+                )
+            registry[identity.source_identity_id] = entry
+            for char_idx in range(max(0, start), min(end, text_len)):
+                source_doc_ids[char_idx] = int(row_local_id)
+                source_identity_ids[char_idx] = identity.source_identity_id
+        if any(value == 0 for value in source_doc_ids + source_identity_ids):
+            raise ValueError("assembled source provenance does not cover every character")
+        lexical["domain_source_doc_ids"] = source_doc_ids
+        lexical["domain_source_identity_ids"] = source_identity_ids
+        lexical["source_identity_registry"] = list(registry.values())
+    lexical_domains = cast(list[int], lexical["domain_ids"])
+    lexical_roles = cast(list[int], lexical["domain_role_ids"])
+    lexical_entities = cast(list[int], lexical["domain_entity_ids"])
+    lexical_confidence = cast(list[int], lexical["domain_confidence_ids"])
+    for edge in cast(list[dict[str, int]], lexical["domain_edges"]):
+        key = (int(edge["from_char"]), int(edge["to_char"]), int(edge["kind"]))
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        deduped_domain_edges.append(edge)
+    for char_idx in range(text_len):
+        is_embedded = lexical_domains[char_idx] != domain
+        if is_embedded or role_ids[char_idx] == int(DomainRoleKind.NONE):
+            role_ids[char_idx] = lexical_roles[char_idx]
+        if is_embedded or entity_ids[char_idx] == 0:
+            entity_ids[char_idx] = lexical_entities[char_idx]
+
+    cross_domain_edges = cast(list[dict[str, int]], lexical["cross_domain_edges"])
+    embedded_domain_spans = cast(list[dict[str, int]], lexical["embedded_domain_spans"])
+    confidence_ids = [int(ParseConfidence.EXACT)] * text_len
+    for char_idx, lexical_domain in enumerate(lexical_domains):
+        if lexical_domain != domain:
+            confidence_ids[char_idx] = lexical_confidence[char_idx]
+
     return {
         "domain_kind": domain,
-        "domain_ids": [domain] * text_len,
+        "domain_ids": lexical_domains,
         "domain_role_ids": role_ids,
         "domain_entity_ids": entity_ids,
         "domain_scope_ids": [0] * text_len,
-        "domain_source_doc_ids": [0] * text_len,
-        "domain_confidence_ids": [int(ParseConfidence.EXACT)] * text_len,
+        "domain_source_doc_ids": lexical["domain_source_doc_ids"],
+        "domain_source_identity_ids": lexical["domain_source_identity_ids"],
+        "source_identity_registry": lexical["source_identity_registry"],
+        "domain_confidence_ids": confidence_ids,
         "domain_edges": deduped_domain_edges,
         "build_edges": [],
         "shell_edges": [],
         "diagnostic_edges": [],
-        "cross_domain_edges": [],
+        "cross_domain_edges": cross_domain_edges,
+        "embedded_domain_spans": embedded_domain_spans,
+        "domain_parse_info": lexical["domain_parse_info"],
     }
 
 
@@ -2748,6 +4982,8 @@ def build_enriched_doc(
     filepath: str | None = None,
     compile_args: list[str] | None = None,
     build_info: dict | None = None,
+    *,
+    project_id: str | None = None,
 ) -> dict:
     """Build enriched document from parts with metadata.
 
@@ -2761,6 +4997,11 @@ def build_enriched_doc(
         dict with text, structure_ids, chunk_boundaries, call_edges, type_edges,
         ast_depth, sibling_index, ast_node_type
     """
+    stable_project_id = (
+        require_project_identity(project_id, source="build_enriched_doc")
+        if project_id is not None
+        else None
+    )
     texts = [p[0] for p in parts_info]
     full_text = '\n\n'.join(texts)
     text_len = len(full_text)
@@ -2769,14 +5010,112 @@ def build_enriched_doc(
     chunk_boundaries = []
     offset = 0
 
-    # Map chunk_idx -> qname for edge computation
-    chunk_qnames = {}        # local function chunks (call-edge SOURCES; carry callees)
-    chunk_target_qnames = {} # call-edge TARGETS: local funcs + cross-lib base-lib pulls
+    # Map chunk_idx -> canonical symbol identity for edge computation.
+    chunk_symbols = {}       # local function chunks (call-edge SOURCES; carry callees)
+    chunk_target_symbols = {} # local funcs + cross-lib base-lib pull targets
     chunk_callees = {}
-    chunk_all_qnames = {}    # ANY named chunk incl. type defs (type-edge targets)
+    chunk_all_symbols = {}   # ANY named chunk incl. type defs (type-edge targets)
     chunk_types = {}         # referenced_types per function chunk (type-edge sources)
+    chunk_ranges: dict[int, tuple[int, int]] = {}
+    call_target_id_rewrites: dict[int, dict[int, int]] = defaultdict(dict)
     macro_route_parts: list[dict[str, object]] = []
     macro_invocation_routes: list[dict[str, object]] = []
+    crosslink_targets: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for candidate_part in parts_info:
+        source = _part_dep_source(candidate_part)
+        metadata = _part_symbol_metadata(candidate_part)
+        candidate_qname = candidate_part[4] if len(candidate_part) > 4 else None
+        if (
+            source is not None
+            and source.startswith("crosslib:")
+            and metadata is not None
+            and isinstance(candidate_qname, str)
+        ):
+            crosslink_targets[
+                normalize_inline_namespace_qname(candidate_qname)
+            ].append(metadata)
+
+    def _resolve_pulled_crosslink(reference: str | SymbolReference) -> str | None:
+        if isinstance(reference, dict):
+            qname = normalize_inline_namespace_qname(
+                str(reference.get("qname") or "")
+            )
+            candidates = list(crosslink_targets.get(qname, []))
+            if not candidates:
+                return None
+            identity_filter_used = False
+            usr = str(reference.get("usr") or "")
+            if usr:
+                identity_filter_used = True
+                candidates = [target for target in candidates if target.get("usr") == usr]
+            else:
+                reference_key = str(reference.get("symbol_key") or "")
+                signature = _normalize_signature_text(
+                    str(reference.get("canonical_signature") or "")
+                )
+                if signature:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if _normalize_signature_text(
+                            str(target.get("canonical_signature") or "")
+                        ) == signature
+                    ]
+                symbol_kind = str(reference.get("symbol_kind") or "")
+                if symbol_kind:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if str(target.get("kind") or "") == symbol_kind
+                    ]
+                if not identity_filter_used and reference_key:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if target.get("symbol_key") == reference_key
+                    ]
+            provider = str(reference.get("provider") or "")
+            if provider:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if str(target.get("provider") or "") == provider
+                ]
+            include_provenance = str(reference.get("include_provenance") or "")
+            if include_provenance:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if str(target.get("include_provenance") or "")
+                    == include_provenance
+                ]
+            if not identity_filter_used:
+                return None
+        else:
+            qname = normalize_inline_namespace_qname(reference)
+            candidates = [
+                target
+                for target in crosslink_targets.get(qname, [])
+                if str(target.get("canonical_signature") or "").startswith(
+                    "legacy-kind="
+                )
+            ]
+        if len(candidates) > 1:
+            raise SymbolIdentityError(
+                f"ambiguous pulled crosslink for {qname!r}: "
+                f"{[target.get('symbol_key') for target in candidates[:8]]}"
+            )
+        if len(candidates) != 1:
+            return None
+        key = candidates[0].get("symbol_key")
+        return key if isinstance(key, str) and key else None
+
+    fragment_sources: list[tuple[int, int, str, int, str | None]] = []
 
     for i, part in enumerate(parts_info):
         part_text, kind, dep_level, name, qname = part[0], part[1], part[2], part[3], part[4]
@@ -2785,6 +5124,24 @@ def build_enriched_doc(
         part_len = len(part_text)
         if offset + part_len > text_len:
             break
+        chunk_ranges[i] = (offset, offset + part_len)
+        fragment_end = offset + part_len + (2 if i < len(parts_info) - 1 else 0)
+        fragment_sources.append(
+            (
+                offset,
+                fragment_end,
+                _part_source_path(part, index, filepath or "assembled.cpp"),
+                i + 1,
+                (
+                    require_project_identity(
+                        dep_source.removeprefix("crosslib:"),
+                        source=f"crosslib source for {name}",
+                    )
+                    if dep_source is not None and dep_source.startswith("crosslib:")
+                    else stable_project_id
+                ),
+            )
+        )
 
         # Fill structure_ids
         for j in range(offset, offset + part_len):
@@ -2797,28 +5154,56 @@ def build_enriched_doc(
             'dep_level': dep_level,
             'name': name,
         }
+        symbol_metadata = _part_symbol_metadata(part)
+        if symbol_metadata is not None:
+            boundary['symbol_id'] = int(symbol_metadata['symbol_id'])
         # Tag cross-repo base-lib pulls with their provenance so the model knows
         # this chunk is a base-lib impl and which lib it came from.
         if dep_source is not None:
             boundary['dep_source'] = dep_source
         chunk_boundaries.append(boundary)
 
-        # Track qnames for edge computation.
+        part_symbol_key = _part_symbol_key(part)
+        # Track identities for edge computation. qname only resolves when
+        # unambiguous; ambiguous qnames intentionally do not create graph edges.
         if qname:
-            chunk_all_qnames[i] = qname
+            resolved_type_key = part_symbol_key or index.resolve_type_key(qname)
+            resolved_func_key = part_symbol_key or index.resolve_function_key(qname)
+            if resolved_type_key:
+                chunk_all_symbols[i] = resolved_type_key
             # Call-edge TARGET candidates = local function chunks AND cross-lib
             # base-lib pulls (a pulled def is a real callee target even though it
             # is not in the LOCAL index). This lets root->base-lib call_edges
             # resolve to the pulled chunk.
-            if qname in index.functions or (
+            if (resolved_func_key and resolved_func_key in index.functions) or (
                 dep_source is not None and dep_source.startswith("crosslib:")
             ):
-                chunk_target_qnames[i] = qname
-        if qname and qname in index.functions:
-            func = index.functions[qname]
-            chunk_qnames[i] = qname
-            chunk_callees[i] = func.callees
-            chunk_types[i] = getattr(func, 'referenced_types', [])
+                target_key = part_symbol_key or resolved_func_key
+                if target_key:
+                    chunk_target_symbols[i] = target_key
+        if qname:
+            func_key = part_symbol_key or index.resolve_function_key(qname)
+        else:
+            func_key = None
+        if func_key and func_key in index.functions:
+            func = index.functions[func_key]
+            chunk_symbols[i] = func_key
+            callee_refs = index._function_callee_keys(func)
+            for ref in getattr(func, "baselib_callee_refs", []):
+                ref_key = _resolve_pulled_crosslink(ref)
+                if isinstance(ref_key, str) and ref_key and ref_key not in callee_refs:
+                    callee_refs.append(ref_key)
+                    source_key = ref.get("symbol_key")
+                    if isinstance(source_key, str) and source_key != ref_key:
+                        call_target_id_rewrites[i][
+                            _compute_symbol_id(source_key)
+                        ] = _compute_symbol_id(ref_key)
+            for ref in list(func.callees) + list(getattr(func, "baselib_callees", [])):
+                edge_key = _resolve_pulled_crosslink(ref)
+                if edge_key is not None and edge_key not in callee_refs:
+                    callee_refs.append(edge_key)
+            chunk_callees[i] = callee_refs
+            chunk_types[i] = index._function_referenced_type_keys(func)
             macro_invocation_routes.extend(
                 _macro_invocation_route_parts(
                     part_text,
@@ -2843,20 +5228,20 @@ def build_enriched_doc(
     # Compute call_edges. Sources are local function chunks (they carry callees);
     # targets include local function chunks AND cross-lib base-lib pulls.
     call_edges = []
-    for ci, caller_qname in chunk_qnames.items():
+    for ci, caller_symbol in chunk_symbols.items():
         callees = chunk_callees.get(ci, [])
-        for callee_qname in callees:
-            for cj, target_qname in chunk_target_qnames.items():
-                if ci != cj and target_qname == callee_qname:
+        for callee_symbol in callees:
+            for cj, target_symbol in chunk_target_symbols.items():
+                if ci != cj and target_symbol == callee_symbol:
                     call_edges.append({'from': ci, 'to': cj})
 
     # Compute type_edges: a function chunk referencing type T -> the chunk that
     # defines T (mirror of the call_edges loop, over referenced_types).
     type_edges: list[dict[str, object]] = []
     for ci, ref_types in chunk_types.items():
-        for t in ref_types:
-            for cj, q in chunk_all_qnames.items():
-                if ci != cj and q == t:
+        for type_symbol in ref_types:
+            for cj, symbol in chunk_all_symbols.items():
+                if ci != cj and symbol == type_symbol:
                     type_edges.append({'from': ci, 'to': cj})
 
     ast_depth, sibling_index, ast_node_type = extract_ast_metadata_from_parts(
@@ -2881,10 +5266,30 @@ def build_enriched_doc(
 
     # Extract semantic metadata (symbol IDs, call targets, type refs, def-use)
     semantic_meta = extract_semantic_metadata_from_parts(full_text, parts_info, index)
+    for part_index, rewrites in call_target_id_rewrites.items():
+        start, end = chunk_ranges[part_index]
+        for char_index in range(start, end):
+            call_id = semantic_meta['call_targets'][char_index]
+            if call_id in rewrites:
+                semantic_meta['call_targets'][char_index] = rewrites[call_id]
+            symbol_id = semantic_meta['symbol_ids'][char_index]
+            if symbol_id in rewrites:
+                semantic_meta['symbol_ids'][char_index] = rewrites[symbol_id]
+
+    symbol_identities = _document_symbol_identities(
+        parts_info,
+        index,
+        semantic_meta['symbol_ids'],
+        semantic_meta['call_targets'],
+        semantic_meta['type_refs'],
+        source=filepath or "clang enriched document",
+    )
 
     result = {
         'text': full_text,
         'doc_type': 'code',
+        'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: symbol_identities,
         'filepath': filepath or '',
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
@@ -2900,10 +5305,21 @@ def build_enriched_doc(
         **_cpp_domain_sidecars(
             full_text,
             index,
+            source_doc_id=1,
+            source_path=filepath or "assembled.cpp",
+            project_id=stable_project_id,
+            fragment_sources=fragment_sources,
             macro_parts=macro_route_parts,
             macro_invocations=macro_invocation_routes,
         ),
     }
+    if stable_project_id is not None:
+        result.update(
+            _project_path_provenance(
+                stable_project_id,
+                filepath or "assembled.cpp",
+            )
+        )
     language_info = detect_language_info(
         full_text,
         filepath,
@@ -2924,14 +5340,22 @@ def build_enriched_doc(
 # --------------------------------------------------------------------------- #
 # Build-file doc emission (ADDITIVE).
 #
-# A build file is emitted as a 'build' enriched doc with the SAME dict shape as
-# build_enriched_doc, but: full raw text; structure_ids ALL set to BUILD_KIND=9
+# A build-file chunk is emitted as a 'build' enriched doc with the SAME dict
+# shape as build_enriched_doc, but: exact span text; structure_ids ALL set to
+# BUILD_KIND=9
 # (extends the 0-8 code-kind vocab); EMPTY call/type/symbol graph (correct --
 # build files are not C++, like commit docs on the code channels); a doc_type of
 # 'build'; and a language_info whose primary_language is the build-system tag
 # (cmake/make/bazel/ninja/meson/...). platform_info / build_info carry the
 # derived A-platform signal where available. NO libclang involved.
-def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
+def _build_domain_sidecars(
+    text: str,
+    build_kind: str,
+    *,
+    filepath: str | None = None,
+    source_doc_id: int,
+    project_id: str | None = None,
+) -> dict[str, object]:
     """Parse build-system text into char-aligned domain sidecars.
 
     The Clang path emits C++ call/type graph metadata.  Build systems need a
@@ -2941,33 +5365,64 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
     positions after tokenizer normalization.
     """
 
-    from cppmega_mlx.data.domain_schema import DomainKind, ParseConfidence
-    from cppmega_mlx.data.build_parsers import (
-        parse_autoconf,
-        parse_automake,
-        parse_bazel,
-        parse_cmake,
-        parse_make,
-        parse_ninja,
+    from cppmega_mlx.data.build_parsers.base import ParsedDomainDocument
+    from cppmega_mlx.data.domain_ingestion import (
+        parse_domain_document,
+        resolve_domain_parser,
     )
-    from cppmega_mlx.data.shell_parsers import parse_sh
+    from cppmega_mlx.data.domain_schema import (
+        DomainKind,
+        ParseConfidence,
+        domain_edge_family,
+    )
 
     kind = build_kind.lower().replace("-", "_")
-    if kind in {"cmake", "cmakelists"}:
-        parsed = parse_cmake(text)
-    elif kind in {"make", "gmake", "makefile"}:
-        parsed = parse_make(text)
-    elif kind in {"automake", "makefile_am"}:
-        parsed = parse_automake(text)
-    elif kind in {"autoconf", "configure_ac", "configure_in"}:
-        parsed = parse_autoconf(text)
-    elif kind == "configure":
-        parsed = parse_sh(text)
-        parsed.metadata["build_kind"] = "configure"
-    elif kind == "ninja":
-        parsed = parse_ninja(text)
-    elif kind in {"bazel", "build_bazel", "workspace_bazel"}:
-        parsed = parse_bazel(text)
+    parser_path_by_kind = {
+        "cmake": "CMakeLists.txt",
+        "cmakelists": "CMakeLists.txt",
+        "make": "Makefile",
+        "gmake": "Makefile",
+        "makefile": "Makefile",
+        "automake": "Makefile.am",
+        "makefile_am": "Makefile.am",
+        "autoconf": "configure.ac",
+        "configure_ac": "configure.ac",
+        "configure_in": "configure.in",
+        "configure": "configure",
+        "ninja": "build.ninja",
+        "bazel": "BUILD.bazel",
+        "build_bazel": "BUILD.bazel",
+        "workspace_bazel": "WORKSPACE.bazel",
+        "bash": "script.bash",
+        "sh": "script.sh",
+        "zsh": "script.zsh",
+        "tcsh": "script.tcsh",
+        "ksh": "script.ksh",
+        "python": "module.py",
+    }
+    parser_path = parser_path_by_kind.get(kind)
+    resolved_path = filepath or parser_path
+    resolved_adapter = (
+        resolve_domain_parser(resolved_path, text) if resolved_path is not None else None
+    )
+    if parser_path is not None:
+        parsed = parse_domain_document(
+            parser_path,
+            text,
+            source_doc_id=source_doc_id,
+        )
+        if resolved_path is not None and resolved_path != parser_path:
+            parsed.metadata["source_path"] = resolved_path
+            parsed.set_source_identity(
+                source_identity_for_path(resolved_path, text=text)
+            )
+    elif resolved_adapter is not None and resolved_adapter.name != "raw-output":
+        assert resolved_path is not None
+        parsed = parse_domain_document(
+            resolved_path,
+            text,
+            source_doc_id=source_doc_id,
+        )
     else:
         raw_domain_by_kind = {
             "meson": DomainKind.MESON,
@@ -2977,88 +5432,45 @@ def _build_domain_sidecars(text: str, build_kind: str) -> dict[str, object]:
             "compile_commands": DomainKind.COMPILE_COMMANDS,
         }
         domain = raw_domain_by_kind.get(kind, DomainKind.BUILD_DIAGNOSTIC)
-        text_len = len(text)
-        return {
-            "domain_kind": int(domain),
-            "domain_ids": [int(domain)] * text_len,
-            "domain_role_ids": [0] * text_len,
-            "domain_entity_ids": [0] * text_len,
-            "domain_scope_ids": [0] * text_len,
-            "domain_source_doc_ids": [0] * text_len,
-            "domain_confidence_ids": [int(ParseConfidence.RAW)] * text_len,
-            "domain_edges": [],
-            "build_edges": [],
-            "shell_edges": [],
-            "diagnostic_edges": [],
-            "cross_domain_edges": [],
-            "domain_parse_info": {
-                "parser": "raw",
+        parsed = ParsedDomainDocument.new(
+            domain=domain,
+            text=text,
+            confidence=ParseConfidence.RAW,
+            metadata={
+                "parser_adapter": "raw-build",
                 "build_kind": build_kind,
-                "tokens": 0,
-                "edges": 0,
+                "unsupported_syntax": f"unsupported_build_domain:{build_kind}",
+                "raw_reason": f"unsupported_build_domain:{build_kind}",
             },
-        }
+        )
+        parsed.set_source_doc_id(source_doc_id)
+        parsed.set_source_identity(
+            source_identity_for_path(resolved_path or parser_path or build_kind, text=text)
+        )
 
-    text_len = len(text)
-    domain_id = int(parsed.domain)
-    domain_ids = [domain_id] * text_len
-    role_ids = [0] * text_len
-    entity_ids = [0] * text_len
-    scope_ids = [0] * text_len
-    source_doc_ids = [0] * text_len
-    confidence_ids = [int(ParseConfidence.HEURISTIC)] * text_len
-    for token_index, token in enumerate(parsed.tokens):
-        start = max(0, min(int(token.start), text_len))
-        end = max(start, min(int(token.end), text_len))
-        if start == end:
-            continue
-        role = int(parsed.role_ids[token_index])
-        entity = int(parsed.entity_ids[token_index])
-        scope = int(parsed.scope_ids[token_index])
-        confidence = int(parsed.confidence_ids[token_index])
-        for char_idx in range(start, end):
-            role_ids[char_idx] = role
-            entity_ids[char_idx] = entity
-            scope_ids[char_idx] = scope
-            confidence_ids[char_idx] = confidence
-
-    edge_triples = [
-        {
-            "from_char": int(parsed.tokens[src].start),
-            "to_char": int(parsed.tokens[dst].start),
-            "kind": int(kind),
-        }
-        for src, dst, kind in parsed.edges
-        if 0 <= src < len(parsed.tokens) and 0 <= dst < len(parsed.tokens)
+    enriched = parsed.to_enriched_document()
+    enriched["domain_edges"] = [
+        edge
+        for edge in cast(list[dict[str, int]], enriched["domain_edges"])
+        if domain_edge_family(int(edge["kind"])) == "domain"
     ]
-    is_shell_domain = parsed.domain in {
-        DomainKind.BASH,
-        DomainKind.ZSH,
-        DomainKind.SH,
-        DomainKind.TCSH,
-    }
-    return {
-        "domain_kind": domain_id,
-        "domain_ids": domain_ids,
-        "domain_role_ids": role_ids,
-        "domain_entity_ids": entity_ids,
-        "domain_scope_ids": scope_ids,
-        "domain_source_doc_ids": source_doc_ids,
-        "domain_confidence_ids": confidence_ids,
-        "domain_edges": edge_triples,
-        "build_edges": [] if is_shell_domain else edge_triples,
-        "shell_edges": edge_triples if is_shell_domain else [],
-        "diagnostic_edges": [],
-        "cross_domain_edges": [],
-        "domain_parse_info": {
-            "parser": parsed.metadata.get("build_kind")
-            or parsed.metadata.get("shell_kind")
-            or "build",
+    if project_id is not None and resolved_path is not None:
+        identity = _source_identity_for_project_path(
+            resolved_path,
+            project_id=project_id,
+        )
+        enriched["domain_source_identity_ids"] = [
+            identity.source_identity_id
+        ] * len(text)
+        enriched["source_identity_registry"] = [identity.as_dict()]
+    enriched["domain_parse_info"].update(
+        {
+            "parser": parsed.metadata.get("parser_adapter", "raw-build"),
             "build_kind": build_kind,
-            "tokens": len(parsed.tokens),
-            "edges": len(edge_triples),
-        },
-    }
+        }
+    )
+    enriched.pop("text", None)
+    return enriched
 
 
 def build_build_doc(
@@ -3066,8 +5478,11 @@ def build_build_doc(
     text: str,
     build_kind: str,
     *,
+    source_root: str | None = None,
+    project_id: str | None = None,
     platform_info: dict | None = None,
     build_info: dict | None = None,
+    source_span: dict[str, int | str] | None = None,
 ) -> dict:
     """Build a single 'build' enriched doc from a build/compilation file.
 
@@ -3075,15 +5490,41 @@ def build_build_doc(
     before this function is called: they carry no training signal and should not
     make an otherwise valid C/C++ repo fail indexing.
     """
+    emitted_filepath = filepath
+    if source_root is not None:
+        absolute_root = os.path.abspath(source_root)
+        absolute_file = os.path.abspath(filepath)
+        try:
+            if os.path.commonpath((absolute_root, absolute_file)) == absolute_root:
+                emitted_filepath = os.path.relpath(absolute_file, absolute_root)
+        except ValueError:
+            pass
+    emitted_filepath = _canonical_project_path(emitted_filepath)
+    stable_project_id = (
+        require_project_identity(project_id, source="build_build_doc")
+        if project_id is not None
+        else None
+    )
     text_len = len(text)
-    domain_sidecars = _build_domain_sidecars(text, build_kind)
+    source_doc_id = 1
+    domain_sidecars = _build_domain_sidecars(
+        text,
+        build_kind,
+        filepath=emitted_filepath,
+        source_doc_id=source_doc_id,
+        project_id=stable_project_id,
+    )
+    if source_span is not None:
+        cast(dict[str, object], domain_sidecars["domain_parse_info"])[
+            "source_span"
+        ] = dict(source_span)
     structure_ids = [BUILD_KIND] * text_len
     chunk_boundaries = [{
         'start': 0,
         'end': text_len,
         'kind': BUILD_KIND,
         'dep_level': 0,
-        'name': os.path.basename(filepath),
+        'name': os.path.basename(emitted_filepath),
     }]
 
     # Per-file platform detection from the build text itself (additive to the
@@ -3106,21 +5547,67 @@ def build_build_doc(
     # knows which build system this is. detect_language_info has no build-system
     # output key, so we set primary_language directly (additive, rendered for
     # free by language_info_to_prefix as "// language: primary=<build_kind> ...").
+    from cppmega_mlx.data.domain_schema import DomainKind
+
+    domain = DomainKind(int(cast(int, domain_sidecars["domain_kind"])))
+    is_shell_doc = domain in {
+        DomainKind.BASH,
+        DomainKind.SH,
+        DomainKind.ZSH,
+        DomainKind.TCSH,
+        DomainKind.KSH,
+    }
+    is_python_doc = domain == DomainKind.PYTHON
+    is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
+    doc_type = (
+        "shell"
+        if is_shell_doc
+        else "code"
+        if is_python_doc
+        else "diagnostic"
+        if is_diagnostic_doc
+        else "sql"
+        if domain == DomainKind.SQL
+        else "build"
+    )
     language_info = {
         "primary_language": build_kind,
         "primary_standard": (build_info or {}).get("standard"),
         "primary_dialect": None,
         "embedded_languages": [],
-        "signals": [f"build_file:{build_kind}"],
-        "detector_sources": ["build_file"],
+        "signals": [
+            f"shell_file:{build_kind}"
+            if is_shell_doc
+            else f"code_file:{build_kind}"
+            if is_python_doc
+            else f"build_file:{build_kind}"
+        ],
+        "detector_sources": [
+            "shell_file"
+            if is_shell_doc
+            else "code_file"
+            if is_python_doc
+            else "build_file"
+        ],
         "confidence": "high",
     }
 
     result: dict[str, object] = {
         'text': text,
-        'doc_type': 'build',
+        'doc_type': doc_type,
+        'symbol_identity_schema_version': SYMBOL_IDENTITY_SCHEMA_VERSION,
+        SYMBOL_IDENTITIES_COLUMN: [],
+        'source_identity_id': int(
+            cast(
+                int,
+                cast(
+                    list[dict[str, object]],
+                    domain_sidecars["source_identity_registry"],
+                )[0]["source_identity_id"],
+            )
+        ),
         'build_kind': build_kind,
-        'filepath': filepath,
+        'filepath': emitted_filepath,
         'structure_ids': structure_ids,
         'chunk_boundaries': chunk_boundaries,
         # Build files carry NO call/type/symbol graph (not C++) -- empty/0, like
@@ -3137,10 +5624,16 @@ def build_build_doc(
         'language_info': language_info,
         **domain_sidecars,
     }
+    if stable_project_id is not None:
+        result.update(
+            _project_path_provenance(stable_project_id, emitted_filepath)
+        )
     if detected_platform:
         result['platform_info'] = detected_platform
     if build_info:
         result['build_info'] = build_info
+    if source_span is not None:
+        result['source_span'] = dict(source_span)
     return result
 
 
@@ -3153,6 +5646,18 @@ _ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
 DEFAULT_MACRO_INCLUDE_DEPTH = int(os.environ.get("CPPMEGA_MACRO_INCLUDE_DEPTH", "0"))
 DEFAULT_MACRO_INCLUDE_FILES_PER_ROOT = int(
     os.environ.get("CPPMEGA_MACRO_INCLUDE_FILES_PER_ROOT", "0")
+)
+DEFAULT_MACRO_DIRECTIVE_CACHE_ENTRIES = int(
+    os.environ.get("CPPMEGA_MACRO_DIRECTIVE_CACHE_ENTRIES", "4096")
+)
+DEFAULT_MACRO_RESOLVE_CACHE_ENTRIES = int(
+    os.environ.get("CPPMEGA_MACRO_RESOLVE_CACHE_ENTRIES", "65536")
+)
+DEFAULT_MAX_MACRO_CANDIDATES_PER_ROOT = int(
+    os.environ.get("CPPMEGA_MAX_MACRO_CANDIDATES_PER_ROOT", "200000")
+)
+DEFAULT_MAX_RETAINED_MACROS = int(
+    os.environ.get("CPPMEGA_MAX_RETAINED_MACROS", "250000")
 )
 _CONDITION_SKIP_IDENTIFIERS = {
     "defined",
@@ -3199,7 +5704,7 @@ def _is_probable_include_guard_define(macro_text: str, name: str) -> bool:
 
 def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
     """Return trainable ``#define`` logical lines, preserving continuations."""
-    lines = text.splitlines(keepends=True)
+    lines, code_lines = _split_source_and_masked_lines(text)
     blocks: list[tuple[int, int, str, str]] = []
     offset = 0
     line_offsets: list[int] = []
@@ -3210,7 +5715,7 @@ def extract_macro_blocks(text: str) -> list[tuple[int, int, str, str]]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        match = _DEFINE_RE.match(line)
+        match = _DEFINE_RE.match(code_lines[i])
         if match is None:
             i += 1
             continue
@@ -3237,10 +5742,10 @@ def _condition_macro_names(line: str) -> list[str]:
     directive = match.group(1)
     rest = match.group(2)
     if directive in {"ifdef", "ifndef"}:
-        ident = _IDENTIFIER_RE.search(rest)
+        ident = next(_iter_code_identifiers(rest), None)
         return [ident.group(0)] if ident else []
     names: list[str] = []
-    for ident in _IDENTIFIER_RE.finditer(rest):
+    for ident in _iter_code_identifiers(rest):
         name = ident.group(0)
         if name.lower() in _CONDITION_SKIP_IDENTIFIERS:
             continue
@@ -3379,11 +5884,24 @@ def register_header_macros(
     header_files: list[str],
     *,
     project_dir: str | None,
+    project_id: str,
     include_dirs: list[str] | None = None,
     max_include_depth: int | None = None,
     max_include_files_per_root: int | None = None,
     memory_limit_gb: float | None = None,
+    macro_usage_texts_by_file: dict[
+        str,
+        Sequence[str | tuple[str, int | None]],
+    ] | None = None,
+    directive_cache_entries: int | None = None,
+    resolve_cache_entries: int | None = None,
+    max_macro_candidates_per_root: int | None = None,
+    max_retained_macros: int | None = None,
 ) -> dict[str, int]:
+    stable_project_id = require_project_identity(
+        project_id,
+        source="register_header_macros",
+    )
     sequence = [0]
     directive_cache: dict[str, list[dict[str, object]]] = {}
     resolve_cache: dict[tuple[str, str], str | None] = {}
@@ -3401,11 +5919,48 @@ def register_header_macros(
         if max_include_files_per_root is None
         else int(max_include_files_per_root)
     )
+    directive_cache_entries = (
+        DEFAULT_MACRO_DIRECTIVE_CACHE_ENTRIES
+        if directive_cache_entries is None
+        else int(directive_cache_entries)
+    )
+    resolve_cache_entries = (
+        DEFAULT_MACRO_RESOLVE_CACHE_ENTRIES
+        if resolve_cache_entries is None
+        else int(resolve_cache_entries)
+    )
+    max_macro_candidates_per_root = (
+        DEFAULT_MAX_MACRO_CANDIDATES_PER_ROOT
+        if max_macro_candidates_per_root is None
+        else int(max_macro_candidates_per_root)
+    )
+    max_retained_macros = (
+        DEFAULT_MAX_RETAINED_MACROS
+        if max_retained_macros is None
+        else int(max_retained_macros)
+    )
     if max_include_depth < 0:
         raise ValueError(f"max_include_depth must be >= 0, got {max_include_depth}")
     if max_include_files_per_root < 0:
         raise ValueError(
             f"max_include_files_per_root must be >= 0, got {max_include_files_per_root}"
+        )
+    if directive_cache_entries < 0:
+        raise ValueError(
+            f"directive_cache_entries must be >= 0, got {directive_cache_entries}"
+        )
+    if resolve_cache_entries < 0:
+        raise ValueError(
+            f"resolve_cache_entries must be >= 0, got {resolve_cache_entries}"
+        )
+    if max_macro_candidates_per_root <= 0:
+        raise ValueError(
+            "max_macro_candidates_per_root must be > 0, got "
+            f"{max_macro_candidates_per_root}"
+        )
+    if max_retained_macros <= 0:
+        raise ValueError(
+            f"max_retained_macros must be > 0, got {max_retained_macros}"
         )
 
     def _check_memory() -> None:
@@ -3419,26 +5974,73 @@ def register_header_macros(
             else path
         )
 
+    derived_usage_texts: defaultdict[
+        str,
+        list[str | tuple[str, int | None]],
+    ] = defaultdict(list)
+    for function in index.functions.values():
+        if function.text:
+            derived_usage_texts[os.path.normpath(function.file)].append(
+                (function.text, function.line)
+            )
+    for type_def in index.typedefs.values():
+        if type_def.file and type_def.text:
+            derived_usage_texts[os.path.normpath(type_def.file)].append(
+                (type_def.text, type_def.line)
+            )
+    for file, preamble in index.file_preambles.items():
+        if preamble:
+            derived_usage_texts[os.path.normpath(file)].append((preamble, 1))
+
+    explicit_usage_texts = {
+        os.path.normpath(file): list(texts)
+        for file, texts in (macro_usage_texts_by_file or {}).items()
+    }
+
+    def _usage_texts_for_root(
+        root_abs: str,
+        root_rel: str,
+    ) -> list[str | tuple[str, int | None]]:
+        normalized_rel = os.path.normpath(root_rel)
+        if normalized_rel in explicit_usage_texts:
+            return explicit_usage_texts[normalized_rel]
+        derived = derived_usage_texts.get(normalized_rel)
+        if derived:
+            return list(derived)
+        try:
+            with open(root_abs, "r", encoding="utf-8", errors="replace") as fh:
+                return [(fh.read(), 1)]
+        except OSError as exc:
+            raise RuntimeError(
+                f"failed to read C/C++ macro root for usage scan: {root_abs}"
+            ) from exc
+
     def _directive_events(norm_abs: str) -> list[dict[str, object]]:
-        cached = directive_cache.get(norm_abs)
+        cached = directive_cache.pop(norm_abs, None)
         if cached is not None:
+            directive_cache[norm_abs] = cached
             stats["directive_cache_hits"] += 1
             return cached
         try:
             with open(norm_abs, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
+                file_text = fh.read()
         except OSError as exc:
             raise RuntimeError(f"failed to read C/C++ file for macro scan: {norm_abs}") from exc
 
+        lines, code_lines = _split_source_and_masked_lines(file_text)
         stats["directive_file_reads"] += 1
         events: list[dict[str, object]] = []
         i = 0
         while i < len(lines):
             line = lines[i]
+            code_line = code_lines[i]
             line_no = i + 1
 
             include_match = _INCLUDE_RE.match(line)
-            if include_match is not None:
+            if include_match is not None and re.match(
+                r"^\s*#\s*include\b",
+                code_line,
+            ):
                 events.append(
                     {
                         "kind": "include",
@@ -3449,20 +6051,20 @@ def register_header_macros(
                 i += 1
                 continue
 
-            if _ENDIF_RE.match(line):
+            if _ENDIF_RE.match(code_line):
                 events.append({"kind": "endif"})
                 i += 1
                 continue
-            if _ELSE_RE.match(line):
-                events.append({"kind": "else", "line": line})
+            if _ELSE_RE.match(code_line):
+                events.append({"kind": "else", "line": line, "code_line": code_line})
                 i += 1
                 continue
-            if _IF_RE.match(line) is not None:
-                events.append({"kind": "if", "line": line})
+            if _IF_RE.match(code_line) is not None:
+                events.append({"kind": "if", "line": line, "code_line": code_line})
                 i += 1
                 continue
 
-            undef_match = _UNDEF_RE.match(line)
+            undef_match = _UNDEF_RE.match(code_line)
             if undef_match is not None:
                 events.append(
                     {
@@ -3474,7 +6076,7 @@ def register_header_macros(
                 i += 1
                 continue
 
-            define_match = _DEFINE_RE.match(line)
+            define_match = _DEFINE_RE.match(code_line)
             if define_match is None:
                 i += 1
                 continue
@@ -3501,14 +6103,24 @@ def register_header_macros(
                     }
                 )
             i = end_line + 1
-        directive_cache[norm_abs] = events
+        if directive_cache_entries:
+            directive_cache[norm_abs] = events
+            while len(directive_cache) > directive_cache_entries:
+                directive_cache.pop(next(iter(directive_cache)))
+                stats["directive_cache_evictions"] += 1
+            stats["directive_cache_peak_entries"] = max(
+                stats["directive_cache_peak_entries"],
+                len(directive_cache),
+            )
         return events
 
     def _resolve_include_cached(include_name: str, *, current_abs: str) -> str | None:
         key = (include_name, os.path.dirname(current_abs))
         if key in resolve_cache:
+            resolved = resolve_cache.pop(key)
+            resolve_cache[key] = resolved
             stats["include_resolve_cache_hits"] += 1
-            return resolve_cache[key]
+            return resolved
         resolved = _resolve_local_include(
             include_name,
             current_abs=current_abs,
@@ -3516,7 +6128,15 @@ def register_header_macros(
             include_dirs=include_dirs,
             known_local_files=local_file_index,
         )
-        resolve_cache[key] = resolved
+        if resolve_cache_entries:
+            resolve_cache[key] = resolved
+            while len(resolve_cache) > resolve_cache_entries:
+                resolve_cache.pop(next(iter(resolve_cache)))
+                stats["resolve_cache_evictions"] += 1
+            stats["resolve_cache_peak_entries"] = max(
+                stats["resolve_cache_peak_entries"],
+                len(resolve_cache),
+            )
         return resolved
 
     def _scan_root(root_abs: str, root_rel: str) -> None:
@@ -3526,16 +6146,45 @@ def register_header_macros(
             print(
                 "  Macro scan heartbeat: "
                 f"roots={stats['roots']} scanned_files={stats['scanned_files']} "
-                f"registered={stats['registered_macros']} "
+                f"discovered={stats['discovered_macro_occurrences']} "
+                f"retained={stats['registered_macros']} "
                 f"resolve_cache_hits={stats['include_resolve_cache_hits']}",
                 file=sys.stderr,
                 flush=True,
             )
+        root_index = ProjectIndex()
+        root_macro_objects = 0
+        root_discovered_macros = 0
         visited_files: set[str] = set()
         active_defs: dict[str, MacroDef] = {}
+        active_macro_texts: dict[str, str] = {}
         last_defs: dict[str, MacroDef] = {}
         pending_undef: dict[str, str] = {}
         condition_stack: list[dict[str, object]] = []
+        usage_names = {
+            match.group(0)
+            for item in _usage_texts_for_root(root_abs, root_rel)
+            for match in _iter_code_identifiers(
+                str(item[0]) if isinstance(item, tuple) else str(item)
+            )
+        }
+        relevant_names = set(usage_names)
+
+        def _count_macro_object() -> None:
+            nonlocal root_macro_objects
+            root_macro_objects += 1
+            stats["peak_root_macro_candidates"] = max(
+                stats["peak_root_macro_candidates"],
+                root_macro_objects,
+            )
+            if root_macro_objects > max_macro_candidates_per_root:
+                raise MemoryError(
+                    "macro scan exceeded the per-root candidate bound: "
+                    f"root={root_rel} candidates={root_macro_objects} "
+                    f"limit={max_macro_candidates_per_root}. "
+                    "Raise CPPMEGA_MAX_MACRO_CANDIDATES_PER_ROOT only after "
+                    "profiling this include graph."
+                )
 
         def _conditions_active() -> bool:
             return all(bool(item["active"]) for item in condition_stack)
@@ -3547,13 +6196,13 @@ def register_header_macros(
             return [str(item.get("line", ""))]
 
         def _macro_value(name: str) -> int:
-            macro = active_defs.get(name)
-            if macro is None:
+            macro_text = active_macro_texts.get(name)
+            if macro_text is None:
                 return 0
-            parsed = _parse_macro_signature(macro.text)
+            parsed = _parse_macro_signature(macro_text)
             if parsed is None:
                 return 1
-            body = macro.text[parsed[3]:].strip()
+            body = macro_text[parsed[3]:].strip()
             if body in {"", "true", "TRUE"}:
                 return 1
             if body in {"false", "FALSE"}:
@@ -3570,7 +6219,7 @@ def register_header_macros(
         def _eval_expr(rest: str) -> bool:
             def repl_defined(match: re.Match[str]) -> str:
                 name = match.group(1) or match.group(2)
-                return "1" if name in active_defs else "0"
+                return "1" if name in active_macro_texts else "0"
 
             expr = re.sub(
                 r"\bdefined\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"
@@ -3614,15 +6263,103 @@ def register_header_macros(
             rest = match.group(2)
             names = _condition_macro_names(line)
             if directive == "ifdef":
-                return (names[0] in active_defs if names else False), names
+                return (names[0] in active_macro_texts if names else False), names
             if directive == "ifndef":
-                return (names[0] not in active_defs if names else True), names
+                return (names[0] not in active_macro_texts if names else True), names
             stripped = rest.strip()
             if stripped in {"0", "(0)"}:
                 return False, names
             if stripped in {"1", "(1)"}:
                 return True, names
             return _eval_expr(rest), names
+
+        def _expand_relevant_names() -> None:
+            """Resolve replacement/condition dependencies without MacroDef objects."""
+
+            while True:
+                before = len(relevant_names)
+                discovery_visited: set[str] = set()
+                discovery_conditions: list[list[str]] = []
+
+                def walk(
+                    abs_path: str,
+                    *,
+                    include_stack: set[str],
+                    depth: int,
+                ) -> None:
+                    norm_abs = os.path.normpath(abs_path)
+                    if norm_abs in include_stack or norm_abs in discovery_visited:
+                        return
+                    if (
+                        max_include_files_per_root
+                        and len(discovery_visited) >= max_include_files_per_root
+                    ):
+                        return
+                    discovery_visited.add(norm_abs)
+                    include_stack.add(norm_abs)
+                    try:
+                        for event in _directive_events(norm_abs):
+                            kind = str(event["kind"])
+                            if kind == "include":
+                                if max_include_depth and depth >= max_include_depth:
+                                    continue
+                                included = _resolve_include_cached(
+                                    str(event["include_name"]),
+                                    current_abs=norm_abs,
+                                )
+                                if included is not None:
+                                    walk(
+                                        included,
+                                        include_stack=include_stack,
+                                        depth=depth + 1,
+                                    )
+                                continue
+                            if kind == "endif":
+                                if discovery_conditions:
+                                    discovery_conditions.pop()
+                                continue
+                            if kind == "else":
+                                continue
+                            if kind == "if":
+                                code_line = str(event["code_line"])
+                                match = _IF_RE.match(code_line)
+                                names = _condition_macro_names(code_line)
+                                if (
+                                    match is not None
+                                    and match.group(1) == "elif"
+                                    and discovery_conditions
+                                ):
+                                    discovery_conditions[-1] = names
+                                else:
+                                    discovery_conditions.append(names)
+                                continue
+                            if kind != "define" or bool(event["include_guard"]):
+                                continue
+                            name = str(event["name"])
+                            if name not in relevant_names:
+                                continue
+                            relevant_names.update(
+                                _macro_body_dependency_names(
+                                    str(event["macro_text"]),
+                                    macro_name=name,
+                                    params=cast(list[str], event["params"]),
+                                )
+                            )
+                            for condition_names in discovery_conditions:
+                                relevant_names.update(condition_names)
+                    finally:
+                        include_stack.remove(norm_abs)
+
+                walk(root_abs, include_stack=set(), depth=0)
+                if len(relevant_names) == before:
+                    break
+
+            stats["peak_root_relevant_macro_names"] = max(
+                stats["peak_root_relevant_macro_names"],
+                len(relevant_names),
+            )
+
+        _expand_relevant_names()
 
         def _scan_file(
             abs_path: str,
@@ -3632,6 +6369,7 @@ def register_header_macros(
             include_stack: set[str],
             depth: int,
         ) -> None:
+            nonlocal root_discovered_macros
             norm_abs = os.path.normpath(abs_path)
             if norm_abs in include_stack:
                 stats["skipped_include_cycle"] += 1
@@ -3695,11 +6433,12 @@ def register_header_macros(
                         continue
                     if kind == "if":
                         line = str(event["line"])
-                        if_match = _IF_RE.match(line)
+                        code_line = str(event["code_line"])
+                        if_match = _IF_RE.match(code_line)
                         if if_match and if_match.group(1) == "elif" and condition_stack:
                             previous = condition_stack.pop()
                             parent_active = _conditions_active()
-                            expr_active, names = _evaluate_condition(line)
+                            expr_active, names = _evaluate_condition(code_line)
                             active = (
                                 parent_active
                                 and not bool(previous["branch_taken"])
@@ -3717,7 +6456,7 @@ def register_header_macros(
                             )
                         else:
                             parent_active = _conditions_active()
-                            expr_active, names = _evaluate_condition(line)
+                            expr_active, names = _evaluate_condition(code_line)
                             active = parent_active and expr_active
                             condition_stack.append(
                                 {
@@ -3736,8 +6475,10 @@ def register_header_macros(
                     if kind == "undef":
                         name = str(event["name"])
                         line = str(event["line"])
-                        pending_undef[name] = line
+                        if name in relevant_names:
+                            pending_undef[name] = line
                         active_defs.pop(name, None)
+                        active_macro_texts.pop(name, None)
                         continue
 
                     if kind != "define":
@@ -3746,7 +6487,12 @@ def register_header_macros(
                     line_no = int(event["line_no"])
                     macro_text = str(event["macro_text"])
                     params = cast(list[str], event["params"])
+                    active_macro_texts[name] = macro_text
                     if not bool(event["include_guard"]):
+                        root_discovered_macros += 1
+                        stats["discovered_macro_occurrences"] += 1
+                        if name not in relevant_names:
+                            continue
                         condition_lines = [
                             line
                             for item in condition_stack
@@ -3768,6 +6514,7 @@ def register_header_macros(
                             line=line_no,
                             text="".join(text_parts),
                             params=params,
+                            project_id=stable_project_id,
                             visible_in_file=root_rel,
                             visible_line=root_visible_line or line_no,
                             sequence=sequence[0],
@@ -3776,25 +6523,11 @@ def register_header_macros(
                             undef_text=undef_text,
                             previous=last_defs.get(name),
                         )
+                        _count_macro_object()
                         sequence[0] += 1
                         active_defs[name] = macro
                         last_defs[name] = macro
-                        index.add_macro(macro)
-                        stats["registered_macros"] += 1
-                    else:
-                        guard_macro = MacroDef(
-                            name=name,
-                            file=rel_path,
-                            line=line_no,
-                            text=macro_text,
-                            params=params,
-                            visible_in_file=root_rel,
-                            visible_line=root_visible_line or line_no,
-                            sequence=sequence[0],
-                        )
-                        sequence[0] += 1
-                        active_defs[name] = guard_macro
-                        last_defs[name] = guard_macro
+                        root_index.add_macro(macro)
             finally:
                 include_stack.remove(norm_abs)
 
@@ -3806,6 +6539,53 @@ def register_header_macros(
             depth=0,
         )
 
+        directly_used = [
+            macro
+            for name in sorted(usage_names)
+            if (
+                macro := _select_visible_macro(
+                    root_index,
+                    name,
+                    target_file=root_rel,
+                    max_line=None,
+                )
+            )
+            is not None
+        ]
+        retained = _macro_dependency_closure(
+            root_index,
+            directly_used,
+            target_file=root_rel,
+            max_line=None,
+        )
+        stats["peak_root_retained_macros"] = max(
+            stats["peak_root_retained_macros"],
+            len(retained),
+        )
+        root_candidate_ids = {id(macro) for macro in root_index.macro_definitions}
+        retained_candidate_ids = {
+            id(macro) for macro in retained if id(macro) in root_candidate_ids
+        }
+        stats["pruned_macro_occurrences"] += max(
+            0,
+            root_discovered_macros - len(retained_candidate_ids),
+        )
+        if len(index.macro_definitions) + len(retained) > max_retained_macros:
+            raise MemoryError(
+                "macro scan exceeded the retained registry bound: "
+                f"root={root_rel} retained={len(index.macro_definitions)} "
+                f"incoming={len(retained)} limit={max_retained_macros}. "
+                "Raise CPPMEGA_MAX_RETAINED_MACROS only after inspecting macro "
+                "retention telemetry."
+            )
+        before = len(index.macro_definitions)
+        for macro in retained:
+            index.add_macro(macro)
+        registered = len(index.macro_definitions) - before
+        stats["registered_macros"] += registered
+        stats["retained_macro_occurrences"] += registered
+
+    seen_roots: set[str] = set()
     for path in header_files:
         rel = _rel(path)
         ext = os.path.splitext(rel)[1].lower()
@@ -3814,7 +6594,12 @@ def register_header_macros(
         abs_path = path
         if project_dir is not None and not os.path.isabs(abs_path):
             abs_path = os.path.join(project_dir, abs_path)
-        _scan_root(os.path.normpath(abs_path), rel)
+        normalized_abs = os.path.normpath(abs_path)
+        if normalized_abs in seen_roots:
+            stats["skipped_duplicate_roots"] += 1
+            continue
+        seen_roots.add(normalized_abs)
+        _scan_root(normalized_abs, rel)
 
     return dict(stats)
 
@@ -3969,7 +6754,7 @@ def _used_macro_defs(
                 yield str(item), max_line
 
     for text, start_line in _iter_texts():
-        for match in _IDENTIFIER_RE.finditer(text):
+        for match in _iter_code_identifiers(text):
             use_line = (
                 _source_line_for_text_offset(
                     text,
@@ -4032,13 +6817,16 @@ def build_header_fragment_doc(
     fragment_kind: str,
     compile_args: list[str] | None,
     build_info: dict | None,
+    project_id: str,
+    part: PartInfo | None = None,
 ) -> dict:
     doc = build_enriched_doc(
-        [(text, kind, 0, name, qname)],
+        [part or (text, kind, 0, name, qname)],
         index,
         filepath=rel_file,
         compile_args=compile_args,
         build_info=build_info,
+        project_id=project_id,
     )
     doc["doc_type"] = "code_header"
     doc["header_fragment_kind"] = fragment_kind
@@ -4130,6 +6918,7 @@ def emit_header_documents(
     index: ProjectIndex,
     header_files: list[str],
     project_dir: str | None,
+    project_id: str,
     compile_db: dict | None,
     default_args: list[str] | None,
     default_build_info: dict | None,
@@ -4171,7 +6960,16 @@ def emit_header_documents(
         if td.file in header_rel_files and td.text:
             typedefs_by_file[td.file].append(td)
 
-    for rel in sorted(header_rel_files):
+    sorted_header_files = sorted(header_rel_files)
+    last_header_heartbeat = time.monotonic()
+    emitted_fragments = 0
+    for header_index, rel in enumerate(sorted_header_files, start=1):
+        last_header_heartbeat = _progress_heartbeat(
+            "Header document generation",
+            header_index - 1,
+            len(sorted_header_files),
+            last_header_heartbeat,
+        )
         compile_args, build_info = _compile_context_for_rel_file(
             rel,
             project_dir=project_dir,
@@ -4198,8 +6996,17 @@ def emit_header_documents(
                 fragment_kind="header_decl" if td.kind == HEADER_FRAGMENT_KIND else "type",
                 compile_args=compile_args,
                 build_info=build_info,
+                project_id=project_id,
+                part=_typedef_part(td),
             )
             emit_doc(doc if enriched else td.text)
+            emitted_fragments += 1
+            last_header_heartbeat = _progress_heartbeat(
+                "Header fragment emission",
+                emitted_fragments,
+                None,
+                last_header_heartbeat,
+            )
 
         abs_path = header_abs_by_rel.get(rel)
         if not abs_path:
@@ -4210,7 +7017,7 @@ def emit_header_documents(
         except OSError as exc:
             raise RuntimeError(f"failed to read header for macro extraction: {abs_path}") from exc
 
-        for _start, _end, name, macro_text in extract_macro_blocks(header_text):
+        for start, _end, name, macro_text in extract_macro_blocks(header_text):
             if estimate_tokens(macro_text) > max_tokens * 2:
                 stats["skipped_header_macro_oversize"] += 1
                 continue
@@ -4218,6 +7025,21 @@ def emit_header_documents(
                 stats["skipped_header_macro"] += 1
                 continue
             stats["header_macro"] += 1
+            line = header_text.count("\n", 0, start) + 1
+            macro = next(
+                (
+                    candidate
+                    for candidate in index.macros_by_name.get(name, [])
+                    if candidate.file == rel and candidate.line == line
+                ),
+                MacroDef(
+                    name,
+                    rel,
+                    line,
+                    macro_text,
+                    project_id=project_id,
+                ),
+            )
             doc = build_header_fragment_doc(
                 index=index,
                 rel_file=rel,
@@ -4228,8 +7050,25 @@ def emit_header_documents(
                 fragment_kind="macro",
                 compile_args=compile_args,
                 build_info=build_info,
+                project_id=project_id,
+                part=_macro_part(macro),
             )
             emit_doc(doc if enriched else macro_text)
+            emitted_fragments += 1
+            last_header_heartbeat = _progress_heartbeat(
+                "Header fragment emission",
+                emitted_fragments,
+                None,
+                last_header_heartbeat,
+            )
+
+    _progress_heartbeat(
+        "Header document generation",
+        len(sorted_header_files),
+        len(sorted_header_files),
+        last_header_heartbeat,
+        force=True,
+    )
 
     return stats
 
@@ -4260,7 +7099,7 @@ def dedup_root_functions(
     the shared SQLite ``DedupStore`` (fail-loud if it cannot open / datasketch is
     missing). When absent, a per-repo in-RAM exact set is used (no near).
 
-    Returns (dropped_root_qnames, {dropped_exact, dropped_near, kept_roots}).
+    Returns (dropped_root_symbol_keys, {dropped_exact, dropped_near, kept_roots}).
     """
     tok = _load_cppmega_tokenizer(tokenizer_path)
 
@@ -4288,28 +7127,43 @@ def dedup_root_functions(
         index.functions.items(),
         key=lambda kv: (kv[1].file or "", kv[1].line or 0, kv[0]),
     )
-    for qname, func in items:
+    last_dedup_heartbeat = time.monotonic()
+    for item_index, (symbol_key, func) in enumerate(items, start=1):
+        last_dedup_heartbeat = _progress_heartbeat(
+            "Function dedup",
+            item_index - 1,
+            len(items),
+            last_dedup_heartbeat,
+        )
         if not (func.is_definition and func.text):
             continue
         token_ids = tok.encode(func.text)
         if store is not None:
             if store.seen_exact_tokens(token_ids):
                 dropped_exact += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
             if near and store.seen_near_tokens(token_ids):
                 dropped_near += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
         else:
             _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             h = _sha1_tokens(token_ids)
             if h in seen_local:
                 dropped_exact += 1
-                dropped_roots.add(qname)
+                dropped_roots.add(symbol_key)
                 continue
             seen_local.add(h)
         kept_roots += 1
+
+    _progress_heartbeat(
+        "Function dedup",
+        len(items),
+        len(items),
+        last_dedup_heartbeat,
+        force=True,
+    )
 
     if store is not None:
         store.commit()
@@ -4325,6 +7179,8 @@ def dedup_root_functions(
 def emit_build_documents(
     build_files: list[tuple[str, str]],
     *,
+    source_root: str | None = None,
+    project_id: str | None = None,
     default_build_info: dict | None,
     compile_index: object | None = None,
     tokenizer_path: str | None = None,
@@ -4332,23 +7188,35 @@ def emit_build_documents(
     dedup_stage_id: str | None = None,
     dedup_stage_db: str | None = None,
     dedup_near: bool = True,
+    emit_doc: Callable[[dict[str, object]], None] | None = None,
+    skip_invalid_inputs: bool = False,
 ) -> list[dict]:
-    """Emit one 'build' doc per build file, with WHOLE-DOC tokenized-hash dedup.
+    """Emit bounded domain docs with tokenized-hash dedup.
 
-    Build-file dedup is at the WHOLE-DOC level (not function-level): a build file
-    whose tokenized text hash was already seen (this repo OR globally via the
-    shared db) is dropped, mirroring the commit-doc whole-doc dedup. Uses the
-    SAME shared DedupStore tables (token-id exact + near) so build docs dedup
-    against each other globally and resumably.
+    Inputs within the domain cap remain one whole-file document. Oversized SQL,
+    build, shell, and diagnostic text use deterministic typed chunks; each
+    chunk is deduplicated independently and carries its exact source
+    byte/character span. Uses the SAME shared DedupStore tables (token-id exact
+    + near) so domain docs dedup globally and resumably.
 
-    FAIL LOUD (RULE #1): a discovered build file that cannot be read/decoded or
-    a non-empty build file that tokenizes empty RAISES. Truly empty/whitespace
-    build files are counted and skipped explicitly; they carry no useful text
-    and should not fail the whole C/C++ repo.
+    FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
+    that tokenizes empty RAISES. NUL-bearing and invalid UTF-8 explicit domain
+    inputs also raise before any chunk is emitted. Truly empty/whitespace files
+    are counted and skipped.
     """
     docs: list[dict] = []
     if not build_files:
         return docs
+
+    emitted = 0
+
+    def record_doc(doc: dict[str, object]) -> None:
+        nonlocal emitted
+        if emit_doc is None:
+            docs.append(doc)
+        else:
+            emit_doc(doc)
+        emitted += 1
 
     tok = None
     store = None
@@ -4367,55 +7235,116 @@ def emit_build_documents(
 
     dropped = 0
     skipped_empty = 0
-    for filepath, build_kind in sorted(build_files):
-        # FAIL LOUD on unreadable build files -- do not paper over a broken file.
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        if not text or not text.strip():
-            skipped_empty += 1
-            continue
+    from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
 
-        per_file_build_info = dict(default_build_info) if default_build_info else {}
-        per_file_build_info["build_system"] = build_kind
-
-        if tok is not None:
-            token_ids = tok.encode(text)
-            if not token_ids:
-                raise RuntimeError(
-                    f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                    f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                )
-            if store is not None:
-                if store.seen_exact_tokens(token_ids):
-                    dropped += 1
-                    continue
-                if dedup_near and store.seen_near_tokens(token_ids):
-                    dropped += 1
-                    continue
-            else:
-                from dedup_store import _sha1_tokens
-                h = _sha1_tokens(token_ids)
-                if h in seen_local:
-                    dropped += 1
-                    continue
-                seen_local.add(h)
-
-        docs.append(
-            build_build_doc(
-                filepath,
-                text,
-                build_kind,
-                build_info=per_file_build_info or None,
-            )
+    sorted_build_files = sorted(build_files)
+    last_build_heartbeat = time.monotonic()
+    processed_chunks = 0
+    for file_index, (filepath, build_kind) in enumerate(sorted_build_files, start=1):
+        last_build_heartbeat = _progress_heartbeat(
+            "Typed-domain document generation",
+            file_index - 1,
+            len(sorted_build_files),
+            last_build_heartbeat,
         )
+        try:
+            source_chunks = iter_domain_file_chunks(
+                filepath,
+                max_chunk_bytes=BUILD_FILE_SIZE_CAP,
+            )
+            for source_chunk in source_chunks:
+                processed_chunks += 1
+                last_build_heartbeat = _progress_heartbeat(
+                    "Typed-domain chunk emission",
+                    processed_chunks,
+                    None,
+                    last_build_heartbeat,
+                )
+                text = source_chunk.text
+                if not text or not text.strip():
+                    skipped_empty += 1
+                    continue
+
+                per_file_build_info = dict(default_build_info) if default_build_info else {}
+                if build_kind not in {
+                    "bash",
+                    "sh",
+                    "zsh",
+                    "tcsh",
+                    "ksh",
+                    "python",
+                    "sql",
+                    "compiler_diagnostic",
+                    "linker_diagnostic",
+                    "build_diagnostic",
+                    "sanitizer_output",
+                    "test_output",
+                    "tool_output",
+                }:
+                    per_file_build_info["build_system"] = build_kind
+
+                if tok is not None:
+                    token_ids = tok.encode(text)
+                    if not token_ids:
+                        raise RuntimeError(
+                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
+                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
+                        )
+                    if store is not None:
+                        if store.seen_exact_tokens(token_ids):
+                            dropped += 1
+                            continue
+                        if dedup_near and store.seen_near_tokens(token_ids):
+                            dropped += 1
+                            continue
+                    else:
+                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
+                        h = _sha1_tokens(token_ids)
+                        if h in seen_local:
+                            dropped += 1
+                            continue
+                        seen_local.add(h)
+
+                record_doc(
+                    build_build_doc(
+                        filepath,
+                        text,
+                        build_kind,
+                        source_root=source_root,
+                        project_id=project_id,
+                        build_info=per_file_build_info or None,
+                        source_span=source_chunk.source_span(),
+                    )
+                )
+        except ValueError as exc:
+            if skip_invalid_inputs and str(exc).startswith(
+                (
+                    "binary domain input contains NUL byte",
+                    "invalid UTF-8 domain input",
+                    "binary shell/domain input contains NUL byte",
+                    "invalid UTF-8 shell/domain input",
+                )
+            ):
+                print(f"  SKIP invalid typed domain input {filepath}: {exc}", file=sys.stderr)
+                continue
+            raise
+
+    _progress_heartbeat(
+        "Typed-domain document generation",
+        len(sorted_build_files),
+        len(sorted_build_files),
+        last_build_heartbeat,
+        force=True,
+    )
 
     if store is not None:
         store.commit()
         store.close()
 
     print(
-        f"  Build docs: emitted={len(docs)} dropped_dup={dropped} "
-        f"skipped_empty={skipped_empty} (whole-doc tokenized-hash dedup)",
+        f"  Build docs: emitted={emitted} dropped_dup={dropped} "
+        f"skipped_empty={skipped_empty} "
+        "(bounded-domain tokenized-hash dedup)",
         file=sys.stderr,
     )
     return docs
@@ -4428,6 +7357,7 @@ def build_training_documents(
     enriched: bool = False,
     *,
     project_dir: str | None = None,
+    project_id: str | None = None,
     compile_db: dict | None = None,
     default_args: list[str] | None = None,
     default_build_info: dict | None = None,
@@ -4461,6 +7391,8 @@ def build_training_documents(
     HARD per-doc bounds (CrossLinkBudget). Behavior is unchanged when None.
     """
     crosslink_total = 0
+    crosslink_ambiguous_total = 0
+    crosslink_ambiguity_examples: set[str] = set()
     documents: list[str | dict[str, object]] = []
 
     def _record_doc(doc: str | dict[str, object]) -> None:
@@ -4469,12 +7401,31 @@ def build_training_documents(
         else:
             documents.append(doc)
 
+    print(
+        f"  Training document generation started: {len(index.functions)} roots",
+        file=sys.stderr,
+        flush=True,
+    )
     index.compute_dep_levels()
+    print("  Dependency levels computed", file=sys.stderr, flush=True)
+    stable_project_id = (
+        require_project_identity(
+            project_id,
+            source="build_training_documents",
+        )
+        if project_id is not None
+        else None
+    )
     if header_files or macro_scan_files:
+        if stable_project_id is None:
+            raise SymbolIdentityError(
+                "build_training_documents macro scan requires project_id"
+            )
         macro_stats = register_header_macros(
             index,
             macro_scan_files or header_files or [],
             project_dir=project_dir,
+            project_id=stable_project_id,
             include_dirs=_collect_macro_include_dirs(
                 project_dir=project_dir,
                 compile_db=compile_db,
@@ -4490,7 +7441,12 @@ def build_training_documents(
             f"directive_cache_hits={macro_stats.get('directive_cache_hits', 0)} "
             f"include_directives={macro_stats.get('include_directives', 0)} "
             f"resolve_cache_hits={macro_stats.get('include_resolve_cache_hits', 0)} "
-            f"registered={macro_stats.get('registered_macros', 0)} "
+            f"discovered={macro_stats.get('discovered_macro_occurrences', 0)} "
+            f"materialized_peak={macro_stats.get('peak_root_macro_candidates', 0)} "
+            f"retained={macro_stats.get('registered_macros', 0)} "
+            f"pruned={macro_stats.get('pruned_macro_occurrences', 0)} "
+            f"directive_cache_peak={macro_stats.get('directive_cache_peak_entries', 0)} "
+            f"resolve_cache_peak={macro_stats.get('resolve_cache_peak_entries', 0)} "
             f"local_file_index_entries={macro_stats.get('local_file_index_entries', 0)} "
             f"skipped_depth={macro_stats.get('skipped_include_depth', 0)} "
             f"skipped_file_cap={macro_stats.get('skipped_include_file_cap', 0)} "
@@ -4548,36 +7504,48 @@ def build_training_documents(
                 kv[0],
             ),
         )
-        for qname, func in items:
+        last_document_heartbeat = time.monotonic()
+        for item_index, (symbol_key, func) in enumerate(items, start=1):
+            last_document_heartbeat = _progress_heartbeat(
+                "Training document generation",
+                item_index - 1,
+                len(items),
+                last_document_heartbeat,
+            )
             if not func.is_definition:
                 continue
             # Skip emitting a STANDALONE root doc for a deduped function. It remains
             # resolvable as a graph node, but chunk-claiming below controls whether
             # its text may appear in training output again.
-            if qname in dropped_roots:
+            if symbol_key in dropped_roots:
                 continue
 
             # Collect transitive deps. When the global symbol index is present, also
             # collect cross-lib base-lib pulls (bounded; depth-1; tagged provenance).
             # When absent, crosslink_budget is None so collect_transitive_deps takes
             # the exact original path (behavior unchanged).
-            crosslink_visited: set[str] = set()
+            crosslink_visited: dict[str, dict[str, object]] = {}
             crosslink_budget = (
                 CrossLinkBudget() if global_symbols is not None else None
             )
-            dep_qnames = collect_transitive_deps(
-                qname, index, max_dep_depth,
+            dep_keys = collect_transitive_deps(
+                symbol_key, index, max_dep_depth,
                 global_symbols=global_symbols,
                 crosslink_visited=crosslink_visited,
                 crosslink_budget=crosslink_budget,
             )
+            if crosslink_budget is not None:
+                crosslink_ambiguous_total += crosslink_budget.ambiguous_lookups
+                for example in crosslink_budget.ambiguity_examples:
+                    if len(crosslink_ambiguity_examples) < 8:
+                        crosslink_ambiguity_examples.add(example)
 
             # Sort by dep_level (leaves/most foundational first). Claims are applied
             # after the candidate document passes the tiny-doc filter so a small
             # helper can still be used as dependency context for its first caller.
             dep_funcs: list[FunctionDef] = []
-            for dq in dep_qnames:
-                df = index.functions.get(dq)
+            for dep_key in dep_keys:
+                df = index.functions.get(dep_key)
                 if not (df and df.is_definition and df.text):
                     continue
                 dep_funcs.append(df)
@@ -4597,13 +7565,11 @@ def build_training_documents(
 
             # Resolve cross-lib pulls to (qname, record) DEEPEST deps. They are the
             # most foundational (base-lib impls) so they precede local deps in text.
-            crosslink_deps: list[tuple[str, dict]] = []
-            if global_symbols is not None and crosslink_visited:
-                for cq in sorted(crosslink_visited):
-                    rec = global_symbols.lookup(cq)
-                    if rec is None or not rec.get("text"):
-                        continue
-                    crosslink_deps.append((cq, rec))
+            crosslink_deps: list[dict[str, object]] = [
+                crosslink_visited[uid]
+                for uid in sorted(crosslink_visited)
+                if crosslink_visited[uid].get("text")
+            ]
 
             def _assemble(dep_funcs_list: list[FunctionDef]) -> str:
                 parts: list[str] = []
@@ -4612,8 +7578,8 @@ def build_training_documents(
                 for macro in macro_deps:
                     parts.append(macro.text)
                 # Cross-lib base-lib defs are the deepest foundation -> emitted first.
-                for _cq, _rec in crosslink_deps:
-                    parts.append(_rec["text"])
+                for record in crosslink_deps:
+                    parts.append(str(record["text"]))
                 for df in dep_funcs_list:
                     parts.append(df.text)
                 parts.append(func.text)
@@ -4666,13 +7632,13 @@ def build_training_documents(
                     claimed_macro_deps.append(macro)
                 macro_deps = claimed_macro_deps
 
-                claimed_crosslink_deps: list[tuple[str, dict]] = []
-                for cq, rec in crosslink_deps:
+                claimed_crosslink_deps: list[dict[str, object]] = []
+                for rec in crosslink_deps:
                     if not chunk_claims.claim_text(rec["text"], max_count=1):
                         chunk_stats["skipped_crosslib"] += 1
                         continue
                     chunk_stats["claimed_crosslib"] += 1
-                    claimed_crosslink_deps.append((cq, rec))
+                    claimed_crosslink_deps.append(rec)
                 crosslink_deps = claimed_crosslink_deps
                 doc = _assemble(dep_funcs)
                 tokens = estimate_tokens(doc)
@@ -4690,15 +7656,7 @@ def build_training_documents(
                 if preamble:
                     parts_info.append((preamble, 1, 0, '', None))  # kind=1 PREAMBLE
                 for macro in macro_deps:
-                    parts_info.append((
-                        macro.text,
-                        MACRO_KIND,
-                        0,
-                        macro.name,
-                        None,
-                        None,
-                        _macro_part_metadata(macro),
-                    ))
+                    parts_info.append(_macro_part(macro))
                 # Cross-lib base-lib pulls: DEEPEST deps. dep_level is set above the
                 # max local dep_level so they sort as the most foundational chunks in
                 # the SAME dep_levels/topo order, and they carry dep_source provenance
@@ -4707,34 +7665,28 @@ def build_training_documents(
                 _max_local_level = max(
                     (df.dep_level for df in dep_funcs), default=0
                 )
-                for cq, rec in crosslink_deps:
-                    cname = cq.split('::')[-1]
-                    parts_info.append((
-                        rec["text"], 2, _max_local_level + 1, cname, cq,
-                        f"crosslib:{rec['base_repo']}",
-                    ))
+                for rec in crosslink_deps:
+                    parts_info.append(_global_symbol_part(rec, _max_local_level + 1))
                 for df in dep_funcs:
-                    parts_info.append((df.text, 2, df.dep_level, df.name,
-                                       df.qualified_name))  # kind=2 FUNC
-                parts_info.append((func.text, 2, func.dep_level, func.name,
-                                   func.qualified_name))  # kind=2 FUNC (root)
+                    parts_info.append(_function_part(df))
+                parts_info.append(_function_part(func))
 
                 # Pull in DEFINITIONS of types referenced by the root func + its
                 # dep funcs as type-edge target chunks. build_enriched_doc matches
-                # a function chunk's referenced_types against any chunk whose qname
-                # equals the type qname (chunk_all_qnames) to emit type_edges; the
-                # type def must therefore be present as a chunk. Definitions live in
+                # canonical referenced-type identities against type-definition
+                # chunks to emit type_edges; the type def must therefore be present.
+                # Definitions live in
                 # headers (now indexed), registered in index.typedefs.
-                func_qnames_in_doc = {func.qualified_name}
-                func_qnames_in_doc.update(df.qualified_name for df in dep_funcs)
-                referenced: list[str] = list(func.referenced_types)
+                func_symbols_in_doc = {func.symbol_key}
+                func_symbols_in_doc.update(df.symbol_key for df in dep_funcs)
+                referenced: list[str] = index._function_referenced_type_keys(func)
                 for df in dep_funcs:
-                    referenced.extend(df.referenced_types)
-                added_type_qnames: set[str] = set()
-                for tq in referenced:
-                    if tq in added_type_qnames or tq in func_qnames_in_doc:
+                    referenced.extend(index._function_referenced_type_keys(df))
+                added_type_keys: set[str] = set()
+                for type_key in referenced:
+                    if type_key in added_type_keys or type_key in func_symbols_in_doc:
                         continue
-                    td = index.typedefs.get(tq)
+                    td = index.typedefs.get(type_key)
                     if td is None or not td.text:
                         continue
                     if chunk_claims is not None:
@@ -4742,10 +7694,9 @@ def build_training_documents(
                             chunk_stats["skipped_type"] += 1
                             continue
                         chunk_stats["claimed_type"] += 1
-                    added_type_qnames.add(tq)
+                    added_type_keys.add(type_key)
                     # kind from TypeDef (4=class/struct/enum/union, 7=typedef/using)
-                    parts_info.append((td.text, td.kind, 0, td.name,
-                                       td.qualified_name))
+                    parts_info.append(_typedef_part(td))
 
                 compile_args = list(default_args or [])
                 build_info = dict(default_build_info) if default_build_info else None
@@ -4761,6 +7712,7 @@ def build_training_documents(
                     filepath=func.file,
                     compile_args=compile_args,
                     build_info=build_info,
+                    project_id=stable_project_id,
                 )
                 if _is_header_path(func.file) and func.text.lstrip().startswith("template"):
                     out_doc["doc_type"] = "code_header"
@@ -4769,11 +7721,24 @@ def build_training_documents(
             else:
                 _record_doc(doc)
 
+        _progress_heartbeat(
+            "Training document generation",
+            len(items),
+            len(items),
+            last_document_heartbeat,
+            force=True,
+        )
+
         if header_files:
+            if stable_project_id is None:
+                raise SymbolIdentityError(
+                    "header emission requires a canonical owner/repo identity"
+                )
             header_stats = emit_header_documents(
                 index=index,
                 header_files=header_files,
                 project_dir=project_dir,
+                project_id=stable_project_id,
                 compile_db=compile_db,
                 default_args=default_args,
                 default_build_info=default_build_info,
@@ -4815,7 +7780,9 @@ def build_training_documents(
         print(
             f"  Cross-lib base-lib pulls: {crosslink_total} (depth-1, "
             f"cap {CROSSLINK_MAX_DEPS_PER_DOC}/doc, "
-            f"{CROSSLINK_TOKEN_BUDGET_PER_DOC} tok/doc, tagged crosslib:<repo>)",
+            f"{CROSSLINK_TOKEN_BUDGET_PER_DOC} tok/doc, tagged crosslib:<repo>); "
+            f"ambiguous_unresolved={crosslink_ambiguous_total} "
+            f"examples={sorted(crosslink_ambiguity_examples)}",
             file=sys.stderr,
         )
     return documents
@@ -4833,7 +7800,7 @@ def _resolve_file_args(filepath, compile_db, default_args):
 
 def _parse_file_batch(args_tuple):
     """Worker function for parallel parsing. Each worker creates its own Index."""
-    filepaths, compile_db, default_args, project_dir = args_tuple
+    filepaths, compile_db, default_args, project_dir, project_id = args_tuple
     sys.setrecursionlimit(50000)  # Set in each worker process too
     _configure_libclang()
     clang_index = Index.create()
@@ -4844,9 +7811,17 @@ def _parse_file_batch(args_tuple):
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
         try:
-            functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+            functions, typedefs = parse_translation_unit(
+                filepath,
+                clang_index,
+                args,
+                project_dir,
+                project_id=project_id,
+            )
             func_results.extend(f.to_dict() for f in functions)
             type_results.extend(t.to_dict() for t in typedefs)
+        except SymbolIdentityError:
+            raise
         except (Exception, RecursionError):
             errors += 1
         now = time.monotonic()
@@ -4864,71 +7839,39 @@ def _parse_file_batch(args_tuple):
     return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
 
 
-def _iter_parse_batch_results(executor, batches):
-    """Yield parse batch results as workers finish, not in submit order."""
-    futures = [executor.submit(_parse_file_batch, batch) for batch in batches]
-    for future in as_completed(futures):
-        yield future.result()
-
-
-def _parse_single_file_worker(args_tuple):
-    """Parse one file in a fresh subprocess so a segfault is file-local."""
-    filepath, compile_db, default_args, project_dir = args_tuple
-    sys.setrecursionlimit(50000)
-    _configure_libclang()
-    clang_index = Index.create()
-    args = _resolve_file_args(filepath, compile_db, default_args)
-    functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
-    return {
-        "functions": [f.to_dict() for f in functions],
-        "typedefs": [t.to_dict() for t in typedefs],
-    }
-
-
-def _parse_files_isolated(
-    cpp_files: list[str],
-    compile_db: dict | None,
-    default_args: list[str],
-    project_dir: str,
+def _iter_parse_batch_results(
+    executor,
+    batches: Iterable,
     *,
-    max_workers: int,
-) -> tuple[ProjectIndex, int, int]:
-    """Parse files via one-file subprocess tasks so crashes don't kill the whole repo."""
-    index_obj = ProjectIndex()
-    parsed = 0
-    errors = 0
-    worker_count = max(1, max_workers)
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(
-                _parse_single_file_worker,
-                (filepath, compile_db, default_args, project_dir),
-            ): filepath
-            for filepath in cpp_files
-        }
-        for future in as_completed(futures):
-            filepath = futures[future]
-            try:
-                payload = future.result(timeout=120)  # 2 min per file
-                for d in payload["functions"]:
-                    index_obj.add_function(FunctionDef.from_dict(d))
-                for td in payload["typedefs"]:
-                    index_obj.add_typedef(TypeDef.from_dict(td))
-                parsed += 1
-            except TimeoutError:
-                errors += 1
-                if errors <= 5:
-                    print(f"  TIMEOUT parsing {filepath} (>120s)", file=sys.stderr)
-            except Exception as e:
-                errors += 1
-                if errors <= 5:
-                    print(f"  ERROR parsing {filepath}: {e}", file=sys.stderr)
-            if parsed % 500 == 0 and parsed > 0:
-                print(
-                    f"  Parsed {parsed}/{len(cpp_files)} files, {len(index_obj.functions)} functions",
-                    file=sys.stderr,
-                )
-    return index_obj, parsed, errors
+    max_in_flight: int,
+):
+    """Yield every batch result while retaining only a bounded future window."""
+
+    if max_in_flight <= 0:
+        raise ValueError(f"max_in_flight must be positive, got {max_in_flight}")
+    batch_iter = iter(batches)
+    pending = set()
+
+    def submit_one() -> bool:
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            return False
+        pending.add(executor.submit(_parse_file_batch, batch))
+        return True
+
+    try:
+        while len(pending) < max_in_flight and submit_one():
+            pass
+        while pending:
+            future = next(as_completed(tuple(pending)))
+            pending.remove(future)
+            yield future.result()
+            while len(pending) < max_in_flight and submit_one():
+                pass
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def process_project(
@@ -4946,6 +7889,9 @@ def process_project(
     dedup_near: bool = True,
     global_symbol_index: str | None = None,
     emit_doc: Callable[[str | dict[str, object]], None] | None = None,
+    *,
+    project_id: str,
+    skip_invalid_domain_inputs: bool = False,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -4955,8 +7901,10 @@ def process_project(
     docs are streamed to it and not accumulated in the returned list.
     """
     project_dir = os.path.abspath(project_dir)
-    project_name = os.path.basename(project_dir)
-    _configure_libclang()
+    stable_project_id = require_project_identity(
+        project_id,
+        source=f"process_project({project_dir})",
+    )
 
     # Open the cross-repo base-lib symbol index (read-only) for THIS process.
     global_symbols: GlobalSymbolReader | None = None
@@ -4965,15 +7913,58 @@ def process_project(
         print(f"  Cross-lib: using global symbol index {global_symbol_index}",
               file=sys.stderr)
 
-    print(f"\n--- Processing project: {project_name} ---", file=sys.stderr)
+    print(f"\n--- Processing project: {stable_project_id} ---", file=sys.stderr)
+
+    invalid_domain_paths: set[str] = set()
+
+    def _handle_invalid_domain_input(path: Path, exc: ValueError) -> None:
+        invalid_domain_paths.add(os.path.abspath(path))
+        print(f"  SKIP invalid typed domain input {path}: {exc}", file=sys.stderr)
+
+    invalid_handler = _handle_invalid_domain_input if skip_invalid_domain_inputs else None
 
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(cpp_files)} C/C++ source files", file=sys.stderr)
+    if cpp_files:
+        _configure_libclang()
 
     # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
     build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
+    shell_files = find_shell_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        invalid_input_handler=invalid_handler,
+    )
+    print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
+    from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
+
+    typed_domain_files = discover_project_domain_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        include_cpp=False,
+        invalid_input_handler=invalid_handler,
+    )
+    domain_files_by_path = {
+        os.path.abspath(filepath): (os.path.abspath(filepath), build_kind)
+        for filepath, build_kind in (*build_files, *shell_files)
+    }
+    for discovered in typed_domain_files:
+        filepath = os.path.abspath(discovered.path)
+        domain_files_by_path[filepath] = (
+            filepath,
+            discovered.domain.name.lower(),
+        )
+    domain_files = sorted(domain_files_by_path.values())
+    if invalid_domain_paths:
+        domain_files = [
+            item for item in domain_files if item[0] not in invalid_domain_paths
+        ]
+    print(
+        f"  Found {len(domain_files)} total typed domain files after dedup",
+        file=sys.stderr,
+    )
 
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
@@ -5005,45 +7996,53 @@ def process_project(
             f"(max {DEFAULT_PARSE_BATCH_FILES}; bounded IPC payload)",
             file=sys.stderr,
         )
+        submit_window = max(
+            1,
+            effective_workers * PARSE_SUBMIT_WINDOW_PER_WORKER,
+        )
+        print(
+            f"  Parse submit window: {submit_window} batches "
+            f"({PARSE_SUBMIT_WINDOW_PER_WORKER} per worker)",
+            file=sys.stderr,
+        )
+        print(
+            "  Parse worker recycle: "
+            f"{PARSE_MAX_BATCHES_PER_WORKER} batches per process",
+            file=sys.stderr,
+        )
         batches = []
         for i in range(0, len(cpp_files), chunk_size):
             batch = cpp_files[i:i + chunk_size]
-            batches.append((batch, compile_db, default_args, project_dir))
+            batches.append(
+                (batch, compile_db, default_args, project_dir, stable_project_id)
+            )
 
         total_parsed = 0
         total_errors = 0
-        try:
-            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-                for payload, parsed_count, error_count in _iter_parse_batch_results(
-                    executor,
-                    batches,
-                ):
-                    for d in payload["functions"]:
-                        index_obj.add_function(FunctionDef.from_dict(d))
-                    for td in payload["typedefs"]:
-                        index_obj.add_typedef(TypeDef.from_dict(td))
-                    total_parsed += parsed_count
-                    total_errors += error_count
-                    check_memory_limit(memory_limit_gb, label="index_project")
-                    print(f"  Parsed {total_parsed}/{len(cpp_files)} files, "
-                          f"{len(index_obj.functions)} functions", file=sys.stderr)
+        with make_parse_executor(max_workers=effective_workers) as executor:
+            for payload, parsed_count, error_count in _iter_parse_batch_results(
+                executor,
+                batches,
+                max_in_flight=submit_window,
+            ):
+                for d in payload["functions"]:
+                    index_obj.add_function(FunctionDef.from_dict(d))
+                for td in payload["typedefs"]:
+                    index_obj.add_typedef(TypeDef.from_dict(td))
+                total_parsed += parsed_count
+                total_errors += error_count
+                check_memory_limit(memory_limit_gb, label="index_project")
+                print(
+                    f"  Parsed {total_parsed}/{len(cpp_files)} files, "
+                    f"{len(index_obj.functions)} functions",
+                    file=sys.stderr,
+                )
 
-            print(f"  Parsed {total_parsed} files ({total_errors} errors), "
-                  f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
-        except Exception as exc:
-            print(
-                f"  WARN: parallel parse failed ({exc}); retrying isolated per-file workers",
-                file=sys.stderr,
-            )
-            index_obj, parsed, errors = _parse_files_isolated(
-                cpp_files,
-                compile_db,
-                default_args,
-                project_dir,
-                max_workers=min(4, effective_workers),
-            )
-            print(f"  Parsed {parsed} files ({errors} errors), "
-                  f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
+        print(
+            f"  Parsed {total_parsed} files ({total_errors} errors), "
+            f"{len(index_obj.functions)} functions indexed",
+            file=sys.stderr,
+        )
     else:
         # Sequential for small projects
         clang_index = Index.create()
@@ -5053,12 +8052,20 @@ def process_project(
         for filepath in cpp_files:
             args = _resolve_file_args(filepath, compile_db, default_args)
             try:
-                functions, typedefs = parse_translation_unit(filepath, clang_index, args, project_dir)
+                functions, typedefs = parse_translation_unit(
+                    filepath,
+                    clang_index,
+                    args,
+                    project_dir,
+                    project_id=stable_project_id,
+                )
                 for func in functions:
                     index_obj.add_function(func)
                 for td in typedefs:
                     index_obj.add_typedef(td)
                 parsed += 1
+            except SymbolIdentityError:
+                raise
             except Exception as e:
                 errors += 1
                 if errors <= 5:
@@ -5115,6 +8122,7 @@ def process_project(
             max_dep_depth,
             enriched=enriched,
             project_dir=project_dir,
+            project_id=stable_project_id,
             compile_db=compile_db,
             default_args=default_args,
             default_build_info=default_build_info,
@@ -5136,9 +8144,11 @@ def process_project(
     # Emit build/compilation files as their own 'build' docs (ADDITIVE). Only in
     # enriched mode: build docs are dict-shaped (structure_ids/language_info/
     # platform_ids); plain-text mode would lose the build-system tag + sidecars.
-    if enriched and build_files:
+    if enriched and domain_files:
         build_docs = emit_build_documents(
-            build_files,
+            domain_files,
+            source_root=project_dir,
+            project_id=stable_project_id,
             default_build_info=default_build_info,
             compile_index=_compile_index,
             tokenizer_path=tokenizer_path,
@@ -5146,17 +8156,16 @@ def process_project(
             dedup_stage_id=dedup_stage_id,
             dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
+            emit_doc=_emit_counted if emit_doc is not None else None,
+            skip_invalid_inputs=skip_invalid_domain_inputs,
         )
-        if emit_doc is not None:
-            for doc in build_docs:
-                _emit_counted(doc)
-        else:
+        if emit_doc is None:
             documents.extend(build_docs)
         check_memory_limit(memory_limit_gb, label="index_project")
-    elif build_files and not enriched:
+    elif domain_files and not enriched:
         print(
-            "  WARN: build files found but --enriched not set; build docs are "
-            "enriched-only and were NOT emitted",
+            "  WARN: build/shell files found but --enriched not set; domain docs "
+            "are enriched-only and were NOT emitted",
             file=sys.stderr,
         )
 
@@ -5174,10 +8183,15 @@ def main() -> int:
         description='Clang-based cross-file C++ dependency indexer')
     parser.add_argument('--project-dir', type=str,
                         help='Single project directory to process')
+    parser.add_argument('--project-id', type=str,
+                        help='Canonical owner/repo identity for --project-dir')
     parser.add_argument('--projects-list', type=str,
-                        help='File listing project directories (one per line)')
+                        help='Tab-separated owner/repo and project directory per line')
     parser.add_argument('--projects-dir', type=str,
                         help='Directory containing multiple project subdirectories')
+    parser.add_argument('--project-map', type=str,
+                        help='JSON object mapping absolute project directories to owner/repo; '
+                             'required with --projects-dir')
     parser.add_argument('--output', type=str, required=True,
                         help='Output JSONL file path')
     parser.add_argument('--max-tokens', type=int, default=16384,
@@ -5197,6 +8211,13 @@ def main() -> int:
                              'call_edges, type_edges alongside text')
     parser.add_argument('--exclude-dirs', type=str, default=None,
                         help='Comma-separated extra directory names to exclude from file discovery')
+    parser.add_argument(
+        '--skip-invalid-domain-inputs',
+        action='store_true',
+        help='Corpus mode: log and skip individual typed domain files containing '
+             'NUL or invalid UTF-8 instead of failing the entire project. The '
+             'default remains fail-loud.',
+    )
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
     parser.add_argument('--dedup-db', type=str, default=None,
@@ -5241,22 +8262,64 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Collect project directories
-    project_dirs = []
+    # Collect project directories together with their canonical corpus identity.
+    project_specs: list[tuple[str, str]] = []
     if args.project_dir:
-        project_dirs.append(args.project_dir)
+        if not args.project_id:
+            parser.error("--project-dir requires --project-id owner/repo")
+        project_specs.append(
+            (
+                os.path.abspath(args.project_dir),
+                require_project_identity(args.project_id, source="--project-id"),
+            )
+        )
     elif args.projects_list:
         with open(args.projects_list) as f:
-            project_dirs = [line.strip() for line in f if line.strip()]
+            for line_number, raw_line in enumerate(f, 1):
+                line = raw_line.rstrip("\n")
+                if not line.strip():
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 2:
+                    parser.error(
+                        f"{args.projects_list}:{line_number}: expected "
+                        "owner/repo<TAB>/project/path"
+                    )
+                project_id, project_dir = fields
+                project_specs.append(
+                    (
+                        os.path.abspath(project_dir),
+                        require_project_identity(
+                            project_id,
+                            source=f"{args.projects_list}:{line_number}",
+                        ),
+                    )
+                )
     elif args.projects_dir:
+        if not args.project_map:
+            parser.error("--projects-dir requires --project-map")
+        with open(args.project_map, encoding="utf-8") as project_map_file:
+            raw_project_map = json.load(project_map_file)
+        if not isinstance(raw_project_map, dict):
+            parser.error("--project-map must contain a JSON object")
+        project_map = {
+            os.path.abspath(str(path)): require_project_identity(
+                project_id,
+                source=f"--project-map[{path!r}]",
+            )
+            for path, project_id in raw_project_map.items()
+        }
         for entry in sorted(os.listdir(args.projects_dir)):
-            full = os.path.join(args.projects_dir, entry)
+            full = os.path.abspath(os.path.join(args.projects_dir, entry))
             if os.path.isdir(full):
-                project_dirs.append(full)
+                project_id = project_map.get(full)
+                if project_id is None:
+                    parser.error(f"--project-map has no identity for {full}")
+                project_specs.append((full, project_id))
     else:
         parser.error("Provide --project-dir, --projects-list, or --projects-dir")
 
-    print(f"Processing {len(project_dirs)} project(s)", file=sys.stderr)
+    print(f"Processing {len(project_specs)} project(s)", file=sys.stderr)
     print(f"Output: {args.output}", file=sys.stderr)
     print(f"Max tokens: {args.max_tokens}", file=sys.stderr)
     print(f"Memory limit: {args.memory_limit_gb} GiB", file=sys.stderr)
@@ -5279,7 +8342,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if args.dedup_stage_id and len(project_dirs) != 1:
+        if args.dedup_stage_id and len(project_specs) != 1:
             print(
                 "ERROR: --dedup-stage-id is only supported for one project per "
                 "index_project process; parent pipeline must own promotion.",
@@ -5351,57 +8414,68 @@ def main() -> int:
 
     append_mode = getattr(args, 'append', False)
     enriched = args.enriched
-    with open(args.output, 'a' if append_mode else 'w') as out:
-        def _write_doc(doc: str | dict[str, object]) -> None:
-            nonlocal total_docs
-            if enriched:
-                json.dump(doc, out)
-            else:
-                json.dump({'text': doc}, out)
-            out.write('\n')
-            total_docs += 1
+    final_output = Path(args.output)
+    with atomic_output_file(final_output) as staged_output:
+        if append_mode and final_output.exists():
+            shutil.copyfile(final_output, staged_output)
+        with staged_output.open('a' if append_mode else 'w') as out:
+            def _write_doc(doc: str | dict[str, object]) -> None:
+                nonlocal total_docs
+                if enriched:
+                    json.dump(doc, out)
+                else:
+                    json.dump({'text': doc}, out)
+                out.write('\n')
+                total_docs += 1
 
-        if args.workers > 1 and len(project_dirs) > 1:
-            # Multi-project parallel mode
-            with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = {
-                    executor.submit(
-                        process_project, pd, args.max_tokens, args.max_dep_depth,
-                        args.parse_workers, enriched, extra_exclude,
-                        args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
-                        args.dedup_stage_id, args.dedup_stage_db, dedup_near,
-                        global_symbol_index,
-                    ): pd
-                    for pd in project_dirs
-                }
-                for future in as_completed(futures):
-                    pd = futures[future]
+            if args.workers > 1 and len(project_specs) > 1:
+                with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                    futures = {
+                        executor.submit(
+                            process_project, pd, args.max_tokens, args.max_dep_depth,
+                            args.parse_workers, enriched, extra_exclude,
+                            args.memory_limit_gb, args.tokenizer_path, args.dedup_db,
+                            args.dedup_stage_id, args.dedup_stage_db, dedup_near,
+                            global_symbol_index,
+                            project_id=project_id,
+                            skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
+                        ): (pd, project_id)
+                        for pd, project_id in project_specs
+                    }
+                    for future in as_completed(futures):
+                        pd, project_id = futures[future]
+                        try:
+                            docs = future.result()
+                            for doc in docs:
+                                _write_doc(doc)
+                        except SymbolIdentityError:
+                            raise
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"failed processing {project_id} ({pd}): {exc}"
+                            ) from exc
+            else:
+                for pd, project_id in project_specs:
                     try:
-                        docs = future.result()
+                        docs = process_project(
+                            pd, args.max_tokens, args.max_dep_depth,
+                            args.parse_workers, enriched, extra_exclude,
+                            args.memory_limit_gb, args.tokenizer_path,
+                            args.dedup_db, args.dedup_stage_id,
+                            args.dedup_stage_db, dedup_near,
+                            global_symbol_index, emit_doc=_write_doc,
+                            project_id=project_id,
+                            skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
+                        )
                         for doc in docs:
                             _write_doc(doc)
-                    except Exception as e:
-                        print(f"ERROR processing {pd}: {e}", file=sys.stderr)
-        else:
-            # Sequential mode
-            for pd in project_dirs:
-                try:
-                    docs = process_project(pd, args.max_tokens, args.max_dep_depth,
-                                           args.parse_workers, enriched, extra_exclude,
-                                           args.memory_limit_gb, args.tokenizer_path,
-                                           args.dedup_db, args.dedup_stage_id,
-                                           args.dedup_stage_db,
-                                           dedup_near,
-                                           global_symbol_index,
-                                           emit_doc=_write_doc)
-                    for doc in docs:
-                        _write_doc(doc)
-                    out.flush()
-                except Exception as e:
-                    print(f"ERROR processing {pd}: {e}", file=sys.stderr)
-                    if len(project_dirs) == 1:
-                        return 1
-                    print("  Skipping project, continuing...", file=sys.stderr)
+                        out.flush()
+                    except SymbolIdentityError:
+                        raise
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"failed processing {project_id} ({pd}): {exc}"
+                        ) from exc
 
     print(f"\n{'='*60}", file=sys.stderr)
     print(f"Total documents: {total_docs}", file=sys.stderr)

@@ -7,11 +7,28 @@ from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
     DomainKind,
     DomainRoleKind,
+    ParseConfidence,
 )
 
 
 def parse_build_error(text: str, *, tool: str = "build") -> object:
-    doc = new_diagnostic_doc(text, domain=DomainKind.BUILD_ERROR, tool=tool)
+    lower_text = text.lower()
+    severity = (
+        "error"
+        if any(token in lower_text for token in ("error", "failed", "failure", "build stopped"))
+        else "warning"
+        if "warning" in lower_text
+        else "unknown"
+    )
+    domain = DomainKind.BUILD_ERROR if severity == "error" else DomainKind.BUILD_DIAGNOSTIC
+    doc = new_diagnostic_doc(
+        text,
+        domain=domain,
+        tool=tool,
+        severity=severity,
+        stage="build",
+        confidence=ParseConfidence.HEURISTIC if severity != "unknown" else ParseConfidence.RAW,
+    )
     primary: int | None = None
     for idx, token in enumerate(doc.tokens):
         value = token.text

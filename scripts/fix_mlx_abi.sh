@@ -1,58 +1,113 @@
 #!/usr/bin/env bash
-# fix_mlx_abi.sh — repair MLX venv-vs-brew dylib version mismatch.
-#
-# Strategy:
-#   1. Pin the venv's mlx package to the brew-installed version so the
-#      bundled .dylib matches what DYLD will resolve.
-#   2. Fall back to plain pin (no force-reinstall) if step 1 fails.
-#   3. Print manual instructions if both fail.
-set -uo pipefail
+# Reconcile one explicitly selected isolated environment with uv.lock.
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VENV_PY="$REPO_ROOT/.venv/bin/python"
-VENV_PIP="$REPO_ROOT/.venv/bin/pip"
-BREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+DEFAULT_ENV_ROOT="$(cd "$REPO_ROOT/.." && pwd)/.venvs/cppmega.mlx"
+EXPECTED_ENV_ROOT="${CPPMEGA_MLX_ENV_ROOT:-$DEFAULT_ENV_ROOT}"
+PYTHON_BIN="${CPPMEGA_MLX_PYTHON:-$EXPECTED_ENV_ROOT/bin/python}"
 
-if [[ ! -x "$VENV_PIP" ]]; then
-  echo "ERROR: $VENV_PIP not found. Activate or create the venv first."
+if [[ "$#" -gt 1 || ( "$#" -eq 1 && "$1" != "--apply" ) ]]; then
+  echo "ERROR: unexpected argument; use no arguments for a probe or exactly --apply" >&2
   exit 2
 fi
 
-BREW_VER=$(ls "$BREW_PREFIX/Cellar/mlx/" 2>/dev/null | head -1)
-if [[ -z "$BREW_VER" ]]; then
-  echo "INFO: no brew mlx detected. Pinning venv to latest pip-released mlx."
-  TARGET=""
-else
-  TARGET="==$BREW_VER"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "ERROR: Python executable is unavailable: $PYTHON_BIN" >&2
+  exit 2
 fi
 
-echo "Reinstalling mlx$TARGET into $VENV_PY"
-if "$VENV_PIP" install --force-reinstall --no-cache-dir "mlx$TARGET" 2>&1 | tail -5; then
-  echo "OK: reinstall succeeded"
-else
-  echo "WARN: --force-reinstall failed; trying plain install"
-  if "$VENV_PIP" install "mlx$TARGET" 2>&1 | tail -5; then
-    echo "OK: plain install succeeded"
-  else
-    cat <<MANUAL
-ERROR: pip install failed.
-
-Manual recovery options:
-  1. Recreate the venv from scratch:
-       python3 -m venv .venv
-       ./.venv/bin/pip install -e .
-  2. Unlink the brew mlx so DYLD only finds the pip-installed dylib:
-       brew unlink mlx
-  3. Pin DYLD_LIBRARY_PATH to brew before running tests:
-       export DYLD_LIBRARY_PATH=$BREW_PREFIX/lib
-
-See docs/mlx_abi_troubleshooting.md for the full triage tree.
-MANUAL
-    exit 1
-  fi
+if [[ "$#" -eq 0 ]]; then
+  echo "No packages changed. Running the fail-closed runtime/ABI probe."
+  exec env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+    -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+    CPPMEGA_MLX_ENV_ROOT="$EXPECTED_ENV_ROOT" \
+    CPPMEGA_MLX_PYTHON="$PYTHON_BIN" \
+    "$REPO_ROOT/scripts/check_mlx_abi.sh"
 fi
 
-# Verify
-NEW_VER=$("$VENV_PY" -c "import mlx.core as mx; print(mx.__version__)" 2>&1 | head -1)
-echo "post-fix venv mlx version: $NEW_VER"
-exit 0
+EXPECTED_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$EXPECTED_ENV_ROOT")"
+EXPECTED_LEXICAL="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$EXPECTED_ENV_ROOT")"
+PYTHON_ABS="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PYTHON_BIN")"
+case "$PYTHON_ABS" in
+  "$EXPECTED_LEXICAL/bin/"*)
+    ;;
+  *)
+    echo "ERROR: refusing to sync unowned environment: Python $PYTHON_ABS is outside $EXPECTED_REAL/bin" >&2
+    exit 2
+    ;;
+esac
+
+if ! ENV_INFO="$(env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+  -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+  "$PYTHON_BIN" -c 'import os,sys; print(os.path.realpath(sys.prefix)); print(os.path.realpath(sys.base_prefix))')"; then
+  echo "ERROR: cannot inspect Python environment prefix: $PYTHON_BIN" >&2
+  exit 2
+fi
+ENV_PREFIX="${ENV_INFO%%$'\n'*}"
+BASE_PREFIX="${ENV_INFO#*$'\n'}"
+if [[ -z "$ENV_PREFIX" || -z "$BASE_PREFIX" || "$ENV_PREFIX" == "$BASE_PREFIX" ]]; then
+  echo "ERROR: refusing to modify a system/base Python installation: prefix=$ENV_PREFIX base=$BASE_PREFIX" >&2
+  exit 2
+fi
+if [[ "$ENV_PREFIX" != "$EXPECTED_REAL" ]]; then
+  echo "ERROR: refusing to sync unowned environment $ENV_PREFIX" >&2
+  echo "Expected $EXPECTED_REAL (override only with CPPMEGA_MLX_ENV_ROOT)." >&2
+  exit 2
+fi
+if [[ ! -f "$ENV_PREFIX/pyvenv.cfg" ]]; then
+  echo "ERROR: selected Python is not a verified virtual environment (missing $ENV_PREFIX/pyvenv.cfg)" >&2
+  exit 2
+fi
+
+if ! GIT_ROOT="$("$PYTHON_BIN" - "$ENV_PREFIX" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]).resolve()
+for candidate in (path, *path.parents):
+    if (candidate / ".git").exists():
+        print(candidate)
+        break
+PY
+)"; then
+  echo "ERROR: cannot inspect whether the selected environment is inside a Git checkout" >&2
+  exit 2
+fi
+if [[ -n "$GIT_ROOT" ]]; then
+  echo "ERROR: refusing to sync an environment inside git checkout $GIT_ROOT" >&2
+  exit 2
+fi
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "ERROR: uv is unavailable; refusing to apply a package sync" >&2
+  exit 2
+fi
+
+env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+  -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+  -u TVM_HOME -u TVM_ROOT -u TVM_LIBRARY_PATH -u TVM_IMPORT_PYTHON_PATH \
+  -u TVM_FFI_INCLUDE_PATH -u TVM_FFI_DLPACK_INCLUDE_PATH \
+  -u TL_APACHE_TVM_SOURCE_HOME -u TL_APACHE_TVM_SWAP_HOME \
+  -u TL_EXTERNAL_TVM_HOME -u TL_TILELANG_SITE -u TL_TILELANG_VENVS \
+  -u TL_TVM_IMPORT_PYTHON_PATH -u DYLD_LIBRARY_PATH \
+  uv lock --check --no-sources --project "$REPO_ROOT"
+
+echo "Reconciling isolated environment from uv.lock: $ENV_PREFIX"
+env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+  -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+  -u TVM_HOME -u TVM_ROOT -u TVM_LIBRARY_PATH -u TVM_IMPORT_PYTHON_PATH \
+  -u TVM_FFI_INCLUDE_PATH -u TVM_FFI_DLPACK_INCLUDE_PATH \
+  -u TL_APACHE_TVM_SOURCE_HOME -u TL_APACHE_TVM_SWAP_HOME \
+  -u TL_EXTERNAL_TVM_HOME -u TL_TILELANG_SITE -u TL_TILELANG_VENVS \
+  -u TL_TVM_IMPORT_PYTHON_PATH -u DYLD_LIBRARY_PATH \
+  UV_PROJECT_ENVIRONMENT="$ENV_PREFIX" \
+  uv sync --project "$REPO_ROOT" --locked --no-sources \
+    --python "$PYTHON_BIN" --extra parquet --extra gui --extra widget \
+    --extra path-c --group dev
+
+exec env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
+  -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
+  CPPMEGA_MLX_ENV_ROOT="$EXPECTED_REAL" \
+  CPPMEGA_MLX_PYTHON="$PYTHON_BIN" \
+  "$REPO_ROOT/scripts/check_mlx_abi.sh"

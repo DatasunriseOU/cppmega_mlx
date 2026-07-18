@@ -16,12 +16,22 @@ def new_diagnostic_doc(
     domain: DomainKind,
     tool: str,
     confidence: ParseConfidence = ParseConfidence.HEURISTIC,
+    severity: str | None = None,
+    stage: str | None = None,
+    platform: str = "posix",
 ) -> ParsedDomainDocument:
     return ParsedDomainDocument.new(
         domain=domain,
         text=text,
         confidence=confidence,
-        metadata={"diagnostic_tool": tool},
+        metadata={
+            "diagnostic_tool": tool,
+            "tool": tool,
+            "severity": severity or "unknown",
+            "stage": stage or "unknown",
+            "platform": platform,
+            "parser_adapter": f"{tool}-diagnostic",
+        },
     )
 
 

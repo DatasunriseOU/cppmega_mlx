@@ -16,13 +16,24 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
         domain=domain,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"build_kind": build_kind},
+        metadata={"build_kind": build_kind, "parser_adapter": build_kind},
     )
     next_entity = 1
     current_target: int | None = None
 
     for line_no, raw_line in enumerate(text.splitlines()):
         line_indices = doc.token_indices_on_line(line_no)
+        comment_offset = next(
+            (
+                idx
+                for idx, char in enumerate(raw_line)
+                if char == "#" and (idx == 0 or raw_line[idx - 1] != "\\")
+            ),
+            len(raw_line),
+        )
+        line_indices = [
+            idx for idx in line_indices if doc.tokens[idx].column < comment_offset
+        ]
         if not line_indices:
             continue
         stripped = raw_line.lstrip()
@@ -54,10 +65,20 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
                 next_entity += 1
             continue
 
-        colon_idx = next((i for i in line_indices if doc.tokens[i].text == ":"), None)
+        colon_idx = next(
+            (i for i in line_indices if doc.tokens[i].text in {":", "::"}),
+            None,
+        )
         if colon_idx is not None:
             targets = [i for i in line_indices if i < colon_idx]
-            prereqs = [i for i in line_indices if i > colon_idx]
+            prereqs: list[int] = []
+            for token_idx in (i for i in line_indices if i > colon_idx):
+                value = doc.tokens[token_idx].text
+                if value == ";":
+                    break
+                if value in {"|", "||", ".WAIT"}:
+                    continue
+                prereqs.append(token_idx)
             if targets:
                 current_target = targets[0]
                 doc.set_role(current_target, DomainRoleKind.TARGET, entity=next_entity)
@@ -72,7 +93,20 @@ def parse_make(text: str, *, domain: DomainKind = DomainKind.MAKE, build_kind: s
 
 
 def parse_automake(text: str) -> ParsedDomainDocument:
-    return parse_make(text, domain=DomainKind.AUTOMAKE, build_kind="automake")
+    doc = parse_make(text, domain=DomainKind.AUTOMAKE, build_kind="automake")
+    for quote in ('"', "'"):
+        escaped = False
+        count = 0
+        for char in text:
+            if char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                count += 1
+            escaped = False
+        if count % 2:
+            return doc.mark_raw("malformed_automake_syntax")
+    return doc
 
 
 __all__ = ["parse_automake", "parse_make"]

@@ -36,10 +36,9 @@ SCRIPT = ROOT / "scripts" / "bench_zero1_loopback.py"
 def _venv_python() -> str:
     """Return the project venv's python interpreter.
 
-    Callers in CI must run via ``.venv/bin/python -m pytest``; we re-use
-    :data:`sys.executable` so the spawned subprocess also has access to
-    the project's installed dependencies. Tests do not fall back to the
-    system python because cppmega_mlx + mlx are venv-installed.
+    Callers must run pytest through the selected dedicated environment; we
+    re-use :data:`sys.executable` so the subprocess exercises that exact
+    package set instead of the checkout's shared ``.venv`` symlink.
     """
 
     return sys.executable
@@ -54,7 +53,7 @@ def _mlx_launch_available() -> bool:
     """
 
     try:
-        import mlx.core as mx  # noqa: WPS433 -- runtime probe
+        import mlx.core as mx
 
         if not mx.distributed.is_available("ring"):
             return False
@@ -75,6 +74,32 @@ def _venv_mlx_launch() -> str:
     if fallback is None:
         raise RuntimeError("mlx.launch is not installed; cannot run loopback test")
     return fallback
+
+
+def _isolated_subprocess_env() -> dict[str, str]:
+    """Keep the launcher from inheriting a different MLX/TVM checkout."""
+
+    blocked = {
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "TVM_HOME",
+        "TVM_ROOT",
+        "TVM_LIBRARY_PATH",
+        "TVM_IMPORT_PYTHON_PATH",
+        "TVM_FFI_INCLUDE_PATH",
+        "TVM_FFI_DLPACK_INCLUDE_PATH",
+        "TL_APACHE_TVM_SOURCE_HOME",
+        "TL_APACHE_TVM_SWAP_HOME",
+        "TL_EXTERNAL_TVM_HOME",
+        "TL_TILELANG_SITE",
+        "TL_TILELANG_VENVS",
+        "TL_TVM_IMPORT_PYTHON_PATH",
+        "DYLD_LIBRARY_PATH",
+    }
+    environment = {key: value for key, value in os.environ.items() if key not in blocked}
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
 
 
 @pytest.mark.slow
@@ -102,6 +127,7 @@ def test_zero1_simulated_2proc_receipt(tmp_path: Path) -> None:
         text=True,
         check=False,
         cwd=str(ROOT),
+        env=_isolated_subprocess_env(),
     )
     assert proc.returncode == 0, (
         f"bench script exit={proc.returncode}\n"
@@ -154,9 +180,9 @@ def test_zero1_loopback_2proc_receipt(tmp_path: Path) -> None:
             "127.0.0.1",
             "--backend",
             "ring",
-            "--python",
-            _venv_python(),
             "--",
+            # mlx.launch executes the remainder directly on each rank.
+            _venv_python(),
             str(SCRIPT),
             "--steps",
             "10",  # 10 steps keeps the test under the 5 min default budget.
@@ -169,7 +195,7 @@ def test_zero1_loopback_2proc_receipt(tmp_path: Path) -> None:
         text=True,
         check=False,
         cwd=str(ROOT),
-        env={**os.environ},
+        env=_isolated_subprocess_env(),
     )
     assert proc.returncode == 0, (
         f"mlx.launch exit={proc.returncode}\n"

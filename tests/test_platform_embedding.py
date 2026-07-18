@@ -58,3 +58,28 @@ def test_platform_embedding_validates_platform_ids_shape_and_range() -> None:
 
     with pytest.raises(ValueError, match="non-negative"):
         module(mx.array([[1, -2]], dtype=mx.int32))
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (0.5, "fractional"),
+        (float("nan"), "finite"),
+        (float("inf"), "finite"),
+    ],
+)
+def test_platform_embedding_rejects_invalid_integer_channels_before_cast(
+    value: float,
+    error: str,
+) -> None:
+    module = PlatformEmbedding(hidden_size=4, vocab_size=PLATFORM_VOCAB_SIZE)
+
+    with pytest.raises(ValueError, match=error):
+        module(mx.array([[value]], dtype=mx.float32))
+
+
+def test_platform_embedding_rejects_uint64_overflow_before_cast() -> None:
+    module = PlatformEmbedding(hidden_size=4, vocab_size=PLATFORM_VOCAB_SIZE)
+
+    with pytest.raises(ValueError, match="less than vocab_size"):
+        module(mx.array([[2**64 - 1]], dtype=mx.uint64))

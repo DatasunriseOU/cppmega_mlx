@@ -17,18 +17,37 @@ missing input, empty output, or malformed store rows. There is no fallback path.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sqlite3
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+
+def _load_local_symbol_identity() -> ModuleType:
+    module_path = REPO_ROOT / "cppmega_mlx" / "data" / "symbol_identity.py"
+    module = importlib.import_module("cppmega_mlx.data.symbol_identity")
+    loaded_path = Path(getattr(module, "__file__", "")).resolve()
+    if loaded_path != module_path.resolve():
+        raise ImportError(
+            "cppmega_mlx.data.symbol_identity resolved outside this checkout: "
+            f"loaded={loaded_path} expected={module_path}"
+        )
+    return module
+
+
+_symbol_identity = _load_local_symbol_identity()
+SYMBOL_IDENTITIES_COLUMN = _symbol_identity.SYMBOL_IDENTITIES_COLUMN
+SYMBOL_IDENTITY_SCHEMA_VERSION = _symbol_identity.SYMBOL_IDENTITY_SCHEMA_VERSION
 
 import streaming_reindex as sr  # noqa: E402
 from streaming_reindex_commits import route_by_fit, recompress_zstd_max  # noqa: E402
@@ -118,6 +137,8 @@ def _write_pr_jsonl(
             if not text:
                 continue
             payload = {
+                "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
+                SYMBOL_IDENTITIES_COLUMN: [],
                 "text": text,
                 "source_text": text,
                 "repo": rec["repo"],

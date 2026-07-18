@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 _VALID_MODES = ("auto", "engine", "shim", "engine_with_msl_extraction")
@@ -160,6 +160,7 @@ def compile_native_tilelang_kernel(
     import tilelang  # noqa: F401 - intentional eager import for ImportError surfacing
     from cppmega_mlx.nn._tilelang._mlx_runtime import (
         NativeTileLangKernel,
+        _build_native_graph_runner,
         normalize_out_idx,
     )
     from cppmega_mlx.nn._tilelang._msl_transform import _ensure_single_libtvm_ffi_image
@@ -192,12 +193,18 @@ def compile_native_tilelang_kernel(
         setattr(artifact, "_tilelang_result_indices", result_indices)
     except (AttributeError, TypeError):
         pass
+    graph_runner = (
+        _build_native_graph_runner(artifact, result_indices)
+        if allow_graph_outputs
+        else None
+    )
     return NativeTileLangKernel(
         artifact=artifact,
         result_indices=result_indices,
         num_params=num_params,
         target=target,
         allow_graph_outputs=allow_graph_outputs,
+        graph_runner=graph_runner,
     )
 
 
