@@ -5456,6 +5456,80 @@ def build_enriched_doc(
     return result
 
 
+def _build_edges_from_detection(
+    build_info: dict | None,
+    source_text: str,
+) -> list[dict[str, int]]:
+    """Extract build-graph edges from build file text using existing parsers.
+
+    Uses the domain build parsers (cmake, make, bazel, ninja) to produce
+    char-level edge triples suitable for the ``build_edges`` field.  Returns
+    an empty list when no parser applies or the text yields no edges.
+    """
+
+    if not build_info or not source_text or not source_text.strip():
+        return []
+
+    from cppmega_mlx.data.domain_schema import domain_edge_family
+
+    build_system = (build_info.get("build_system") or "").lower().replace("-", "_")
+    parser_module_by_kind: dict[str, str] = {
+        "cmake": "cppmega_mlx.data.build_parsers.cmake",
+        "cmakelists": "cppmega_mlx.data.build_parsers.cmake",
+        "make": "cppmega_mlx.data.build_parsers.make",
+        "gmake": "cppmega_mlx.data.build_parsers.make",
+        "makefile": "cppmega_mlx.data.build_parsers.make",
+        "automake": "cppmega_mlx.data.build_parsers.make",
+        "bazel": "cppmega_mlx.data.build_parsers.bazel",
+        "ninja": "cppmega_mlx.data.build_parsers.ninja",
+    }
+    module_path = parser_module_by_kind.get(build_system)
+    if module_path is None:
+        return []
+
+    try:
+        mod = importlib.import_module(module_path)
+    except ImportError:
+        return []
+
+    parse_fn = None
+    if build_system in {"cmake", "cmakelists"}:
+        parse_fn = getattr(mod, "parse_cmake", None)
+    elif build_system in {"make", "gmake", "makefile", "automake"}:
+        parse_fn = getattr(mod, "parse_make", None)
+    elif build_system == "bazel":
+        parse_fn = getattr(mod, "parse_bazel", None)
+    elif build_system == "ninja":
+        parse_fn = getattr(mod, "parse_ninja", None)
+
+    if parse_fn is None:
+        return []
+
+    try:
+        parsed = parse_fn(source_text)
+    except Exception:
+        return []
+
+    edges: list[dict[str, int]] = []
+    for src, dst, kind in parsed.edges:
+        try:
+            family = domain_edge_family(kind)
+        except (ValueError, TypeError):
+            continue
+        if family != "build":
+            continue
+        if not (0 <= src < len(parsed.tokens)) or not (0 <= dst < len(parsed.tokens)):
+            continue
+        edges.append(
+            {
+                "from_char": int(parsed.tokens[src].start),
+                "to_char": int(parsed.tokens[dst].start),
+                "kind": int(kind),
+            }
+        )
+    return edges
+
+
 # --------------------------------------------------------------------------- #
 # Build-file doc emission (ADDITIVE).
 #
@@ -5751,6 +5825,12 @@ def build_build_doc(
         result['platform_info'] = detected_platform
     if build_info:
         result['build_info'] = build_info
+    # Supplement build_edges from build_info detection when the domain parser
+    # did not produce structural edges (e.g. unsupported build kinds).
+    if not result.get('build_edges') and build_info:
+        detected_edges = _build_edges_from_detection(build_info, text)
+        if detected_edges:
+            result['build_edges'] = detected_edges
     if source_span is not None:
         result['source_span'] = dict(source_span)
     return result
