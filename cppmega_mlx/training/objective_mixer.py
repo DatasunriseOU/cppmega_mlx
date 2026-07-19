@@ -884,7 +884,43 @@ class EligibilityAwareTaskMixer:
             ):
                 return realized
 
+        # Exhaustive fallback: the greedy augmenting-path matcher explores only
+        # a narrow set of realizations because candidate_packets ordering is
+        # fixed.  When required_realized_assignment is active and the initial
+        # sweep failed, enumerate all valid packet-to-slot matchings to avoid
+        # a false ObjectiveQuotaUnsatisfiedError (CR-01).
         if required_realized_assignment is not None and matched_assignment:
+            import itertools
+
+            num_slots = len(slots)
+            pool_indices = list(range(len(packets)))
+            for combo in itertools.combinations(pool_indices, num_slots):
+                # Try all permutations of slot assignments for this packet combo
+                for perm in itertools.permutations(range(num_slots)):
+                    # Check eligibility: packet combo[i] must be eligible for
+                    # the task of slot perm[i]
+                    valid = all(
+                        slots[perm[i]] in eligibility[combo[i]][0]
+                        for i in range(num_slots)
+                    )
+                    if not valid:
+                        continue
+                    # Build packet_owner for this assignment
+                    exhaustive_owner: list[int | None] = [None] * len(packets)
+                    for i, packet_idx in enumerate(combo):
+                        exhaustive_owner[packet_idx] = perm[i]
+                    signature = tuple(exhaustive_owner)
+                    if signature in attempted_assignments:
+                        continue
+                    attempted_assignments.add(signature)
+                    realized = realize(exhaustive_owner)
+                    if any(
+                        required_realized_assignment(
+                            packets[item.source_index], item
+                        )
+                        for item in realized
+                    ):
+                        return realized
             raise ObjectiveQuotaUnsatisfiedError(
                 "objective quota matching produced no realized assignment "
                 "satisfying the required auxiliary constraint: "
