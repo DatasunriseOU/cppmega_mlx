@@ -18,6 +18,10 @@ from cppmega_mlx.data.prompt_graph import (
 from cppmega_mlx.data.prompt_graph_index import (
     ClangPromptProjectIndexProducer,
 )
+from cppmega_mlx.data.prompt_graph_provenance import (
+    INDEX_INTEGRITY_VERSION,
+    validate_shared_provenance,
+)
 from cppmega_mlx.data.symbol_identity import compute_symbol_id
 
 
@@ -687,3 +691,90 @@ def test_corrupt_producer_cache_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="cached prompt project index"):
         producer.build(FIXTURE, project_id="tests/case3-corrupt")
+
+
+# ---------------------------------------------------------------------------
+# CR-03: index_integrity_version provenance round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_cr03_producer_emits_index_integrity_version(tmp_path: Path) -> None:
+    """MLX producer must emit index_integrity_version in provenance output."""
+    project_id = "tests/case3-cr03-emit"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+
+    assert result.receipt["index_integrity_version"] == INDEX_INTEGRITY_VERSION
+
+
+def test_cr03_provenance_round_trip_validates(tmp_path: Path) -> None:
+    """Serialize MLX index, reload, and validate through shared provenance."""
+    project_id = "tests/case3-cr03-roundtrip"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+
+    # Serialize and reload
+    payload = result.index.to_dict()
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    reloaded = PromptProjectIndex.from_dict(json.loads(serialized))
+
+    # Must pass shared provenance validation
+    validate_shared_provenance(reloaded, expected_indexer_root=ROOT)
+
+
+def test_cr03_tampered_integrity_version_rejected(tmp_path: Path) -> None:
+    """Deliberately changed index_integrity_version must be rejected."""
+    project_id = "tests/case3-cr03-tamper"
+    result = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=ROOT,
+    ).build(FIXTURE, project_id=project_id)
+
+    payload = result.index.to_dict()
+    payload["provenance"]["index_integrity_version"] = "999"
+    tampered = PromptProjectIndex.from_dict(payload).with_integrity()
+
+    with pytest.raises(ValueError, match="integrity version"):
+        validate_shared_provenance(tampered, expected_indexer_root=ROOT)
+
+
+# ---------------------------------------------------------------------------
+# CR-07: foreign indexer_root rejection
+# ---------------------------------------------------------------------------
+
+
+def test_cr07_load_indexer_rejects_foreign_checkout(tmp_path: Path) -> None:
+    """_load_indexer must reject an indexer_root outside the package checkout."""
+    foreign_root = tmp_path / "foreign_checkout"
+    foreign_root.mkdir()
+    (foreign_root / "tools" / "clang_indexer").mkdir(parents=True)
+    (foreign_root / "tools" / "clang_indexer" / "index_project.py").write_text(
+        "# foreign\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="same checkout"):
+        prompt_graph_index_module._load_indexer(foreign_root)
+
+
+def test_cr07_producer_rejects_foreign_indexer_before_execution(
+    tmp_path: Path,
+) -> None:
+    """Producer.build must reject foreign indexer_root before module exec."""
+    foreign_root = tmp_path / "foreign_checkout"
+    foreign_root.mkdir()
+    (foreign_root / "tools" / "clang_indexer").mkdir(parents=True)
+    (foreign_root / "tools" / "clang_indexer" / "index_project.py").write_text(
+        "raise RuntimeError('must not execute')\n", encoding="utf-8"
+    )
+
+    producer = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=foreign_root,
+    )
+
+    with pytest.raises(ValueError, match="same checkout"):
+        producer.build(FIXTURE, project_id="tests/case3-cr07-foreign")
