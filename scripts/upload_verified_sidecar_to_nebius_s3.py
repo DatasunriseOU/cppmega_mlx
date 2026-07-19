@@ -422,11 +422,8 @@ def _write_manifest(
     if len(audit_receipts) != 1:
         raise SystemExit("exactly one final audit receipt is required")
     audit_path = audit_receipts[0]
-    audit_payload = validate_audit_receipt(
-        json.loads(audit_path.read_text(encoding="utf-8")),
-        selected_keys=selected_keys,
-    )
     inventory: list[dict[str, object]] = []
+    inventory_by_bucket: dict[str, list[dict[str, object]]] = {}
     for remote, local in selections:
         record = inventory_directory(local, remote=remote)
         inventory.append(
@@ -438,10 +435,25 @@ def _write_manifest(
         )
         key = remote.removeprefix("parquet/") if remote.startswith("parquet/") else None
         if key is not None:
+            inventory_by_bucket[key] = [
+                {"path": f["path"], "size": f["size"], "sha256": f["sha256"]}
+                for f in record["files"]
+            ]
+    audit_payload = validate_audit_receipt(
+        json.loads(audit_path.read_text(encoding="utf-8")),
+        selected_keys=selected_keys,
+        inventory=inventory_by_bucket,
+    )
+    for remote, local in selections:
+        key = remote.removeprefix("parquet/") if remote.startswith("parquet/") else None
+        if key is not None:
+            inv_record = next(
+                r for r in inventory if r["remote"] == remote
+            )
             expected_files = int(audit_payload["by_kind_bucket"][key]["files"])
-            if int(record["file_count"]) != expected_files:
+            if int(inv_record["file_count"]) != expected_files:
                 raise SystemExit(
-                    f"inventory file count for {remote}={record['file_count']} "
+                    f"inventory file count for {remote}={inv_record['file_count']} "
                     f"differs from audit receipt={expected_files}"
                 )
     audit_selection = next(

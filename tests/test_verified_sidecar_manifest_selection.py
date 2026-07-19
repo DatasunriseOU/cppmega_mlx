@@ -24,6 +24,8 @@ from scripts.sidecar_manifest_contract import (
     inventory_directory,
     inventory_sha256,
     selection_policy,
+    sha256_file,
+    validate_audit_receipt,
     validate_manifest,
 )
 
@@ -130,26 +132,33 @@ def _build_receipt(
     valid_tokens: dict[str, int],
     bad: dict[str, tuple[int, int]] | None = None,
     omit: set[str] | None = None,
+    file_records: dict[str, list[dict[str, object]]] | None = None,
 ) -> Path:
     """Write a real audit receipt JSON with a ``by_kind_bucket`` map.
 
     ``bad`` maps a bucket key to ``(bad_files, bad_rows)``; ``omit`` drops keys
     entirely (stale/narrow receipt). The aggregate ``total`` is kept green on
     purpose to prove the gate is per-selected-bucket, not the coarse aggregate.
+    ``file_records`` maps a bucket key to per-file identity records
+    (path/size/sha256) that bind the receipt to exact bytes.
     """
     bad = bad or {}
     omit = omit or set()
-    by_kind_bucket: dict[str, dict[str, int]] = {}
+    file_records = file_records or {}
+    by_kind_bucket: dict[str, dict[str, object]] = {}
     for key, tokens in valid_tokens.items():
         if key in omit:
             continue
         bf, br = bad.get(key, (0, 0))
-        by_kind_bucket[key] = {
+        entry: dict[str, object] = {
             "valid_tokens": tokens,
             "files": 1,
             "bad_files": bf,
             "bad_rows": br,
         }
+        if key in file_records:
+            entry["file_records"] = file_records[key]
+        by_kind_bucket[key] = entry
     payload = {
         "schema": AUDIT_SCHEMA,
         "status": "verified",
@@ -258,18 +267,31 @@ def _download_fixture(
     return finalize_manifest(payload), root
 
 
-def _populate_upload_sources(selections: tuple[tuple[str, Path], ...]) -> None:
+def _populate_upload_sources(
+    selections: tuple[tuple[str, Path], ...],
+) -> dict[str, list[dict[str, object]]]:
+    """Create source directories and return per-bucket file identity records."""
+    file_records: dict[str, list[dict[str, object]]] = {}
     for index, (remote, local) in enumerate(selections, 1):
         local.mkdir(parents=True, exist_ok=True)
         if remote.startswith("parquet/"):
             key = remote.removeprefix("parquet/")
             bucket = int(remote.rsplit("/", 1)[1])
+            shard_path = local / f"part-{index:03d}.parquet"
             _write_green_shard(
-                local / f"part-{index:03d}.parquet",
+                shard_path,
                 bucket=bucket,
                 valid_tokens=_BUCKET_VALID_TOKENS[key],
                 source_id=index,
             )
+            file_records.setdefault(key, []).append(
+                {
+                    "path": shard_path.name,
+                    "size": shard_path.stat().st_size,
+                    "sha256": sha256_file(shard_path),
+                }
+            )
+    return file_records
 
 
 def test_token_total_is_profile_aware_subset(tmp_path: Path) -> None:
@@ -494,10 +516,14 @@ def test_upload_main_dry_run_writes_manifest_and_prints_targets(
     monkeypatch.chdir(tmp_path)
     # Every selected source dir must exist or _existing_sources RAISEs; this
     # also creates the audit dir that holds the receipt.
-    _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
+    fr = _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
     # Real temp receipt at the relative path the script reads (_audit_receipts),
     # covering every selected parquet bucket and green.
-    _build_receipt(upload._audit_receipts()[0], valid_tokens=_BUCKET_VALID_TOKENS)
+    _build_receipt(
+        upload._audit_receipts()[0],
+        valid_tokens=_BUCKET_VALID_TOKENS,
+        file_records=fr,
+    )
 
     manifest_path = tmp_path / "manifest.json"
     rc = upload.main(
@@ -549,11 +575,12 @@ def test_upload_main_dry_run_does_not_gate_default_on_standalone_pr_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
+    fr = _populate_upload_sources(upload.ALL_VALID_SELECTIONS)
     _build_receipt(
         upload._audit_receipts()[0],
         valid_tokens=_BUCKET_VALID_TOKENS,
         bad={"pr/8192": (1, 0)},
+        file_records=fr,
     )
 
     rc = upload.main(
@@ -574,13 +601,14 @@ def test_upload_main_dry_run_raises_on_non_green_explicit_standalone_pr_bucket(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    _populate_upload_sources(
+    fr = _populate_upload_sources(
         upload.CODE_COMMIT_SELECTIONS + upload.STANDALONE_PR_SELECTIONS
     )
     _build_receipt(
         upload._audit_receipts()[0],
         valid_tokens=_BUCKET_VALID_TOKENS,
         bad={"pr/8192": (1, 0)},
+        file_records=fr,
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -777,3 +805,92 @@ def test_download_main_dry_run_copies_manifest_uri(
     # syncs code/commit buckets, but not standalone PR diagnostics.
     assert "s3://mybucket/myprefix/parquet/code/1024/" in out
     assert "parquet/pr/" not in out
+
+
+# --- CR-11: audit receipt must bind to per-file bytes -------------------------
+
+
+def test_audit_receipt_rejects_stale_file_records_after_byte_swap(
+    tmp_path: Path,
+) -> None:
+    """A green receipt whose file_records reference the original bytes must be
+    rejected when the underlying parquet is replaced with different content
+    (same file count).  A fresh receipt matching the new bytes must pass.
+    """
+    shard_dir = tmp_path / "code" / "1024"
+    shard_dir.mkdir(parents=True)
+    shard = shard_dir / "part-001.parquet"
+    _write_green_shard(shard, bucket=1024, valid_tokens=42, source_id=1)
+
+    original_sha = sha256_file(shard)
+    original_size = shard.stat().st_size
+    original_records = [
+        {"path": "part-001.parquet", "size": original_size, "sha256": original_sha}
+    ]
+
+    receipt_path = tmp_path / "sidecar_parquet_audit.json"
+    _build_receipt(
+        receipt_path,
+        valid_tokens={"code/1024": 42},
+        file_records={"code/1024": original_records},
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    # Inventory matching the original bytes passes.
+    inventory_ok = {"code/1024": original_records}
+    validate_audit_receipt(receipt, selected_keys=["code/1024"], inventory=inventory_ok)
+
+    # Replace the shard with different bytes (same file count).
+    shard.write_bytes(b"\x00" * original_size)
+    swapped_sha = sha256_file(shard)
+    assert swapped_sha != original_sha
+    swapped_records = [
+        {"path": "part-001.parquet", "size": original_size, "sha256": swapped_sha}
+    ]
+    inventory_swapped = {"code/1024": swapped_records}
+
+    # The stale receipt must be rejected against the swapped inventory.
+    with pytest.raises(ValueError, match="file_records do not match inventory"):
+        validate_audit_receipt(
+            receipt, selected_keys=["code/1024"], inventory=inventory_swapped
+        )
+
+    # A fresh receipt binding to the new bytes must pass.
+    fresh_receipt_path = tmp_path / "fresh_audit.json"
+    _build_receipt(
+        fresh_receipt_path,
+        valid_tokens={"code/1024": 42},
+        file_records={"code/1024": swapped_records},
+    )
+    fresh_receipt = json.loads(fresh_receipt_path.read_text(encoding="utf-8"))
+    validate_audit_receipt(
+        fresh_receipt, selected_keys=["code/1024"], inventory=inventory_swapped
+    )
+
+
+def test_audit_receipt_rejects_missing_file_records_when_inventory_supplied(
+    tmp_path: Path,
+) -> None:
+    """When inventory is supplied but the receipt bucket lacks file_records,
+    validation must fail rather than silently skipping the byte binding.
+    """
+    receipt_path = tmp_path / "sidecar_parquet_audit.json"
+    _build_receipt(receipt_path, valid_tokens={"code/1024": 42})
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    shard_dir = tmp_path / "code" / "1024"
+    shard_dir.mkdir(parents=True)
+    shard = shard_dir / "part-001.parquet"
+    _write_green_shard(shard, bucket=1024, valid_tokens=42, source_id=1)
+    inv = {
+        "code/1024": [
+            {
+                "path": "part-001.parquet",
+                "size": shard.stat().st_size,
+                "sha256": sha256_file(shard),
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="lacks file_records"):
+        validate_audit_receipt(receipt, selected_keys=["code/1024"], inventory=inv)

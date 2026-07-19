@@ -1589,10 +1589,20 @@ def _audit_file(
     if stats.bad_rows:
         stats.bad_files = 1
 
+    import hashlib as _hashlib
+
+    file_size = path.stat().st_size
+    file_digest = _hashlib.sha256()
+    with path.open("rb") as _fh:
+        while _chunk := _fh.read(8 * 1024 * 1024):
+            file_digest.update(_chunk)
+
     return {
         "kind": kind,
         "bucket": bucket,
         "path": path_str,
+        "size": file_size,
+        "sha256": file_digest.hexdigest(),
         "stats": stats.as_dict(),
     }
 
@@ -1614,18 +1624,36 @@ def _rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
     by_kind: dict[str, AuditStats] = {}
     by_bucket: dict[str, AuditStats] = {}
     by_kind_bucket: dict[str, AuditStats] = {}
+    file_records_by_bucket: dict[str, list[dict[str, Any]]] = {}
     bad_files: list[str] = []
 
     for result in results:
         kind = result["kind"]
         bucket = result["bucket"]
+        key = f"{kind}/{bucket}"
         stats = _stats_from_dict(result["stats"])
         total.add(stats)
         by_kind.setdefault(kind, AuditStats()).add(stats)
         by_bucket.setdefault(bucket, AuditStats()).add(stats)
-        by_kind_bucket.setdefault(f"{kind}/{bucket}", AuditStats()).add(stats)
+        by_kind_bucket.setdefault(key, AuditStats()).add(stats)
+        file_records_by_bucket.setdefault(key, []).append(
+            {
+                "path": result["path"],
+                "size": result.get("size", 0),
+                "sha256": result.get("sha256", ""),
+            }
+        )
         if result["stats"]["bad_files"] or result["stats"]["bad_rows"]:
             bad_files.append(result["path"])
+
+    by_kind_bucket_out: dict[str, Any] = {}
+    for k, v in sorted(by_kind_bucket.items()):
+        entry = v.as_dict()
+        entry["file_records"] = sorted(
+            file_records_by_bucket.get(k, []),
+            key=lambda r: r["path"],
+        )
+        by_kind_bucket_out[k] = entry
 
     return {
         "total": total.as_dict(),
@@ -1637,7 +1665,7 @@ def _rollup(results: list[dict[str, Any]]) -> dict[str, Any]:
                 key=lambda kv: int(kv[0]) if kv[0].isdigit() else kv[0],
             )
         },
-        "by_kind_bucket": {k: v.as_dict() for k, v in sorted(by_kind_bucket.items())},
+        "by_kind_bucket": by_kind_bucket_out,
         "bad_files": bad_files[:10000],
     }
 

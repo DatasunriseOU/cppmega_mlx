@@ -201,6 +201,7 @@ def validate_audit_receipt(
     receipt: object,
     *,
     selected_keys: Sequence[str],
+    inventory: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(receipt, dict):
         raise ValueError("sidecar audit receipt must be an object")
@@ -225,7 +226,45 @@ def validate_audit_receipt(
             raise ValueError(f"sidecar audit bucket is not green: {key}")
         if int(row.get("files", 0)) <= 0 or int(row.get("valid_tokens", 0)) <= 0:
             raise ValueError(f"sidecar audit bucket has no verified data: {key}")
+    if inventory is not None:
+        _validate_receipt_file_records(by_kind_bucket, selected_keys, inventory)
     return receipt
+
+
+def _validate_receipt_file_records(
+    by_kind_bucket: dict,
+    selected_keys: Sequence[str],
+    inventory: Mapping[str, Sequence[Mapping[str, object]]],
+) -> None:
+    """Cross-check per-file path/size/SHA256 records in the receipt against
+    the actual upload inventory, binding the receipt to exact bytes."""
+    for key in selected_keys:
+        row = by_kind_bucket[key]
+        file_records = row.get("file_records")
+        inv_records = inventory.get(key)
+        if inv_records is None:
+            continue
+        if file_records is None:
+            raise ValueError(
+                f"sidecar audit receipt bucket {key} lacks file_records; "
+                f"cannot bind receipt to inventory bytes"
+            )
+        receipt_set = {
+            (str(r["path"]), int(r["size"]), str(r["sha256"]))
+            for r in file_records
+        }
+        inventory_set = {
+            (str(r["path"]), int(r["size"]), str(r["sha256"]))
+            for r in inv_records
+        }
+        if receipt_set != inventory_set:
+            stale = sorted(receipt_set - inventory_set)
+            new = sorted(inventory_set - receipt_set)
+            raise ValueError(
+                f"sidecar audit receipt file_records do not match inventory "
+                f"for bucket {key}: "
+                f"stale={stale[:3]} new={new[:3]}"
+            )
 
 
 def expected_bucket_remotes() -> set[str]:
