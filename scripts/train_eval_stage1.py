@@ -40,6 +40,7 @@ import random
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,13 +69,17 @@ from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ObjectiveAccounting,
     ObjectiveSource,
-    production_training_loss,
+    scheduled_production_training_loss,
 )
 from cppmega_mlx.training.objective_schedule import (
     CanonicalObjectivePlanner,
     OBJECTIVE_SCHEDULE_ALGORITHM,
     OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+    ScheduledObjective,
     canonical_schedule_receipt_sha256,
+    validate_objective_assignment_receipt,
+    validate_objective_source_selection_receipt,
+    validate_scheduled_objective,
 )
 from cppmega_mlx.data.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
@@ -221,6 +226,7 @@ class ObjectiveBatch:
     graph_route_receipts: tuple[dict[str, object], ...]
     graph_route_exclusion_reason: str | None
     schedule_window_receipt: dict[str, object] | None = None
+    schedule_assignment_receipts: tuple[dict[str, object], ...] = ()
 
     @property
     def aligned(self) -> bool:
@@ -485,7 +491,11 @@ def _graph_targets_and_pair_mask_mx(
 
 def _materialize_batch(
     task: TaskKind,
-    entries: list[tuple[ObjectiveExample, ObjectiveSource]],
+    entries: list[
+        ScheduledObjective
+        | tuple[ObjectiveExample, ObjectiveSource]
+        | tuple[ObjectiveExample, ObjectiveSource, Mapping[str, object]]
+    ],
     *,
     seq_len: int,
     graph_relations: tuple[str, ...] = ("call", "type"),
@@ -502,7 +512,32 @@ def _materialize_batch(
             f"{task.value}: graph_relations must be a non-empty supported tuple; "
             f"unsupported={unsupported_relations}"
         )
-    examples = tuple(example for example, _source in entries)
+    normalized_entries: list[
+        tuple[ObjectiveExample, ObjectiveSource, Mapping[str, object] | None]
+    ] = []
+    for entry in entries:
+        if isinstance(entry, ScheduledObjective):
+            validate_scheduled_objective(
+                entry,
+                graph_relations=graph_relations,
+            )
+            normalized_entries.append(
+                (
+                    entry.realized.example,
+                    entry.source,
+                    dict(entry.assignment_receipt or {}),
+                )
+            )
+            continue
+        elif len(entry) == 2:
+            example, source = entry
+            assignment_receipt = None
+        elif len(entry) == 3:
+            example, source, assignment_receipt = entry
+        else:  # pragma: no cover - typed tuple contract
+            raise ValueError(f"{task.value}: objective entry tuple has invalid arity")
+        normalized_entries.append((example, source, assignment_receipt))
+    examples = tuple(example for example, _source, _receipt in normalized_entries)
     input_ids = mx.array(
         [_pad(example.input_ids, seq_len) for example in examples], dtype=mx.int32
     )
@@ -527,7 +562,9 @@ def _materialize_batch(
     route_receipts: list[dict[str, object]] = []
     exclusion_reasons: set[str] = set()
     input_lengths: list[int] = []
-    for row_index, (example, source) in enumerate(entries):
+    for row_index, (example, source, _assignment_receipt) in enumerate(
+        normalized_entries
+    ):
         input_length = int(example.input_ids.shape[0])
         input_lengths.append(input_length)
         source_indices = _objective_source_indices(task, example)
@@ -608,7 +645,39 @@ def _materialize_batch(
     )
     graph_edges_array = mx.sum(graph_targets)
     graph_samples_array = mx.sum(eligible_rows.astype(mx.int32))
-    mx.eval(graph_edges_array, graph_samples_array)
+    mx.eval(graph_edges_array, graph_samples_array, eligible_rows)
+    assignment_receipts = tuple(
+        receipt
+        for _example, _source, receipt in normalized_entries
+        if receipt is not None
+    )
+    if assignment_receipts:
+        if len(assignment_receipts) != len(normalized_entries):
+            raise ValueError(
+                f"{task.value}: canonical schedule receipt is missing for a batch row"
+            )
+        graph_positive_rows = [
+            bool(value) for value in eligible_rows.tolist()
+        ]
+        for row_index, receipt in enumerate(assignment_receipts):
+            validate_objective_assignment_receipt(
+                receipt,
+                graph_relations=graph_relations,
+            )
+            if receipt.get("task") != task.value:
+                raise ValueError(
+                    f"{task.value}: schedule assignment task drifted at row {row_index}"
+                )
+            graph_receipt = receipt.get("graph_eligibility")
+            receipt_positive = bool(
+                isinstance(graph_receipt, Mapping)
+                and graph_receipt.get("eligible") is True
+            )
+            if receipt_positive != graph_positive_rows[row_index]:
+                raise ValueError(
+                    f"{task.value}: graph eligibility receipt disagrees with "
+                    f"materialized graph targets at row {row_index}"
+                )
     return ObjectiveBatch(
         task=task,
         examples=examples,
@@ -628,6 +697,7 @@ def _materialize_batch(
             None if not exclusion_reasons else next(iter(exclusion_reasons))
         ),
         schedule_window_receipt=schedule_window_receipt,
+        schedule_assignment_receipts=assignment_receipts,
     )
 
 
@@ -643,6 +713,8 @@ def _objective_batches(
     graph_relations: tuple[str, ...] = ("call", "type"),
     require_route_sidecars: bool = True,
     schedule_receipts: list[dict[str, object]] | None = None,
+    planner_holder: list[CanonicalObjectivePlanner] | None = None,
+    require_production_objectives: bool = False,
 ):
     if quota_lookahead_samples is None:
         quota_lookahead_samples = 3 * quota_window_samples
@@ -662,20 +734,25 @@ def _objective_batches(
         quota_lookahead_samples=quota_lookahead_samples,
         graph_relations=graph_relations,
         require_route_sidecars=require_route_sidecars,
+        require_production_objectives=require_production_objectives,
     )
+    if planner_holder is not None:
+        planner_holder.append(planner)
     start_step = 0
     while True:
         window = planner.plan_window(start_step=start_step)
         if schedule_receipts is not None:
             schedule_receipts.append(dict(window.receipt))
-        grouped: dict[TaskKind, list[tuple[ObjectiveExample, ObjectiveSource]]] = {
+        grouped: dict[TaskKind, list[ScheduledObjective]] = {
             task: [] for task in quotas
         }
         for assignment in window.assignments:
             item = assignment.realized
-            grouped[item.task].append(
-                (item.example, assignment.source)
+            validate_scheduled_objective(
+                assignment,
+                graph_relations=graph_relations,
             )
+            grouped[item.task].append(assignment)
         batches: list[ObjectiveBatch] = []
         for task, entries in grouped.items():
             for offset in range(0, len(entries), batch_size):
@@ -1131,6 +1208,8 @@ def main() -> None:
     warmup = args.warmup
     total = args.steps
     min_lr = peak_lr * 0.1
+    active_objective: TaskKind | None = None
+    active_schedule_assignments: tuple[dict[str, object], ...] = ()
 
     def lr_at(step: int) -> float:
         if step < warmup:
@@ -1151,11 +1230,13 @@ def main() -> None:
         graph_targets,
         graph_pair_mask,
     ):
-        return production_training_loss(
+        return scheduled_production_training_loss(
             model,
             input_ids,
             targets,
             loss_mask,
+            objective=active_objective,
+            schedule_assignments=active_schedule_assignments,
             side_channels=side,
             document_ids=document_ids,
             block_bias=block_bias,
@@ -1164,6 +1245,8 @@ def main() -> None:
             graph_pair_mask=graph_pair_mask,
             graph_config=graph_config,
             graph_weight=args.graph_aux_weight,
+            graph_relations=graph_config.relations,
+            require_schedule_receipt=True,
         )
 
     objective_loss_and_grad = nn.value_and_grad(
@@ -1233,6 +1316,7 @@ def main() -> None:
 
     source_iter = _iter_sources(train_shards, args.seed)
     schedule_receipts: list[dict[str, object]] = []
+    planner_holder: list[CanonicalObjectivePlanner] = []
     batch_iter = _objective_batches(
         source_iter,
         mixer,
@@ -1244,6 +1328,8 @@ def main() -> None:
         graph_relations=graph_config.relations,
         require_route_sidecars=True,
         schedule_receipts=schedule_receipts,
+        planner_holder=planner_holder,
+        require_production_objectives=True,
     )
     accounting = ObjectiveAccounting(mixer.rates)
     lm_accounting = ObjectiveAccounting(mixer.rates)
@@ -1259,6 +1345,21 @@ def main() -> None:
 
     for step in range(args.steps):
         objective_batch = next(batch_iter)
+        if len(objective_batch.schedule_assignment_receipts) != args.batch:
+            raise ValueError(
+                "production objective batch is missing canonical assignment receipts"
+            )
+        for assignment in objective_batch.schedule_assignment_receipts:
+            validate_objective_assignment_receipt(
+                assignment,
+                graph_relations=graph_config.relations,
+            )
+            if assignment.get("task") != objective_batch.task.value:
+                raise ValueError(
+                    "production objective batch task drifted from its schedule receipt"
+                )
+        active_objective = objective_batch.task
+        active_schedule_assignments = objective_batch.schedule_assignment_receipts
         # LR is updated outside the compiled step (it changes every step); MLX
         # picks up the new optimizer scalar via the captured state.
         opt.learning_rate = lr_at(step)
@@ -1366,14 +1467,29 @@ def main() -> None:
         "raw_mean_loss": graph_aux_loss_sum / graph_aux_batches,
         "route_exclusions": dict(graph_route_exclusions),
     }
-    schedule_report = {
-        "schema": OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
-        "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
-        "windows": len(schedule_receipts),
-        "windows_sha256": canonical_schedule_receipt_sha256(schedule_receipts),
-        "quota_window_samples": quota_window_samples,
-        "quota_lookahead_samples": quota_lookahead_samples,
-    }
+    if len(planner_holder) != 1:
+        raise RuntimeError("production objective runner lost its canonical planner")
+    output_samples = args.steps * args.batch
+    schedule_report = planner_holder[0].source_selection_receipt(
+        output_samples=output_samples
+    )
+    validate_objective_source_selection_receipt(
+        schedule_report,
+        output_samples=output_samples,
+        quota_window_samples=quota_window_samples,
+        graph_relations=graph_config.relations,
+        expected_window_quotas={
+            task.value: count
+            for task, count in mixer.quotas(quota_window_samples).items()
+        },
+    )
+    if schedule_report["windows"] != schedule_receipts:
+        raise RuntimeError("runner schedule windows drifted from the planner receipt")
+    schedule_receipt_path = OUT_DIR / "objective_schedule_receipt.json"
+    schedule_receipt_path.write_text(
+        json.dumps(schedule_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     log(
         "[objectives] total_loss_accounting="
         f"{json.dumps(objective_report, sort_keys=True)}"
@@ -1384,7 +1500,13 @@ def main() -> None:
     )
     log(f"[objectives] graph_accounting={json.dumps(graph_report, sort_keys=True)}")
     log(
-        f"[objectives] schedule_receipt={json.dumps(schedule_report, sort_keys=True)}"
+        "[objectives] schedule_receipt="
+        f"{json.dumps(schedule_report, sort_keys=True)}"
+    )
+    log(
+        "[objectives] schedule_receipt_path="
+        f"{schedule_receipt_path} windows_sha256="
+        f"{canonical_schedule_receipt_sha256(schedule_receipts)}"
     )
 
     final_cp = save_ckpt(model, opt, args.steps)

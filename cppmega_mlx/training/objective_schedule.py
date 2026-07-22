@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,17 @@ OBJECTIVE_SCHEDULE_ALGORITHM = (
     "bounded_eligibility_bipartite_graph_capability_v1"
 )
 GRAPH_ELIGIBILITY_RECEIPT_SCHEMA = "cppmega_objective_graph_eligibility_v1"
+OBJECTIVE_REALIZATION_RECEIPT_SCHEMA = "cppmega_objective_realization_v1"
+PREMATERIALIZED_OBJECTIVE = "pre_materialized"
+
+CANONICAL_PRODUCTION_OBJECTIVES = (
+    TaskKind.CAUSAL_LM,
+    TaskKind.FIM,
+    TaskKind.IFIM,
+    TaskKind.AST_FIM,
+    TaskKind.COMMIT_DIFF,
+    TaskKind.PRE_TO_POST,
+)
 
 _TRANSFORMED_TASKS = frozenset(
     {
@@ -112,10 +124,401 @@ def canonical_window_quotas(
     return {task.value: quotas[task] for task in normalized}
 
 
+def validate_production_objective_rates(
+    rates: Mapping[TaskKind | str, float | str],
+    *,
+    quota_window_samples: int,
+) -> dict[str, int]:
+    """Require every canonical production objective to have a real quota."""
+
+    if quota_window_samples < 1:
+        raise ValueError("production quota window must be positive")
+    parsed: dict[TaskKind, float] = {}
+    for raw_task, raw_rate in rates.items():
+        task = raw_task if isinstance(raw_task, TaskKind) else TaskKind(raw_task)
+        value = float(raw_rate)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"production objective {task.value} rate must be finite and non-negative"
+            )
+        parsed[task] = parsed.get(task, 0.0) + value
+    missing = [
+        task.value
+        for task in CANONICAL_PRODUCTION_OBJECTIVES
+        if parsed.get(task, 0.0) <= 0.0
+    ]
+    if missing:
+        raise ValueError(
+            "production objectives "
+            + ", ".join(missing)
+            + " must have positive rates"
+        )
+    quotas = canonical_window_quotas(parsed, quota_window_samples)
+    zero_quota = [
+        task.value
+        for task in CANONICAL_PRODUCTION_OBJECTIVES
+        if quotas.get(task.value, 0) == 0
+    ]
+    if zero_quota:
+        raise ValueError(
+            "production schedule produced zero quota for canonical objectives: "
+            + ", ".join(zero_quota)
+        )
+    return quotas
+
+
 def _receipt_mapping(value: object, *, where: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{where} must be an object")
     return value
+
+
+def objective_realization_receipt(realized: RealizedObjective) -> dict[str, object]:
+    """Bind the realized builder output and selected packet to one digest."""
+
+    raw_source_map = realized.example.metadata.get("source_token_indices")
+    source_map = (
+        None
+        if not isinstance(raw_source_map, (tuple, list))
+        else [int(value) for value in raw_source_map]
+    )
+    selected_packet = realized.selected_packet
+    if isinstance(selected_packet, CodePacket):
+        packet_payload: dict[str, object] = {
+            "type": "CodePacket",
+            "token_ids": selected_packet.token_ids.tolist(),
+            "ifim_instruction_token_ids": (
+                None
+                if selected_packet.ifim_instruction_token_ids is None
+                else selected_packet.ifim_instruction_token_ids.tolist()
+            ),
+            "document_ids": (
+                None
+                if selected_packet.document_ids is None
+                else selected_packet.document_ids.tolist()
+            ),
+            "source_doc_ids": (
+                None
+                if selected_packet.source_doc_ids is None
+                else selected_packet.source_doc_ids.tolist()
+            ),
+            "source_identity_ids": (
+                None
+                if selected_packet.source_identity_ids is None
+                else selected_packet.source_identity_ids.tolist()
+            ),
+            "repo": selected_packet.repo,
+            "filepath": selected_packet.filepath,
+            "commit_or_ref": selected_packet.commit_or_ref,
+        }
+    elif isinstance(selected_packet, CommitPacket):
+        packet_payload = {
+            "type": "CommitPacket",
+            **{
+                field: (
+                    None
+                    if getattr(selected_packet, field) is None
+                    else getattr(selected_packet, field).tolist()
+                )
+                for field in (
+                    "pre_token_ids",
+                    "post_token_ids",
+                    "diff_token_ids",
+                    "commit_msg",
+                    "change_mask_pre",
+                    "change_mask_post",
+                    "hunk_ids",
+                    "edit_ops",
+                    "changed_chunk_ids",
+                    "changed_chunk_spans",
+                )
+            },
+            "repo": selected_packet.repo,
+            "filepath": selected_packet.filepath,
+            "commit_or_ref": selected_packet.commit_or_ref,
+            "packed_constituent_binding": selected_packet.metadata.get(
+                "packed_constituent_binding"
+            ),
+        }
+    else:
+        packet_payload = {"type": None}
+    payload = {
+        "task": realized.task.value,
+        "selected_packet_index": realized.selected_packet_index,
+        "packet": packet_payload,
+        "input_ids": [int(value) for value in realized.example.input_ids.tolist()],
+        "target_ids": [int(value) for value in realized.example.target_ids.tolist()],
+        "loss_mask": [int(value) for value in realized.example.loss_mask.tolist()],
+        "source_token_indices": source_map,
+    }
+    return {
+        "schema": OBJECTIVE_REALIZATION_RECEIPT_SCHEMA,
+        "task": realized.task.value,
+        "selected_packet_index": realized.selected_packet_index,
+        "example_sha256": _canonical_sha256(payload),
+        "input_tokens": len(payload["input_ids"]),
+        "loss_tokens": sum(payload["loss_mask"]),
+    }
+
+
+def validate_objective_assignment_receipt(
+    receipt: Mapping[str, object],
+    *,
+    graph_relations: Sequence[str],
+) -> None:
+    """Validate one assignment before it can enter the total-loss path."""
+
+    expected_keys = {
+        "source_index",
+        "source_pool_index",
+        "task",
+        "realization",
+        "graph_eligibility",
+    }
+    if set(receipt) != expected_keys:
+        raise ValueError("objective assignment receipt keys are invalid")
+    _receipt_int(receipt.get("source_index"), where="assignment.source_index")
+    _receipt_int(
+        receipt.get("source_pool_index"),
+        where="assignment.source_pool_index",
+    )
+    task = receipt.get("task")
+    if not isinstance(task, str) or not task:
+        raise ValueError("objective assignment task must be a non-empty string")
+    realization = _receipt_mapping(
+        receipt.get("realization"),
+        where="assignment.realization",
+    )
+    if set(realization) != {
+        "schema",
+        "task",
+        "selected_packet_index",
+        "example_sha256",
+        "input_tokens",
+        "loss_tokens",
+    }:
+        raise ValueError("objective realization receipt keys are invalid")
+    if realization.get("schema") != OBJECTIVE_REALIZATION_RECEIPT_SCHEMA:
+        raise ValueError("objective realization receipt schema is invalid")
+    if realization.get("task") != task:
+        raise ValueError("objective realization task binding drifted")
+    _receipt_int(
+        realization.get("selected_packet_index"),
+        where="assignment.realization.selected_packet_index",
+    )
+    digest = realization.get("example_sha256")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValueError("objective realization example digest is invalid")
+    _receipt_int(realization.get("input_tokens"), where="assignment.input_tokens")
+    _receipt_int(realization.get("loss_tokens"), where="assignment.loss_tokens")
+
+    relations = tuple(graph_relations)
+    graph = receipt.get("graph_eligibility")
+    if not relations:
+        if graph is not None:
+            raise ValueError("graph eligibility must be absent without relations")
+        return
+    graph_mapping = _receipt_mapping(
+        graph,
+        where="assignment.graph_eligibility",
+    )
+    graph_keys = {
+        "schema",
+        "objective",
+        "eligible",
+        "reason",
+        "positive_edges",
+        "relations",
+        "route_mode",
+        "route_receipt",
+    }
+    graph_fields = set(graph_mapping)
+    if graph_fields != graph_keys and graph_fields != graph_keys | {"detail"}:
+        raise ValueError("objective graph eligibility receipt keys are invalid")
+    if graph_mapping.get("schema") != GRAPH_ELIGIBILITY_RECEIPT_SCHEMA:
+        raise ValueError("objective graph eligibility receipt schema is invalid")
+    if graph_mapping.get("objective") != task:
+        raise ValueError("objective graph eligibility task binding drifted")
+    if graph_mapping.get("relations") != list(relations):
+        raise ValueError("objective graph eligibility relations drifted")
+    positive_edges = _receipt_int(
+        graph_mapping.get("positive_edges"),
+        where="assignment.graph_eligibility.positive_edges",
+    )
+    eligible = graph_mapping.get("eligible")
+    if not isinstance(eligible, bool) or eligible != (positive_edges > 0):
+        raise ValueError("objective graph eligibility verdict is inconsistent")
+    reason = graph_mapping.get("reason")
+    if eligible and reason is not None:
+        raise ValueError("graph-positive assignment must not have a reason")
+    if not eligible and (not isinstance(reason, str) or not reason):
+        raise ValueError("graph-ineligible assignment requires an explicit reason")
+    route_mode = graph_mapping.get("route_mode")
+    route_receipt = graph_mapping.get("route_receipt")
+    if route_mode == "unavailable":
+        if reason != "missing_exact_source_token_route_map" or route_receipt is not None:
+            raise ValueError("unavailable graph route receipt is inconsistent")
+    else:
+        route = _receipt_mapping(
+            route_receipt,
+            where="assignment.graph_eligibility.route_receipt",
+        )
+        if route.get("mode") != route_mode:
+            raise ValueError("objective graph route mode binding drifted")
+    if task in {TaskKind.COMMIT_DIFF.value, TaskKind.PRE_TO_POST.value} and (
+        eligible
+        or route_mode != "excluded"
+        or reason != "exact_source_route_map_unavailable"
+    ):
+        raise ValueError("commit objective graph eligibility must be excluded")
+
+
+def canonical_batch_assignment_receipts(
+    *,
+    objective: TaskKind | str = PREMATERIALIZED_OBJECTIVE,
+    input_ids: object,
+    targets: object,
+    loss_mask: object,
+    graph_relations: Sequence[str] = (),
+    graph_positive_edges: Sequence[int] | None = None,
+) -> tuple[dict[str, object], ...]:
+    """Build row receipts for an already materialized, hash-bound batch."""
+
+    task = objective.value if isinstance(objective, TaskKind) else objective
+    if not isinstance(task, str) or not task:
+        raise ValueError("pre-materialized objective name must be a non-empty string")
+    rows = input_ids.tolist()
+    target_rows = targets.tolist()
+    mask_rows = loss_mask.tolist()
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
+        raise ValueError("pre-materialized input_ids must be shaped (B, S)")
+    if len(target_rows) != len(rows) or len(mask_rows) != len(rows):
+        raise ValueError("pre-materialized batch rows are not aligned")
+    relations = tuple(graph_relations)
+    edge_counts = (
+        [0] * len(rows)
+        if graph_positive_edges is None
+        else [int(value) for value in graph_positive_edges]
+    )
+    if len(edge_counts) != len(rows) or any(value < 0 for value in edge_counts):
+        raise ValueError("pre-materialized graph edge counts are not batch-aligned")
+
+    assignments: list[dict[str, object]] = []
+    for row_index, (inputs, labels, mask, positive_edges) in enumerate(
+        zip(rows, target_rows, mask_rows, edge_counts, strict=True)
+    ):
+        payload = {
+            "task": task,
+            "selected_packet_index": 0,
+            "packet": {"type": PREMATERIALIZED_OBJECTIVE},
+            "input_ids": [int(value) for value in inputs],
+            "target_ids": [int(value) for value in labels],
+            "loss_mask": [int(value) for value in mask],
+            "source_token_indices": None,
+        }
+        graph_receipt: dict[str, object] | None = None
+        if relations:
+            eligible = positive_edges > 0
+            graph_receipt = {
+                "schema": GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
+                "objective": task,
+                "eligible": eligible,
+                "reason": (
+                    None
+                    if eligible
+                    else "no_configured_graph_positive_causal_same_document_pair"
+                ),
+                "positive_edges": positive_edges,
+                "relations": list(relations),
+                "route_mode": PREMATERIALIZED_OBJECTIVE,
+                "route_receipt": {"mode": PREMATERIALIZED_OBJECTIVE},
+            }
+        receipt = {
+            "source_index": row_index,
+            "source_pool_index": row_index,
+            "task": task,
+            "realization": {
+                "schema": OBJECTIVE_REALIZATION_RECEIPT_SCHEMA,
+                "task": task,
+                "selected_packet_index": 0,
+                "example_sha256": _canonical_sha256(payload),
+                "input_tokens": len(payload["input_ids"]),
+                "loss_tokens": sum(payload["loss_mask"]),
+            },
+            "graph_eligibility": graph_receipt,
+        }
+        validate_objective_assignment_receipt(receipt, graph_relations=relations)
+        assignments.append(receipt)
+    return tuple(assignments)
+
+
+def canonical_batch_shape_assignment_receipts(
+    *,
+    batch_size: int,
+    input_tokens: int,
+    loss_tokens: int,
+    objective: TaskKind | str = PREMATERIALIZED_OBJECTIVE,
+    graph_relations: Sequence[str] = (),
+    graph_positive_edges: int = 0,
+) -> tuple[dict[str, object], ...]:
+    """Build transform-safe receipts when a compiled batch hides device values.
+
+    The immutable pre-materialized contract carries the value-level graph receipt;
+    this envelope binds the compiled loss invocation to its fixed batch shape.
+    """
+
+    if batch_size < 1 or input_tokens < 1 or loss_tokens < 1:
+        raise ValueError("pre-materialized batch receipt dimensions must be positive")
+    if graph_positive_edges < 0:
+        raise ValueError("pre-materialized graph edge count must be non-negative")
+    task = objective.value if isinstance(objective, TaskKind) else objective
+    if not isinstance(task, str) or not task:
+        raise ValueError("pre-materialized objective name must be a non-empty string")
+    relations = tuple(graph_relations)
+    assignments: list[dict[str, object]] = []
+    for row_index in range(batch_size):
+        payload = {
+            "task": task,
+            "selected_packet_index": 0,
+            "packet": {"type": PREMATERIALIZED_OBJECTIVE},
+            "input_tokens": input_tokens,
+            "loss_tokens": loss_tokens,
+            "row_index": row_index,
+        }
+        graph_receipt = None
+        if relations:
+            eligible = graph_positive_edges > 0
+            graph_receipt = {
+                "schema": GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
+                "objective": task,
+                "eligible": eligible,
+                "reason": (
+                    None
+                    if eligible
+                    else "no_configured_graph_positive_causal_same_document_pair"
+                ),
+                "positive_edges": int(graph_positive_edges),
+                "relations": list(relations),
+                "route_mode": PREMATERIALIZED_OBJECTIVE,
+                "route_receipt": {"mode": PREMATERIALIZED_OBJECTIVE},
+            }
+        receipt = {
+            "source_index": row_index,
+            "source_pool_index": row_index,
+            "task": task,
+            "realization": {
+                "schema": OBJECTIVE_REALIZATION_RECEIPT_SCHEMA,
+                "task": task,
+                "selected_packet_index": 0,
+                "example_sha256": _canonical_sha256(payload),
+                "input_tokens": input_tokens,
+                "loss_tokens": loss_tokens,
+            },
+            "graph_eligibility": graph_receipt,
+        }
+        validate_objective_assignment_receipt(receipt, graph_relations=relations)
+        assignments.append(receipt)
+    return tuple(assignments)
 
 
 def _receipt_int(
@@ -228,6 +631,7 @@ def validate_objective_source_selection_receipt(
         "start_step",
         "output_samples",
         "source_pool_samples",
+        "source_pool_source_indices",
         "source_rows_consumed",
         "selected_source_indices",
         "task_counts",
@@ -239,6 +643,7 @@ def validate_objective_source_selection_receipt(
         "source_index",
         "source_pool_index",
         "task",
+        "realization",
         "graph_eligibility",
     }
     graph_keys = {
@@ -275,6 +680,28 @@ def validate_objective_source_selection_receipt(
         )
         if pool_samples > max_pool:
             raise ValueError(f"objective schedule window {window_index} pool is unbounded")
+        raw_pool_source_indices = window.get("source_pool_source_indices")
+        if (
+            not isinstance(raw_pool_source_indices, list)
+            or len(raw_pool_source_indices) != pool_samples
+        ):
+            raise ValueError(
+                f"objective schedule window {window_index} source pool binding is invalid"
+            )
+        pool_source_indices = [
+            _receipt_int(
+                value,
+                where=(
+                    f"objective schedule window {window_index}."
+                    "source_pool_source_indices"
+                ),
+            )
+            for value in raw_pool_source_indices
+        ]
+        if len(set(pool_source_indices)) != len(pool_source_indices):
+            raise ValueError(
+                f"objective schedule window {window_index} source pool binding reuses a row"
+            )
         window_consumed = _receipt_int(
             window.get("source_rows_consumed"),
             where=f"source_selection.windows[{window_index}].source_rows_consumed",
@@ -282,6 +709,11 @@ def validate_objective_source_selection_receipt(
         )
         if window_consumed > consumed:
             raise ValueError(f"objective schedule window {window_index} over-consumed")
+        if any(source_index >= window_consumed for source_index in pool_source_indices):
+            raise ValueError(
+                f"objective schedule window {window_index} source pool binding is ahead "
+                "of the consumed cursor"
+            )
         previous_consumed = window_consumed
         raw_assignments = window.get("assignments")
         if not isinstance(raw_assignments, list) or len(raw_assignments) != quota_window_samples:
@@ -298,6 +730,11 @@ def validate_objective_source_selection_receipt(
         ]
         if any(set(assignment) != assignment_keys for assignment in assignments):
             raise ValueError(f"objective schedule window {window_index} assignment keys drifted")
+        for assignment in assignments:
+            validate_objective_assignment_receipt(
+                assignment,
+                graph_relations=relations,
+            )
         source_indices = [
             _receipt_int(
                 assignment.get("source_index"),
@@ -335,6 +772,11 @@ def validate_objective_source_selection_receipt(
             if pool_index >= pool_samples:
                 raise ValueError(
                     f"objective schedule window {window_index} pool index is invalid"
+                )
+            if source_indices[assignment_index] != pool_source_indices[pool_index]:
+                raise ValueError(
+                    f"objective schedule window {window_index} source pool binding "
+                    f"drifted at assignment {assignment_index}"
                 )
             task = assignment.get("task")
             graph_receipt = assignment.get("graph_eligibility")
@@ -396,7 +838,10 @@ def validate_objective_source_selection_receipt(
         if window.get("graph_positive_edges") != positive_edges:
             raise ValueError(f"objective schedule window {window_index} edge count drifted")
         if relations and positive_assignments < 1:
-            raise ValueError(f"objective schedule window {window_index} has no graph-positive assignment")
+            raise ValueError(
+                f"objective schedule window {window_index} has no graph-positive "
+                "assignment"
+            )
 
     if previous_consumed != consumed:
         raise ValueError("final objective schedule window consumption drifted")
@@ -719,12 +1164,42 @@ class ScheduledObjective:
     source: SourceInput
     realized: RealizedObjective
     graph_eligibility: Mapping[str, object] | None
+    assignment_receipt: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
 class ObjectiveScheduleWindow:
     assignments: tuple[ScheduledObjective, ...]
     receipt: dict[str, object]
+
+
+def validate_scheduled_objective(
+    assignment: ScheduledObjective,
+    *,
+    graph_relations: Sequence[str],
+) -> None:
+    """Bind one planner assignment to its source, realization, and graph verdict."""
+
+    receipt = assignment.assignment_receipt
+    if not isinstance(receipt, Mapping):
+        raise ValueError("scheduled objective is missing its assignment receipt")
+    expected = {
+        "source_index": assignment.source_index,
+        "source_pool_index": assignment.realized.source_index,
+        "task": assignment.realized.task.value,
+        "realization": objective_realization_receipt(assignment.realized),
+        "graph_eligibility": (
+            None
+            if assignment.graph_eligibility is None
+            else dict(assignment.graph_eligibility)
+        ),
+    }
+    validate_objective_assignment_receipt(receipt, graph_relations=graph_relations)
+    if dict(receipt) != expected:
+        raise ValueError(
+            "scheduled objective assignment drifted from its selected source or "
+            "realization"
+        )
 
 
 class CanonicalObjectivePlanner:
@@ -739,6 +1214,7 @@ class CanonicalObjectivePlanner:
         quota_lookahead_samples: int,
         graph_relations: Sequence[str] = (),
         require_route_sidecars: bool = False,
+        require_production_objectives: bool = False,
     ) -> None:
         if quota_window_samples < 1:
             raise ValueError("quota_window_samples must be >=1")
@@ -756,6 +1232,17 @@ class CanonicalObjectivePlanner:
         self.quota_lookahead_samples = int(quota_lookahead_samples)
         self.graph_relations = relations
         self.require_route_sidecars = require_route_sidecars
+        self.require_production_objectives = require_production_objectives
+        self._canonical_mixer = isinstance(mixer, EligibilityAwareTaskMixer)
+        if require_production_objectives:
+            if not self._canonical_mixer:
+                raise TypeError(
+                    "production objective validation requires EligibilityAwareTaskMixer"
+                )
+            validate_production_objective_rates(
+                mixer.rates,
+                quota_window_samples=quota_window_samples,
+            )
         self.max_source_pool_samples = (
             self.quota_window_samples + self.quota_lookahead_samples
         )
@@ -766,6 +1253,7 @@ class CanonicalObjectivePlanner:
         self._max_source_pool_observed = 0
         self._last_yielded_cursor: dict[str, int] | None = None
         self._windows: list[dict[str, object]] = []
+        self._next_start_step: int | None = None
 
     @property
     def source_rows_consumed(self) -> int:
@@ -826,11 +1314,19 @@ class CanonicalObjectivePlanner:
         return (
             item.source_index,
             item.task.value,
+            item.selected_packet_index,
             tuple(int(value) for value in item.example.input_ids.tolist()),
             tuple(raw_map) if isinstance(raw_map, (tuple, list)) else None,
         )
 
     def plan_window(self, *, start_step: int = 0) -> ObjectiveScheduleWindow:
+        if isinstance(start_step, bool) or not isinstance(start_step, int) or start_step < 0:
+            raise ValueError("objective schedule start_step must be a non-negative integer")
+        if self._next_start_step is not None and start_step != self._next_start_step:
+            raise ValueError(
+                "objective schedule start_step reuse or drift: "
+                f"expected={self._next_start_step}, got={start_step}"
+            )
         self._ensure_window_pool()
         graph_receipts: dict[tuple[object, ...], dict[str, object]] = {}
 
@@ -899,14 +1395,41 @@ class CanonicalObjectivePlanner:
                 if graph_receipt is None:
                     assess(source, item)
                     graph_receipt = graph_receipts[key]
-            assignments.append(
-                ScheduledObjective(
-                    source_index=self._source_indices[item.source_index],
-                    source=source,
-                    realized=item,
-                    graph_eligibility=graph_receipt,
-                )
+            task = getattr(item, "task", None)
+            if not isinstance(task, TaskKind) or not hasattr(item, "example"):
+                if self._canonical_mixer:
+                    raise RuntimeError(
+                        "canonical objective mixer returned an untyped realization"
+                    )
+                assignment_receipt = {
+                    "source_index": self._source_indices[item.source_index],
+                    "source_pool_index": item.source_index,
+                    "task": "unknown",
+                    "graph_eligibility": None,
+                }
+            else:
+                assignment_receipt = {
+                    "source_index": self._source_indices[item.source_index],
+                    "source_pool_index": item.source_index,
+                    "task": task.value,
+                    "realization": objective_realization_receipt(item),
+                    "graph_eligibility": (
+                        None if graph_receipt is None else dict(graph_receipt)
+                    ),
+                }
+            scheduled = ScheduledObjective(
+                source_index=self._source_indices[item.source_index],
+                source=source,
+                realized=item,
+                graph_eligibility=graph_receipt,
+                assignment_receipt=assignment_receipt,
             )
+            if self._canonical_mixer:
+                validate_scheduled_objective(
+                    scheduled,
+                    graph_relations=self.graph_relations,
+                )
+            assignments.append(scheduled)
 
         task_counts = Counter(
             getattr(getattr(item.realized, "task", None), "value", "unknown")
@@ -927,26 +1450,14 @@ class CanonicalObjectivePlanner:
             "start_step": int(start_step),
             "output_samples": self.quota_window_samples,
             "source_pool_samples": len(self._source_pool),
+            "source_pool_source_indices": list(self._source_indices),
             "source_rows_consumed": self._source_rows_consumed,
             "selected_source_indices": [item.source_index for item in assignments],
             "task_counts": dict(
                 sorted(task_counts.items(), key=lambda item: item[0])
             ),
             "assignments": [
-                {
-                    "source_index": item.source_index,
-                    "source_pool_index": item.realized.source_index,
-                    "task": getattr(
-                        getattr(item.realized, "task", None),
-                        "value",
-                        "unknown",
-                    ),
-                    "graph_eligibility": (
-                        None
-                        if item.graph_eligibility is None
-                        else dict(item.graph_eligibility)
-                    ),
-                }
+                dict(item.assignment_receipt)
                 for item in assignments
             ],
             "graph_positive_assignments": int(graph_positive_assignments),
@@ -975,6 +1486,7 @@ class CanonicalObjectivePlanner:
         self._source_pool = [source for source, _index, _cursor in retained]
         self._source_indices = [index for _source, index, _cursor in retained]
         self._source_cursor_pool = [cursor for _source, _index, cursor in retained]
+        self._next_start_step = start_step + self.quota_window_samples
         return ObjectiveScheduleWindow(tuple(assignments), window_receipt)
 
     def source_selection_receipt(self, *, output_samples: int) -> dict[str, object]:
@@ -983,7 +1495,7 @@ class CanonicalObjectivePlanner:
         if self._last_yielded_cursor is None:
             raise RuntimeError("objective planner consumed no source rows")
         windows = [dict(window) for window in self._windows]
-        return {
+        receipt: dict[str, object] = {
             "schema": OBJECTIVE_SOURCE_SELECTION_SCHEMA,
             "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
             "output_samples": int(output_samples),
@@ -1012,22 +1524,43 @@ class CanonicalObjectivePlanner:
                 "windows_sha256": canonical_schedule_receipt_sha256(windows),
             },
         }
+        if self._canonical_mixer:
+            validate_objective_source_selection_receipt(
+                receipt,
+                output_samples=output_samples,
+                quota_window_samples=self.quota_window_samples,
+                graph_relations=self.graph_relations,
+                expected_window_quotas=canonical_window_quotas(
+                    self.mixer.rates,
+                    self.quota_window_samples,
+                ),
+            )
+        return receipt
 
 
 __all__ = [
     "CanonicalObjectivePlanner",
+    "CANONICAL_PRODUCTION_OBJECTIVES",
     "GRAPH_ELIGIBILITY_RECEIPT_SCHEMA",
+    "OBJECTIVE_REALIZATION_RECEIPT_SCHEMA",
     "OBJECTIVE_SCHEDULE_ALGORITHM",
     "OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA",
     "OBJECTIVE_SCHEDULE_WINDOW_SCHEMA",
     "OBJECTIVE_SOURCE_RESUME_SCHEMA",
     "OBJECTIVE_SOURCE_SELECTION_SCHEMA",
+    "PREMATERIALIZED_OBJECTIVE",
     "ObjectiveScheduleWindow",
     "ScheduledObjective",
     "assess_graph_positive_capability",
     "canonical_window_quotas",
+    "canonical_batch_assignment_receipts",
+    "canonical_batch_shape_assignment_receipts",
     "canonical_schedule_receipt_sha256",
+    "objective_realization_receipt",
     "source_has_graph_candidate",
+    "validate_objective_assignment_receipt",
     "validate_graph_receipt_against_document",
     "validate_objective_source_selection_receipt",
+    "validate_production_objective_rates",
+    "validate_scheduled_objective",
 ]

@@ -67,10 +67,19 @@ from cppmega_mlx.data.fim import FIMSpecialTokenIds
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch
 from cppmega_mlx.data.parquet_dataset import _normalize_edge_pairs
 from cppmega_mlx.models.dense_cpp_lm import DenseCppLM, DenseCppLMConfig
+from cppmega_mlx.nn.code_graph_routes import build_token_graph_biases
 from cppmega_mlx.training.objectives import ObjectiveExample
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     ObjectiveSource,
+    RealizedObjective,
+    scheduled_production_training_loss,
+)
+from cppmega_mlx.training.objective_schedule import (
+    CanonicalObjectivePlanner,
+    objective_realization_receipt,
+    validate_objective_assignment_receipt,
+    validate_scheduled_objective,
 )
 from cppmega_mlx.training.task_mixer import TaskKind
 from cppmega_mlx.training.stage1_production import (
@@ -470,7 +479,10 @@ class TrainStep:
     loss_mask: mx.array  # (1, S)
     side_channels: dict[str, mx.array]  # aligned channels, or {} when disabled
     graph_batch: GraphBatch | None = None
+    document_ids: mx.array | None = None
     metadata_only: Mapping[str, object] = field(default_factory=dict)
+    schedule_window_receipt: Mapping[str, object] | None = None
+    schedule_assignment_receipt: Mapping[str, object] | None = None
 
 
 def _assert_aligned(name: str, channel: mx.array, seq_len: int) -> mx.array:
@@ -497,6 +509,9 @@ def build_train_step(
     objective: str,
     example: ObjectiveExample,
     packet: CodePacket | CommitPacket,
+    *,
+    schedule_assignment_receipt: Mapping[str, object] | None = None,
+    schedule_window_receipt: Mapping[str, object] | None = None,
 ) -> TrainStep:
     """Materialize a TrainStep, applying the side-channel alignment rule.
 
@@ -510,6 +525,27 @@ def build_train_step(
     input_ids = example.input_ids[None, :]
     target_ids = example.target_ids[None, :]
     loss_mask = example.loss_mask[None, :]
+
+    if schedule_assignment_receipt is None:
+        realized = RealizedObjective(
+            task=TaskKind(objective),
+            example=example,
+            ineligible={},
+            source_index=0,
+            selected_packet=packet,
+            selected_packet_index=0,
+        )
+        schedule_assignment_receipt = {
+            "source_index": 0,
+            "source_pool_index": 0,
+            "task": objective,
+            "realization": objective_realization_receipt(realized),
+            "graph_eligibility": None,
+        }
+    validate_objective_assignment_receipt(
+        schedule_assignment_receipt,
+        graph_relations=(),
+    )
 
     if objective in _ALIGNED_OBJECTIVES:
         if not isinstance(packet, CodePacket):
@@ -543,6 +579,11 @@ def build_train_step(
         if platform is not None:
             channels["platform_ids"] = platform  # (1, K) document-level
         graph_batch = _aligned_packet_graph_batch(packet, input_length=seq_len)
+        document_ids = _assert_aligned(
+            "document_ids",
+            packet.document_ids,
+            seq_len,
+        )
         metadata_only = _metadata_only_packet_fields(packet)
         return TrainStep(
             objective,
@@ -551,7 +592,10 @@ def build_train_step(
             loss_mask,
             channels,
             graph_batch=graph_batch,
+            document_ids=document_ids,
             metadata_only=metadata_only,
+            schedule_window_receipt=schedule_window_receipt,
+            schedule_assignment_receipt=schedule_assignment_receipt,
         )
 
     if objective in _REORDERED_OBJECTIVES:
@@ -567,6 +611,8 @@ def build_train_step(
                 "reason": "objective_changes_token_order_or_synthesizes_tokens",
                 "source_fields": _present_packet_route_fields(packet),
             },
+            schedule_window_receipt=schedule_window_receipt,
+            schedule_assignment_receipt=schedule_assignment_receipt,
         )
 
     raise ValueError(f"unknown objective {objective!r}: cannot classify alignment")
@@ -681,21 +727,50 @@ def _loss_for_step(
             f"objective={step.objective!r} has no aligned GraphBatch"
         )
 
-    if channels_on:
-        model_kwargs = dict(step.side_channels)
-        # A legacy mixed-objective smoke keeps graph routing disabled because
-        # FIM/synthesized examples have no exact source-coordinate remap.  The
-        # typed graph remains on TrainStep for graph-enabled callers; passing it
-        # here is conditional on the model's explicit graph-route contract.
-        if step.graph_batch is not None and model.config.graph_routes_enabled:
-            model_kwargs["graph_batch"] = step.graph_batch
-        _, loss = model(
+    if step.schedule_assignment_receipt is None:
+        raise ValueError("train_stage1 step is missing its canonical schedule receipt")
+    assignment_receipts = (dict(step.schedule_assignment_receipt),)
+
+    def scheduled_loss(side_channels: Mapping[str, mx.array]) -> mx.array:
+        document_ids = None
+        block_bias = None
+        edge_kind_bias = None
+        if getattr(model.config, "graph_routes_enabled", False):
+            if step.graph_batch is None or step.document_ids is None:
+                raise ValueError(
+                    "train_stage1 graph-routed smoke requires GraphBatch and "
+                    "document_ids"
+                )
+            document_ids = step.document_ids
+            block_bias, edge_kind_bias = build_token_graph_biases(
+                step.graph_batch,
+                batch_size=int(step.input_ids.shape[0]),
+                seq_length=int(step.input_ids.shape[1]),
+                document_ids=document_ids,
+            )
+        total, _lm_loss, _graph_loss = scheduled_production_training_loss(
+            model,
             step.input_ids,
-            targets=step.target_ids,
-            loss_mask=step.loss_mask,
-            **model_kwargs,
+            step.target_ids,
+            step.loss_mask,
+            objective=TaskKind(step.objective),
+            schedule_assignments=assignment_receipts,
+            side_channels=side_channels,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            graph_targets=None,
+            graph_pair_mask=None,
+            graph_config=None,
+            graph_weight=0.0,
+            graph_relations=(),
+            require_schedule_receipt=True,
+            allow_route_free_smoke=True,
         )
-        return loss
+        return total
+
+    if channels_on:
+        return scheduled_loss(step.side_channels)
 
     cfg = model.config
     saved = (
@@ -712,11 +787,7 @@ def _loss_for_step(
         ngram_residual_scale=0.0,
     ))
     try:
-        _, loss = model(
-            step.input_ids,
-            targets=step.target_ids,
-            loss_mask=step.loss_mask,
-        )
+        loss = scheduled_loss({})
     finally:
         object.__setattr__(model, "config", replace(
             cfg,
@@ -751,18 +822,34 @@ def materialize_steps(
             ObjectiveSource(commit_packet=commit_packets[index % len(commit_packets)])
             for index in range(num_steps)
         )
-    realized = mixer.materialize_window_from_pool(
-        sources,
-        output_count=num_steps,
+    planner = CanonicalObjectivePlanner(
+        mixer=mixer,
+        source_iter=iter(sources),
+        quota_window_samples=num_steps,
+        quota_lookahead_samples=len(sources) - num_steps,
+    )
+    window = planner.plan_window(start_step=0)
+    source_selection_receipt = planner.source_selection_receipt(
+        output_samples=num_steps
     )
     steps: list[TrainStep] = []
-    for item in realized:
+    for assignment in window.assignments:
+        validate_scheduled_objective(assignment, graph_relations=())
+        item = assignment.realized
         packet = item.selected_packet
         if packet is None:  # pragma: no cover - mixer guarantees selected packets
             raise RuntimeError(
                 f"{item.task.value}: realized objective lost its selected packet"
             )
-        steps.append(build_train_step(item.example.objective, item.example, packet))
+        steps.append(
+            build_train_step(
+                item.example.objective,
+                item.example,
+                packet,
+                schedule_assignment_receipt=assignment.assignment_receipt,
+                schedule_window_receipt=source_selection_receipt,
+            )
+        )
     return steps
 
 

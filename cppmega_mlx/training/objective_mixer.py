@@ -58,6 +58,15 @@ class RealizedObjective:
     ineligible: Mapping[TaskKind, str]
     source_index: int
     selected_packet: CodePacket | CommitPacket | None = None
+    selected_packet_index: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.selected_packet_index, bool)
+            or not isinstance(self.selected_packet_index, int)
+            or self.selected_packet_index < 0
+        ):
+            raise ValueError("selected_packet_index must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -603,6 +612,20 @@ class EligibilityAwareTaskMixer:
             return eligible_packets[0]
         return eligible_packets[rng.randrange(len(eligible_packets))]
 
+    @classmethod
+    def _selected_packet_index(
+        cls,
+        source: SourceInput,
+        task: TaskKind,
+        selected_packet: CodePacket | CommitPacket,
+    ) -> int:
+        for index, packet in enumerate(cls._packets_for_task(source, task)):
+            if packet is selected_packet:
+                return index
+        raise RuntimeError(
+            f"selected {task.value} packet is not bound to its ObjectiveSource"
+        )
+
     def materialize(
         self,
         packet: SourceInput,
@@ -630,6 +653,7 @@ class EligibilityAwareTaskMixer:
             ineligible=ineligible,
             source_index=0,
             selected_packet=task_packet,
+            selected_packet_index=self._selected_packet_index(packet, task, task_packet),
         )
 
     @staticmethod
@@ -860,6 +884,11 @@ class EligibilityAwareTaskMixer:
                         ineligible=eligibility[source_index][1],
                         source_index=source_index,
                         selected_packet=task_packet,
+                        selected_packet_index=self._selected_packet_index(
+                            packet,
+                            task,
+                            task_packet,
+                        ),
                     )
                 )
             assert Counter(item.task for item in realized) == Counter(quotas)
@@ -1259,6 +1288,217 @@ def production_training_loss(
     return breakdown.total, breakdown.lm_ce, breakdown.graph_total
 
 
+def _validate_scheduled_loss_receipt(
+    input_ids: mx.array,
+    *,
+    objective: TaskKind | str | None,
+    schedule_assignments: Sequence[Mapping[str, object]] | None,
+    graph_relations: Sequence[str],
+    graph_config: GraphAuxLossConfig | None,
+    graph_targets: mx.array | None,
+    graph_pair_mask: mx.array | None,
+    graph_weight: float,
+    require_schedule_receipt: bool,
+) -> bool:
+    """Validate control-plane bindings before entering the differentiated path."""
+
+    graph_positive = False
+    if schedule_assignments is None:
+        if require_schedule_receipt:
+            raise ValueError(
+                "scheduled production loss requires a canonical schedule receipt"
+            )
+    else:
+        batch_size = int(input_ids.shape[0])
+        if len(schedule_assignments) != batch_size:
+            raise ValueError(
+                "canonical schedule assignment count does not match loss batch: "
+                f"{len(schedule_assignments)} != {batch_size}"
+            )
+        from cppmega_mlx.training.objective_schedule import (
+            validate_objective_assignment_receipt,
+        )
+
+        expected_task = (
+            objective.value if isinstance(objective, TaskKind) else objective
+        )
+        for index, assignment in enumerate(schedule_assignments):
+            validate_objective_assignment_receipt(
+                assignment,
+                graph_relations=graph_relations,
+            )
+            if expected_task is not None and assignment.get("task") != expected_task:
+                raise ValueError(
+                    "canonical schedule task differs from the loss batch: "
+                    f"row={index}, receipt={assignment.get('task')!r}, "
+                    f"loss={expected_task!r}"
+                )
+            graph_receipt = assignment.get("graph_eligibility")
+            graph_positive = graph_positive or bool(
+                isinstance(graph_receipt, Mapping)
+                and graph_receipt.get("eligible") is True
+            )
+
+    graph_values = (graph_config, graph_targets, graph_pair_mask)
+    if graph_positive and (
+        graph_weight <= 0.0 or any(value is None for value in graph_values)
+    ):
+        raise ValueError(
+            "graph-positive canonical assignment requires a positive graph weight "
+            "and complete graph config/targets/pair_mask"
+        )
+    if schedule_assignments is not None and graph_relations and (
+        graph_weight <= 0.0 or any(value is None for value in graph_values)
+    ):
+        raise ValueError(
+            "canonical graph schedule requires a positive graph weight and complete "
+            "graph config/targets/pair_mask"
+        )
+    return graph_positive
+
+
+def scheduled_production_training_loss_breakdown(
+    model: Any,
+    input_ids: mx.array,
+    targets: mx.array,
+    loss_mask: mx.array,
+    *,
+    objective: TaskKind | str | None = None,
+    schedule_assignments: Sequence[Mapping[str, object]] | None = None,
+    side_channels: Mapping[str, mx.array],
+    document_ids: mx.array | None,
+    block_bias: mx.array | None,
+    edge_kind_bias: mx.array | None = None,
+    graph_targets: mx.array | None,
+    graph_pair_mask: mx.array | None,
+    graph_config: GraphAuxLossConfig | None,
+    graph_weight: float,
+    graph_relations: Sequence[str] = (),
+    require_schedule_receipt: bool = False,
+    allow_route_free_smoke: bool = False,
+) -> ProductionTrainingLossBreakdown:
+    """Run the one scheduled Stage-1 total-loss path and return its breakdown.
+
+    The schedule is validated before the decoder is entered.  Production graph
+    calls then delegate to the single differentiated LM+graph implementation;
+    the route-free branch is reserved for the tiny legacy smoke and is explicit
+    so it cannot masquerade as graph-conditioned production training.
+    """
+
+    graph_positive = _validate_scheduled_loss_receipt(
+        input_ids,
+        objective=objective,
+        schedule_assignments=schedule_assignments,
+        graph_relations=graph_relations,
+        graph_config=graph_config,
+        graph_targets=graph_targets,
+        graph_pair_mask=graph_pair_mask,
+        graph_weight=graph_weight,
+        require_schedule_receipt=require_schedule_receipt,
+    )
+
+    model_config = getattr(model, "config", None)
+    graph_routes_active = bool(
+        model_config is not None
+        and getattr(model_config, "graph_routes_enabled", False)
+        and getattr(model_config, "require_graph_routes", False)
+    )
+    if graph_routes_active:
+        return production_training_loss_breakdown(
+            model,
+            input_ids,
+            targets,
+            loss_mask,
+            side_channels=side_channels,
+            document_ids=document_ids,
+            block_bias=block_bias,
+            edge_kind_bias=edge_kind_bias,
+            graph_targets=graph_targets,
+            graph_pair_mask=graph_pair_mask,
+            graph_config=graph_config,
+            graph_weight=graph_weight,
+        )
+
+    if not allow_route_free_smoke:
+        raise ValueError(
+            "scheduled production loss requires active fail-closed graph routes"
+        )
+    if graph_positive or any(
+        value is not None for value in (graph_config, graph_targets, graph_pair_mask)
+    ):
+        raise ValueError(
+            "route-free smoke cannot bypass a scheduled graph objective"
+        )
+    if graph_weight != 0.0:
+        raise ValueError("route-free smoke requires graph_weight=0")
+    result = model(
+        input_ids,
+        targets=targets,
+        loss_mask=loss_mask,
+        **dict(side_channels),
+    )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("route-free smoke model returned an invalid loss contract")
+    _logits, lm_loss = result
+    if not isinstance(lm_loss, mx.array):
+        raise RuntimeError("route-free smoke model returned a non-array loss")
+    zero = lm_loss * mx.array(0.0, dtype=lm_loss.dtype)
+    return ProductionTrainingLossBreakdown(
+        total=lm_loss,
+        lm_ce=lm_loss,
+        graph_total=zero,
+        graph_edge_bce=zero,
+        graph_ranking=zero,
+        graph_positive_pairs=mx.array(0.0, dtype=mx.float32),
+        ntokens=mx.sum(mx.asarray(loss_mask).astype(mx.float32)),
+        graph_layer_count=0,
+    )
+
+
+def scheduled_production_training_loss(
+    model: Any,
+    input_ids: mx.array,
+    targets: mx.array,
+    loss_mask: mx.array,
+    *,
+    objective: TaskKind | str | None = None,
+    schedule_assignments: Sequence[Mapping[str, object]] | None = None,
+    side_channels: Mapping[str, mx.array],
+    document_ids: mx.array | None,
+    block_bias: mx.array | None,
+    edge_kind_bias: mx.array | None = None,
+    graph_targets: mx.array | None,
+    graph_pair_mask: mx.array | None,
+    graph_config: GraphAuxLossConfig | None,
+    graph_weight: float,
+    graph_relations: Sequence[str] = (),
+    require_schedule_receipt: bool = False,
+    allow_route_free_smoke: bool = False,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Return the canonical scheduled total, LM, and graph losses."""
+
+    breakdown = scheduled_production_training_loss_breakdown(
+        model,
+        input_ids,
+        targets,
+        loss_mask,
+        objective=objective,
+        schedule_assignments=schedule_assignments,
+        side_channels=side_channels,
+        document_ids=document_ids,
+        block_bias=block_bias,
+        edge_kind_bias=edge_kind_bias,
+        graph_targets=graph_targets,
+        graph_pair_mask=graph_pair_mask,
+        graph_config=graph_config,
+        graph_weight=graph_weight,
+        graph_relations=graph_relations,
+        require_schedule_receipt=require_schedule_receipt,
+        allow_route_free_smoke=allow_route_free_smoke,
+    )
+    return breakdown.total, breakdown.lm_ce, breakdown.graph_total
+
+
 def production_training_loss_breakdown(
     model: Any,
     input_ids: mx.array,
@@ -1498,5 +1738,7 @@ __all__ = [
     "graph_auxiliary_loss_from_targets",
     "production_training_loss",
     "production_training_loss_breakdown",
+    "scheduled_production_training_loss",
+    "scheduled_production_training_loss_breakdown",
     "validated_packed_commit_binding",
 ]

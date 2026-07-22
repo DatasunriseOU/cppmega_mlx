@@ -21,7 +21,7 @@ from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     GraphAuxLossConfig,
     ObjectiveSource,
-    production_training_loss,
+    scheduled_production_training_loss,
 )
 from cppmega_mlx.training.task_mixer import TaskKind
 from scripts.train_eval_stage1 import _materialize_batch, _objective_batches
@@ -201,11 +201,13 @@ def test_mixed_objective_batches_reach_one_loss_composition() -> None:
     seen: dict[TaskKind, tuple[float, float, str | None]] = {}
     for _ in range(5):
         batch = next(batches)
-        total, lm_loss, graph_loss = production_training_loss(
+        total, lm_loss, graph_loss = scheduled_production_training_loss(
             model,
             batch.input_ids,
             batch.targets,
             batch.loss_mask,
+            objective=batch.task,
+            schedule_assignments=batch.schedule_assignment_receipts,
             side_channels=batch.side_channels,
             document_ids=batch.document_ids,
             block_bias=batch.block_bias,
@@ -214,6 +216,8 @@ def test_mixed_objective_batches_reach_one_loss_composition() -> None:
             graph_pair_mask=batch.graph_pair_mask,
             graph_config=graph_config,
             graph_weight=graph_config.global_weight,
+            graph_relations=graph_config.relations,
+            require_schedule_receipt=True,
         )
         mx.eval(total, lm_loss, graph_loss)
         total_value = float(total.item())
@@ -277,9 +281,14 @@ def test_stage1_runners_use_the_mixer_and_do_not_dispatch_objective_builders() -
 
     assert "EligibilityAwareTaskMixer" in train_stage1_calls
     assert "EligibilityAwareTaskMixer" in train_eval_calls
+    assert "CanonicalObjectivePlanner" in train_stage1_calls
     assert not forbidden.intersection(train_stage1_calls)
     assert not forbidden.intersection(train_eval_calls)
-    assert "production_training_loss" in train_eval_calls
+    assert "scheduled_production_training_loss" in train_stage1_calls
+    assert "scheduled_production_training_loss" in train_eval_calls
+    assert "materialize_window_from_pool" not in (
+        ROOT / "scripts" / "train_stage1.py"
+    ).read_text(encoding="utf-8")
     # Bundle mode is an ingress to the hash-bound pre-materialized objective;
     # it must not become a second low-level objective dispatcher.
     source = (ROOT / "scripts" / "train_stage1.py").read_text(encoding="utf-8")
@@ -293,4 +302,11 @@ def test_stage1_runners_use_the_mixer_and_do_not_dispatch_objective_builders() -
     ).read_text(encoding="utf-8")
     assert "EligibilityAwareTaskMixer" in materializer
     assert "CanonicalObjectivePlanner" in materializer
-    assert "production_training_loss_breakdown" in production
+    assert "scheduled_production_training_loss_breakdown" in production
+    assert "source_selection_receipt" in (
+        ROOT / "scripts" / "train_eval_stage1.py"
+    ).read_text(encoding="utf-8")
+    assert "require_production_objectives=True" in (
+        ROOT / "scripts" / "train_eval_stage1.py"
+    ).read_text(encoding="utf-8")
+    assert "production_training_loss" not in train_eval_calls

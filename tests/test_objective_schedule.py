@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from cppmega_mlx.training import objective_schedule
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.commit_packet import CommitPacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
@@ -15,12 +17,16 @@ from cppmega_mlx.data.graph_packet import EdgeIndex
 from cppmega_mlx.training.objective_mixer import (
     EligibilityAwareTaskMixer,
     ObjectiveSource,
+    scheduled_production_training_loss,
 )
 from cppmega_mlx.training.objective_schedule import (
     CanonicalObjectivePlanner,
     GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
     assess_graph_positive_capability,
+    canonical_schedule_receipt_sha256,
     source_has_graph_candidate,
+    validate_objective_source_selection_receipt,
+    validate_scheduled_objective,
 )
 from cppmega_mlx.training.task_mixer import TaskKind
 from scripts import materialize_megatron_objectives as materializer
@@ -302,3 +308,146 @@ def test_transformed_objective_without_exact_route_map_is_explicitly_ineligible(
     assert receipt["reason"] == "missing_exact_source_token_route_map"
     assert receipt["route_mode"] == "unavailable"
     assert receipt["route_receipt"] is None
+
+
+def test_canonical_schedule_binds_selected_candidate_and_rejects_start_step_reuse() -> None:
+    first = _typed_sources()[1]
+    second = _typed_sources()[1]
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer(
+            {TaskKind.COMMIT_DIFF: 1.0},
+            seed=23,
+        ),
+        source_iter=iter((first, second)),
+        quota_window_samples=1,
+        quota_lookahead_samples=0,
+    )
+
+    window = planner.plan_window(start_step=0)
+    assignment = window.receipt["assignments"][0]
+    assert assignment["realization"]["selected_packet_index"] == 0
+    assert assignment["realization"]["example_sha256"]
+
+    with pytest.raises(ValueError, match="start_step.*reuse"):
+        planner.plan_window(start_step=0)
+
+
+def test_assignment_receipt_rejects_selected_candidate_and_realization_drift() -> None:
+    first = _typed_sources()[1].commit_packet
+    assert first is not None
+    second = replace(first, diff_token_ids=_arr([90, 91, 92]))
+    source = ObjectiveSource(
+        code_packet=_code_packet(),
+        commit_packet=first,
+        commit_candidates=(first, second),
+    )
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer({TaskKind.COMMIT_DIFF: 1.0}, seed=31),
+        source_iter=iter((source,)),
+        quota_window_samples=1,
+        quota_lookahead_samples=0,
+    )
+    assignment = planner.plan_window(start_step=0).assignments[0]
+    receipt = deepcopy(dict(assignment.assignment_receipt or {}))
+    receipt["realization"]["selected_packet_index"] = (
+        receipt["realization"]["selected_packet_index"] + 1
+    )
+    tampered = replace(assignment, assignment_receipt=receipt)
+
+    with pytest.raises(ValueError, match="drifted"):
+        validate_scheduled_objective(tampered, graph_relations=())
+
+
+def test_graph_positive_schedule_cannot_enter_total_loss_with_zero_weight() -> None:
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer({TaskKind.CAUSAL_LM: 1.0}, seed=23),
+        source_iter=iter((ObjectiveSource(code_packet=_code_packet(call_edge=(1, 0))),)),
+        quota_window_samples=1,
+        quota_lookahead_samples=0,
+        graph_relations=("call",),
+        require_route_sidecars=False,
+    )
+    assignment = planner.plan_window(start_step=0).assignments[0]
+    assert assignment.graph_eligibility is not None
+    assert assignment.graph_eligibility["eligible"] is True
+
+    with pytest.raises(ValueError, match="positive graph weight"):
+        scheduled_production_training_loss(
+            SimpleNamespace(),
+            mx.zeros((1, 4), dtype=mx.int32),
+            mx.zeros((1, 4), dtype=mx.int32),
+            mx.ones((1, 4), dtype=mx.float32),
+            objective=TaskKind.CAUSAL_LM,
+            schedule_assignments=(dict(assignment.assignment_receipt or {}),),
+            side_channels={},
+            document_ids=None,
+            block_bias=None,
+            edge_kind_bias=None,
+            graph_targets=None,
+            graph_pair_mask=None,
+            graph_config=None,
+            graph_weight=0.0,
+            graph_relations=("call",),
+            require_schedule_receipt=True,
+        )
+
+
+def test_schedule_receipt_rejects_source_pool_binding_drift() -> None:
+    planner = CanonicalObjectivePlanner(
+        mixer=EligibilityAwareTaskMixer(
+            {TaskKind.CAUSAL_LM: 1.0},
+            seed=23,
+        ),
+        source_iter=iter(
+            (
+                ObjectiveSource(code_packet=_code_packet()),
+                ObjectiveSource(code_packet=_code_packet(call_edge=(1, 0))),
+            )
+        ),
+        quota_window_samples=1,
+        quota_lookahead_samples=1,
+        graph_relations=("call",),
+        require_route_sidecars=False,
+    )
+    planner.plan_window(start_step=0)
+    receipt = planner.source_selection_receipt(output_samples=1)
+    tampered = deepcopy(receipt)
+    tampered["windows"][0]["source_pool_source_indices"][1] = 99
+    tampered["windows_sha256"] = canonical_schedule_receipt_sha256(
+        tampered["windows"]
+    )
+    tampered["schedule"]["windows_sha256"] = tampered["windows_sha256"]
+
+    with pytest.raises(ValueError, match="source pool.*binding"):
+        validate_objective_source_selection_receipt(
+            tampered,
+            output_samples=1,
+            quota_window_samples=1,
+            graph_relations=("call",),
+        )
+
+
+def test_production_schedule_rejects_zero_rate_and_zero_quota_objectives() -> None:
+    validate_production_objective_rates = getattr(
+        objective_schedule,
+        "validate_production_objective_rates",
+        None,
+    )
+    assert callable(validate_production_objective_rates)
+    rates = {
+        TaskKind.CAUSAL_LM: 0.5,
+        TaskKind.FIM: 0.05,
+        TaskKind.AST_FIM: 0.0,
+        TaskKind.IFIM: 0.1,
+        TaskKind.COMMIT_DIFF: 0.1,
+        TaskKind.PRE_TO_POST: 0.1,
+        TaskKind.SYMBOL_RECOVERY: 0.1 / 3.0,
+        TaskKind.TYPE_RECOVERY: 0.1 / 3.0,
+        TaskKind.CALLEE_RECOVERY: 0.1 / 3.0,
+    }
+    with pytest.raises(ValueError, match="ast_fim.*positive"):
+        validate_production_objective_rates(rates, quota_window_samples=60)
+
+    rates[TaskKind.AST_FIM] = 0.05
+    with pytest.raises(ValueError, match="zero quota"):
+        validate_production_objective_rates(rates, quota_window_samples=1)
