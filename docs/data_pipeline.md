@@ -98,15 +98,23 @@ realize exact task quotas when sparse objective eligibility requires additional
 source rows.
 
 The Stage-1 objective path has one task dispatcher: `EligibilityAwareTaskMixer`.
-The streaming runner wraps it in `CanonicalObjectivePlanner`, remaps FIM/IFIM
-routes before batch construction, and composes CE with the configured graph /
-indexer loss through `production_training_loss`. The immutable Megatron ingress
-used by the production bundle runner is the same path materialized ahead of
-time; its `objective_materialized` contract and hashes are validated before any
-training batch is opened. Runners do not call individual FIM, IFIM, or commit
-builders. Missing graph route sidecars fail closed; independently tokenized
-COMMIT_DIFF and PRE_TO_POST sections carry an explicit route exclusion rather
-than fabricated graph alignment.
+The streaming runner wraps it in one `CanonicalObjectivePlanner`; every window
+and assignment carries a hash-bound realization, selected packet index, source
+pool binding, and graph eligibility verdict. The runner validates the complete
+`source_selection` receipt after the requested samples are consumed, including
+resume cursors and exact quotas. Causal LM, FIM, IFIM, AST-FIM, COMMIT_DIFF, and
+PRE_TO_POST then enter the same `scheduled_production_training_loss` path. That
+path requires a positive graph weight and complete graph targets whenever a
+graph-positive assignment is scheduled, and delegates to the single
+route-conditioned LM plus graph/indexer composition. The route-free branch is
+explicitly limited to the tiny legacy smoke.
+
+The immutable Megatron ingress used by the production bundle runner is the same
+pre-materialized schedule contract; its objective artifact, source receipt, and
+hashes are validated before any training batch is opened. Runners do not call
+individual FIM, IFIM, or commit builders. Missing graph route sidecars fail
+closed; independently tokenized COMMIT_DIFF and PRE_TO_POST sections carry an
+explicit route exclusion rather than fabricated graph alignment.
 
 ## Optional PyTorch DataLoader Bridge
 

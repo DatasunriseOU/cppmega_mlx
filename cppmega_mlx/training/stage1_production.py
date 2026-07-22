@@ -43,7 +43,12 @@ from cppmega_mlx.data.graph_recipe import (
 from cppmega_mlx.training.objective_mixer import (
     GraphAuxLossConfig,
     ProductionTrainingLossBreakdown,
-    production_training_loss_breakdown,
+    scheduled_production_training_loss_breakdown,
+)
+from cppmega_mlx.training.objective_schedule import (
+    PREMATERIALIZED_OBJECTIVE,
+    canonical_batch_shape_assignment_receipts,
+    validate_objective_assignment_receipt,
 )
 
 
@@ -78,6 +83,7 @@ class Stage1ProductionObjective:
     """Canonical Stage-1 CE objective with optional DSA graph supervision."""
 
     graph_config: GraphAuxLossConfig = STAGE1_PRODUCTION_GRAPH_LOSS
+    schedule_assignments: tuple[Mapping[str, object], ...] | None = None
 
     def __post_init__(self) -> None:
         validate_stage1_graph_config(self.graph_config)
@@ -124,11 +130,34 @@ class Stage1ProductionObjective:
                 "production Stage-1 graph ranking topk differs from model DSA topk: "
                 f"{self.graph_config.topk} != {model.config.attention_sparse_topk}"
             )
+        graph_relations = (
+            self.graph_config.relations
+            if model.config.attention_mode == "dsa"
+            else ()
+        )
+        schedule_assignments = self.schedule_assignments
+        if schedule_assignments is None:
+            schedule_assignments = canonical_batch_shape_assignment_receipts(
+                objective=PREMATERIALIZED_OBJECTIVE,
+                batch_size=int(values.input_ids.shape[0]),
+                input_tokens=int(values.input_ids.shape[1]),
+                loss_tokens=1,
+                graph_relations=graph_relations,
+            )
+        if len(schedule_assignments) != int(values.input_ids.shape[0]):
+            raise ValueError(
+                "production Stage-1 schedule receipt count does not match batch"
+            )
+        for assignment in schedule_assignments:
+            validate_objective_assignment_receipt(
+                assignment,
+                graph_relations=graph_relations,
+            )
         if model.config.attention_mode == "gqa":
             # Dense GQA has no learned indexer score tensor. Graph routes still
             # condition the full-causal decoder, while DSA-only graph metrics
             # remain zero instead of re-labelling route eligibility as loss.
-            return production_training_loss_breakdown(
+            return scheduled_production_training_loss_breakdown(
                 model,
                 values.input_ids,
                 values.targets,
@@ -141,12 +170,15 @@ class Stage1ProductionObjective:
                 graph_pair_mask=None,
                 graph_config=None,
                 graph_weight=0.0,
+                graph_relations=(),
+                schedule_assignments=schedule_assignments,
+                require_schedule_receipt=True,
             )
         if model.config.attention_mode != "dsa":
             raise ValueError(
                 "production Stage-1 supports only attention_mode='gqa' or 'dsa'"
             )
-        return production_training_loss_breakdown(
+        return scheduled_production_training_loss_breakdown(
             model,
             values.input_ids,
             values.targets,
@@ -159,6 +191,9 @@ class Stage1ProductionObjective:
             graph_pair_mask=values.graph_pair_mask,
             graph_config=self.graph_config,
             graph_weight=self.graph_config.global_weight,
+            graph_relations=self.graph_config.relations,
+            schedule_assignments=schedule_assignments,
+            require_schedule_receipt=True,
         )
 
     def __call__(
@@ -184,6 +219,8 @@ class Stage1ProductionObjective:
                 "graph_auxiliary_enabled": False,
                 "route_only": True,
                 "single_decoder_forward": True,
+                "schedule": "canonical_objective_schedule_receipt",
+                "total_loss_path": "scheduled_production_training_loss_breakdown",
             }
         if attention_mode != "dsa":
             raise ValueError(
@@ -212,6 +249,8 @@ class Stage1ProductionObjective:
             "positive_weight": config.pos_weight,
             "ranking_margin": config.margin,
             "single_decoder_forward": True,
+            "schedule": "canonical_objective_schedule_receipt",
+            "total_loss_path": "scheduled_production_training_loss_breakdown",
         }
 
 
