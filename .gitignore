@@ -131,3 +131,5 @@ outputs/conveyor/extract_cache/kodi/kodi_commits.jsonl
 outputs/conveyor/progress_commits.jsonl
 outputs/conveyor/locks/code.lock
 outputs/conveyor/locks/commits.lock
+cppmega_mlx/training/native_optim/_build/*
+cppmega_mlx/data/grammars/tree_sitter_tcsh.so

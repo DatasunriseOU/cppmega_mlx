@@ -2722,6 +2722,8 @@ def should_stage_repo_from_manifest(
 def stream_lock_names(streams: str) -> tuple[str, ...]:
     if streams == "both":
         return ("code", "commits")
+    if streams == "all":
+        return ("code", "commits", "ci")
     return (streams,)
 
 
@@ -4200,9 +4202,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Bound staged, not-yet-finished repos on disk. Default "
                         "= --repo-workers. Use 20-30 for a wide streaming window "
                         "when disk has room.")
-    p.add_argument("--streams", choices=("both", "code", "commits"), default="both",
+    p.add_argument("--streams", choices=("both", "code", "commits", "ci", "all"),
+                   default="both",
                    help="Which streams to emit. 'code' uses the source-only tar "
-                        "stream and does not extract .git / run PR/commit stages.")
+                        "stream and does not extract .git / run PR/commit stages. "
+                        "'ci' runs the CI enriched pipeline (tokenize_ci_enriched.py) "
+                        "on outputs/ci_enriched/ and exits. 'all' runs code+commits+ci.")
     p.add_argument("--max-repos", type=int, default=None,
                    help="Process at most N repos this run (after resume filtering).")
     p.add_argument("--token-budget", type=int, default=None,
@@ -4239,6 +4244,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--commit-output-root", default=str(src.COMMIT_OUTPUT_ROOT),
                    help="Output root for packed COMMIT parquet buckets. "
                         f"Default {src.COMMIT_OUTPUT_ROOT}.")
+    p.add_argument("--ci-input", default=str(MLX_ROOT / "outputs" / "ci_enriched"),
+                   help="Input directory containing CI enriched JSONL files "
+                        "(ci_logs_enriched.jsonl + ci_paired_enriched.jsonl). "
+                        "Default outputs/ci_enriched/.")
+    p.add_argument("--ci-output", default=str(MLX_ROOT / "outputs"),
+                   help="Output root for packed CI parquet buckets. "
+                        "Default outputs/ (produces reindexed_ci_<ts>_code/).")
+    p.add_argument("--target-lengths-ci", default="1024,2048,4096",
+                   help="Route-by-fit ladder for CI (default 1024,2048,4096).")
     p.add_argument("--conveyor-root", default=str(CONVEYOR_ROOT),
                    help="Root for conveyor manifest, locks, extract cache, "
                         f"progress and tmp defaults. Default {CONVEYOR_ROOT}.")
@@ -4363,9 +4377,46 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _run_ci_stream(args: argparse.Namespace) -> int:
+    """Run the CI enriched pipeline via tokenize_ci_enriched.py subprocess."""
+    ci_input = Path(args.ci_input)
+    ci_output = Path(args.ci_output)
+    seq_lengths = args.target_lengths_ci
+    tokenize_ci = _SCRIPT_DIR / "tokenize_ci_enriched.py"
+    if not tokenize_ci.exists():
+        raise SystemExit(f"CI stream requires {tokenize_ci} (not found)")
+    if not ci_input.exists():
+        raise SystemExit(f"--ci-input directory does not exist: {ci_input}")
+    cmd = [
+        str(VENV_PYTHON), str(tokenize_ci),
+        "--input", str(ci_input),
+        "--output", str(ci_output),
+        "--seq-lengths", seq_lengths,
+    ]
+    _log(f"CI stream: {' '.join(cmd)}")
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        _log(f"CI stream FAILED (exit {result.returncode})")
+    else:
+        _log("CI stream completed successfully.")
+    return result.returncode
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_runtime_paths_from_args(args)
+
+    # CI-only stream: run tokenize_ci_enriched.py and exit (no per-repo conveyor).
+    if args.streams == "ci":
+        return _run_ci_stream(args)
+
+    # 'all' = run CI first, then fall through to the normal both-streams conveyor.
+    if args.streams == "all":
+        ci_rc = _run_ci_stream(args)
+        if ci_rc != 0:
+            _log(f"CI stream failed (exit {ci_rc}); continuing with code+commits.")
+        args.streams = "both"
+
     try:
         revision_guard = CodeRevisionGuard.for_production(
             args.expected_code_revision,
