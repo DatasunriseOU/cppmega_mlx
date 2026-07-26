@@ -159,6 +159,10 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     ).read_text(encoding="utf-8")
     assert '-e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
     assert '-e "$repo_root[gui,parquet,widget]"' in installer
+    assert installer.index('-e "$repo_root[gui,parquet,widget]"') < installer.index(
+        '-e "$CPPMEGA_MLX_LM_CHECKOUT"'
+    )
+    assert '--no-deps \\\n  -e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
     assert 'rev-parse HEAD' in installer
     assert 'diff --cached --quiet' in installer
     assert "native optimizer extension unavailable" in installer
