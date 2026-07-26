@@ -1286,16 +1286,37 @@ def symbol_identity_for_cursor(
     signature = _cursor_canonical_signature(cursor)
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
-    rel_file, identity_project = _cursor_repo_file_location_identity(
-        cursor,
-        project_dir=project_dir,
-        project=project or repo,
-        fallback_file=fallback_file,
-    )
     requested_project = project or repo
-    is_external = rel_file.startswith("@provider/") or (
-        bool(requested_project) and identity_project != requested_project
-    )
+    if uses_repo_file_location:
+        rel_file, identity_project = _cursor_repo_file_location_identity(
+            cursor,
+            project_dir=project_dir,
+            project=requested_project,
+            fallback_file=fallback_file,
+        )
+        is_external = rel_file.startswith("@provider/") or (
+            bool(requested_project) and identity_project != requested_project
+        )
+    else:
+        rel_file, is_project_local = _cursor_identity_location(
+            cursor,
+            project_dir=project_dir,
+            fallback_file=fallback_file,
+        )
+        identity_project = requested_project if is_project_local else None
+        is_external = not is_project_local
+        if is_external:
+            external_provider, external_include = symbol_provider_provenance(rel_file)
+            if external_provider and external_include:
+                rel_file = canonical_external_provider_file(
+                    external_provider,
+                    external_include,
+                    source="symbol_identity_for_cursor",
+                )
+                identity_project = external_provider_project(
+                    external_provider,
+                    source="symbol_identity_for_cursor",
+                )
     provider, include_provenance = symbol_provider_provenance(rel_file)
     loc = getattr(cursor, "location", None)
     linkage = getattr(cursor, "linkage", None)
@@ -1315,7 +1336,7 @@ def symbol_identity_for_cursor(
     }
     if "INTERNAL" in linkage_name or storage_name == "STATIC" or is_local:
         file_scope = True
-    if is_external and usr:
+    if is_external and usr and provider and include_provenance:
         identity_key = canonical_external_usr_identity(
             usr=usr,
             canonical_signature=signature,
@@ -1334,7 +1355,7 @@ def symbol_identity_for_cursor(
             file=rel_file,
             line=getattr(loc, "line", None),
             column=getattr(loc, "column", None),
-            force_file_scope=file_scope or is_external,
+            force_file_scope=file_scope,
             repo_file_location_fallback=uses_repo_file_location,
         )
     return identity_key, usr, signature
@@ -3518,26 +3539,28 @@ class GlobalSymbolReader:
         """Resolve one exact candidate and fail closed on ambiguity."""
         all_candidates = self.lookup_candidates(qname)
         candidates = list(all_candidates)
-        identity_filter_used = False
-        if symbol_key:
-            identity_filter_used = True
-            candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
         if usr:
-            identity_filter_used = True
             candidates = [row for row in candidates if row["usr"] == usr]
-        if canonical_signature:
-            identity_filter_used = True
-            signature = _normalize_signature_text(canonical_signature)
-            candidates = [
-                row
-                for row in candidates
-                if _normalize_signature_text(str(row["canonical_signature"])) == signature
-            ]
-        if symbol_kind:
-            identity_filter_used = True
-            candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
-        if not identity_filter_used:
-            candidates = list(all_candidates)
+        else:
+            fallback_used = False
+            if canonical_signature:
+                fallback_used = True
+                signature = _normalize_signature_text(canonical_signature)
+                candidates = [
+                    row
+                    for row in candidates
+                    if _normalize_signature_text(str(row["canonical_signature"]))
+                    == signature
+                ]
+            if symbol_kind:
+                fallback_used = True
+                candidates = [
+                    row for row in candidates if row["symbol_kind"] == symbol_kind
+                ]
+            if not fallback_used and symbol_key:
+                candidates = [
+                    row for row in candidates if row["symbol_key"] == symbol_key
+                ]
         if project:
             candidates = [row for row in candidates if row["base_repo"] == project]
         if file:
@@ -5169,33 +5192,35 @@ def build_enriched_doc(
             if usr:
                 identity_filter_used = True
                 candidates = [target for target in candidates if target.get("usr") == usr]
-            signature = _normalize_signature_text(
-                str(reference.get("canonical_signature") or "")
-            )
-            if signature:
-                identity_filter_used = True
-                candidates = [
-                    target
-                    for target in candidates
-                    if _normalize_signature_text(
-                        str(target.get("canonical_signature") or "")
-                    ) == signature
-                ]
-            symbol_kind = str(reference.get("symbol_kind") or "")
-            if symbol_kind:
-                identity_filter_used = True
-                candidates = [
-                    target
-                    for target in candidates
-                    if str(target.get("kind") or "") == symbol_kind
-                ]
-            if reference_key:
-                identity_filter_used = True
-                candidates = [
-                    target
-                    for target in candidates
-                    if target.get("symbol_key") == reference_key
-                ]
+            else:
+                signature = _normalize_signature_text(
+                    str(reference.get("canonical_signature") or "")
+                )
+                if signature:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if _normalize_signature_text(
+                            str(target.get("canonical_signature") or "")
+                        )
+                        == signature
+                    ]
+                symbol_kind = str(reference.get("symbol_kind") or "")
+                if symbol_kind:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if str(target.get("kind") or "") == symbol_kind
+                    ]
+                if not identity_filter_used and reference_key:
+                    identity_filter_used = True
+                    candidates = [
+                        target
+                        for target in candidates
+                        if target.get("symbol_key") == reference_key
+                    ]
             provider = str(reference.get("provider") or "")
             if provider:
                 identity_filter_used = True

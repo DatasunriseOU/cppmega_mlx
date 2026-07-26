@@ -159,6 +159,10 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     ).read_text(encoding="utf-8")
     assert '-e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
     assert '-e "$repo_root[gui,parquet,widget]"' in installer
+    assert '"mlx==0.32.0"' in installer
+    assert installer.index('"mlx==0.32.0"') < installer.index(
+        '-e "$repo_root[gui,parquet,widget]"'
+    )
     assert installer.index('-e "$repo_root[gui,parquet,widget]"') < installer.index(
         '-e "$CPPMEGA_MLX_LM_CHECKOUT"'
     )

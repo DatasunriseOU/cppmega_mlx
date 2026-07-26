@@ -15,6 +15,7 @@ fi
 git -C "$CPPMEGA_MLX_LM_CHECKOUT" diff --quiet
 git -C "$CPPMEGA_MLX_LM_CHECKOUT" diff --cached --quiet
 
+"$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check "mlx==0.32.0"
 "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check \
   -e "$repo_root[gui,parquet,widget]"
 "$VBGUI_E2E_PYTHON" -m pip install --disable-pip-version-check --no-deps \
