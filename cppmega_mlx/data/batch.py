@@ -13,11 +13,11 @@ import numpy as np
 
 from cppmega_mlx.data.graph_packet import GraphBatch
 from cppmega_mlx.data.integer_validation import validated_integer_array
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+)
 
 SideChannelDropoutPolicy = Mapping[str, float]
-LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
-    "source_token_predicts_next_v1"
-)
 
 _BATCH_VALUES_PREVALIDATED: ContextVar[bool] = ContextVar(
     "cppmega_mlx_batch_values_prevalidated",

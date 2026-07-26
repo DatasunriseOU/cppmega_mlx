@@ -70,7 +70,7 @@ _EXPORT_MODULES = {
     "TOOL_USE_SPECIAL_TOKEN_IDS": "cppmega_mlx.data.tokenizer_contract",
     "validate_required_special_token_ids": "cppmega_mlx.data.tokenizer_contract",
     "BatchCursor": "cppmega_mlx.data.token_dataset",
-    "TokenDatasetMetadata": "cppmega_mlx.data.token_dataset",
+    "TokenDatasetMetadata": "cppmega_mlx.data.dataset_metadata",
     "TokenNpzDataset": "cppmega_mlx.data.token_dataset",
     "iterate_token_batches": "cppmega_mlx.data.token_dataset",
     "open_token_dataset": "cppmega_mlx.data.token_dataset",

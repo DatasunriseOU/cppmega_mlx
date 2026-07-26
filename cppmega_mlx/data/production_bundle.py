@@ -12,22 +12,18 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from cppmega_mlx.config.model import (
     LOCAL_PROFILE_VOCAB_SIZE,
     MEGACPP_TOKENIZER_VOCAB_SIZE,
 )
+from cppmega_mlx.data.dataset_metadata import TokenDatasetMetadata
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
-from cppmega_mlx.data.batch import (
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
 )
-from cppmega_mlx.data.megatron_indexed import (
-    MegatronIndexedDataset,
-    open_megatron_indexed_dataset,
-)
-from cppmega_mlx.data.token_dataset import TokenDatasetMetadata
 from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
@@ -36,6 +32,9 @@ from cppmega_mlx.data.graph_recipe import (
     stage1_graph_recipe_binding,
     validate_stage1_graph_contract,
 )
+
+if TYPE_CHECKING:
+    from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
 
 
 _BUNDLE_SCHEMA = "cppmega_megatron_bundle_v1"
@@ -364,6 +363,11 @@ def open_production_megatron_bundle(
     )
 
     _assert_artifacts_unchanged(root, validated.artifact_stats)
+    from cppmega_mlx.data.megatron_indexed import (
+        MegatronIndexedDataset,
+        open_megatron_indexed_dataset,
+    )
+
     dataset = open_megatron_indexed_dataset(
         selected_prefix.prefix,
         seq_len=seq_len,

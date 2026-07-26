@@ -34,3 +34,29 @@ assert info["primary_language"] == "c++"
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_portable_packing_contracts_do_not_eagerly_load_mlx_runtime() -> None:
+    code = """
+import sys
+
+from cppmega_mlx.data.dataset_metadata import TokenDatasetMetadata
+from cppmega_mlx.data.production_bundle import ProductionMegatronDatasetMetadata
+from scripts.nanochat_data.pack_enriched_rows import PackingStrategy
+
+assert TokenDatasetMetadata().tokenizer_contract == "megacpp"
+assert issubclass(ProductionMegatronDatasetMetadata, TokenDatasetMetadata)
+assert PackingStrategy is not None
+assert "cppmega_mlx.data.batch" not in sys.modules
+assert "mlx" not in sys.modules
+assert not any(name.startswith("mlx.") for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
