@@ -630,6 +630,7 @@ def _forbid_mmap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(np, "memmap", forbidden)
 
 
+@pytest.mark.mlx_runtime
 def test_open_production_megatron_bundle_records_validated_provenance(
     tmp_path: Path,
 ) -> None:
@@ -661,6 +662,7 @@ def test_legacy_objective_artifact_shape_requires_regeneration() -> None:
         )
 
 
+@pytest.mark.mlx_runtime
 def test_open_production_megatron_bundle_accepts_bounded_source_sampling(
     tmp_path: Path,
 ) -> None:

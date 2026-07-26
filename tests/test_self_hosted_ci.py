@@ -259,6 +259,15 @@ def test_both_lane_manifests_run_the_orchestration_regressions() -> None:
     assert "tests/test_workflow_runner_policy.py" in ci.LINUX_TESTS
 
 
+def test_linux_portable_lane_excludes_only_explicit_mlx_runtime_tests() -> None:
+    assert ci.LANES["linux-portable"].pytest_args == (
+        "--noconftest",
+        "-m",
+        "not mlx_runtime",
+    )
+    assert ci.LANES["macos-mlx"].pytest_args == ()
+
+
 def test_source_bound_environment_resolves_the_reviewed_checkout(
     tmp_path: Path,
 ) -> None:
