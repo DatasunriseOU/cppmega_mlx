@@ -108,6 +108,24 @@ def test_cuda_lane_does_not_request_a_nonexistent_dev_extra() -> None:
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in workflow
 
 
+def test_macos_abi_probe_binds_the_runner_environment_explicitly() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml"
+    ).read_text(encoding="utf-8")
+
+    assert 'scripts/check_mlx_abi.py \\' in workflow
+    assert '--python "${python_bin}"' in workflow
+    assert "--env-root /Volumes/external/sources/.venvs/cppmega.mlx" in workflow
+
+
+def test_tcsh_gitlink_has_a_canonical_submodule_mapping() -> None:
+    gitmodules = (REPO_ROOT / ".gitmodules").read_text(encoding="utf-8")
+
+    assert '[submodule "vendor/tree-sitter-tcsh"]' in gitmodules
+    assert "path = vendor/tree-sitter-tcsh" in gitmodules
+    assert "url = https://github.com/j3bit/tree-sitter-tcsh.git" in gitmodules
+
+
 def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "e2e-matrix.yml").read_text(
         encoding="utf-8"
@@ -141,6 +159,14 @@ def test_macos_e2e_uses_an_isolated_job_venv() -> None:
     ).read_text(encoding="utf-8")
     assert '-e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
     assert '-e "$repo_root[gui,parquet,widget]"' in installer
+    assert '"mlx==0.32.0"' in installer
+    assert installer.index('"mlx==0.32.0"') < installer.index(
+        '-e "$repo_root[gui,parquet,widget]"'
+    )
+    assert installer.index('-e "$repo_root[gui,parquet,widget]"') < installer.index(
+        '-e "$CPPMEGA_MLX_LM_CHECKOUT"'
+    )
+    assert '--no-deps \\\n  -e "$CPPMEGA_MLX_LM_CHECKOUT"' in installer
     assert 'rev-parse HEAD' in installer
     assert 'diff --cached --quiet' in installer
     assert "native optimizer extension unavailable" in installer

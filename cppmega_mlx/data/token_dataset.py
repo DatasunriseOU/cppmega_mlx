@@ -11,20 +11,17 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 import mlx.core as mx
 import numpy as np
 from numpy.lib.npyio import NpzFile
 
-from cppmega_mlx.config.model import (
-    LOCAL_PROFILE_VOCAB_SIZE,
-    MEGACPP_TOKENIZER_VOCAB_SIZE,
-)
 from cppmega_mlx.data.batch import LMTokenBatch
-
-TokenizerContract = Literal["megacpp", "local_profile", "custom"]
-TokenDatasetFormat = Literal["npz", "parquet", "megatron"]
+from cppmega_mlx.data.dataset_metadata import (
+    TokenDatasetFormat,
+    TokenDatasetMetadata,
+)
 
 
 class TokenNpzDatasetOptions(TypedDict, total=False):
@@ -93,47 +90,6 @@ _UNSUPPORTED_NGRAM_SIDECAR_KEYS = (
     "ngram_sidecar",
     "ngrams",
 )
-
-
-@dataclass(frozen=True)
-class TokenDatasetMetadata:
-    """Tokenizer/data contract carried with local token shards."""
-
-    vocab_size: int = MEGACPP_TOKENIZER_VOCAB_SIZE
-    tokenizer_contract: TokenizerContract = "megacpp"
-    local_profile_vocab_size: int = LOCAL_PROFILE_VOCAB_SIZE
-    megacpp_tokenizer_vocab_size: int = MEGACPP_TOKENIZER_VOCAB_SIZE
-    source_format: str = "npz"
-
-    def __post_init__(self) -> None:
-        if self.vocab_size <= 0:
-            raise ValueError("vocab_size must be positive")
-        if self.local_profile_vocab_size <= 0:
-            raise ValueError("local_profile_vocab_size must be positive")
-        if self.megacpp_tokenizer_vocab_size <= 0:
-            raise ValueError("megacpp_tokenizer_vocab_size must be positive")
-        if self.tokenizer_contract not in {"megacpp", "local_profile", "custom"}:
-            raise ValueError(
-                f"unsupported tokenizer_contract={self.tokenizer_contract!r}"
-            )
-
-    @classmethod
-    def from_npz(cls, data: NpzFile) -> "TokenDatasetMetadata":
-        """Read optional scalar metadata from an NPZ file."""
-
-        return cls(
-            vocab_size=_npz_scalar_int(data, "vocab_size", MEGACPP_TOKENIZER_VOCAB_SIZE),
-            tokenizer_contract=_npz_scalar_str(
-                data, "tokenizer_contract", "megacpp"
-            ),
-            local_profile_vocab_size=_npz_scalar_int(
-                data, "local_profile_vocab_size", LOCAL_PROFILE_VOCAB_SIZE
-            ),
-            megacpp_tokenizer_vocab_size=_npz_scalar_int(
-                data, "megacpp_tokenizer_vocab_size", MEGACPP_TOKENIZER_VOCAB_SIZE
-            ),
-            source_format="npz",
-        )
 
 
 @dataclass(frozen=True)
@@ -431,25 +387,6 @@ def _document_id_windows_from_npz(
             f"got {windows.shape}"
         )
     return windows
-
-
-def _npz_scalar_int(
-    data: NpzFile, key: str, default: int
-) -> int:
-    if key not in data:
-        return default
-    return int(np.asarray(data[key]).reshape(()).item())
-
-
-def _npz_scalar_str(
-    data: NpzFile, key: str, default: TokenizerContract
-) -> TokenizerContract:
-    if key not in data:
-        return default
-    value = str(np.asarray(data[key]).reshape(()).item())
-    if value not in {"megacpp", "local_profile", "custom"}:
-        raise ValueError(f"unsupported tokenizer_contract={value!r}")
-    return value  # type: ignore[return-value]
 
 
 def _side_channel_dtype(key: str) -> np.dtype[np.float32] | np.dtype[np.int32]:

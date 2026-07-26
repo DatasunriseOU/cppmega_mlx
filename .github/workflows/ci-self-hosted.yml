@@ -29,7 +29,10 @@ jobs:
           python_bin=/Volumes/external/sources/.venvs/cppmega.mlx/bin/python
           test -x "${python_bin}"
           env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
-            "${python_bin}" scripts/check_mlx_abi.py --json
+            "${python_bin}" scripts/check_mlx_abi.py \
+              --python "${python_bin}" \
+              --env-root /Volumes/external/sources/.venvs/cppmega.mlx \
+              --json
           uv pip check --python "${python_bin}"
           "${python_bin}" scripts/run_self_hosted_ci.py lane \
             --lane macos-mlx \

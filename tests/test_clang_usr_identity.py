@@ -1277,13 +1277,20 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
     db = tmp_path / "symbols.sqlite"
     usr = "c:@N@boost@N@algorithm@F@trim#&1$@S@Range#"
     signature = "display=trim(Range &)|type=void (Range &)"
+    provider = "boost"
+    include_provenance = "boost/algorithm/string/trim.hpp"
+    provider_project = ip.external_provider_project(provider)
+    provider_file = ip.canonical_external_provider_file(
+        provider,
+        include_provenance,
+    )
     global_key = ip.canonical_symbol_identity(
         qname="boost::algorithm::trim",
         kind="FUNCTION_TEMPLATE",
         usr=usr,
         canonical_signature=signature,
-        project="boostorg/boost",
-        file="boost/algorithm/string/trim.hpp",
+        project=provider_project,
+        file=include_provenance,
     )
     store = gsi.GlobalSymbolStore(str(db))
     store.insert_symbols(
@@ -1291,10 +1298,10 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
             gsi.GlobalSymbolRecord(
                 qname="boost::algorithm::trim",
                 base_lib="boost",
-                base_repo="boostorg/boost",
+                base_repo=provider_project,
                 kind=2,
                 sym_type="func",
-                file="boost/algorithm/string/trim.hpp",
+                file=include_provenance,
                 line=10,
                 end_line=12,
                 is_public=1,
@@ -1305,8 +1312,8 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
                 usr=usr,
                 canonical_signature=signature,
                 symbol_kind="FUNCTION_TEMPLATE",
-                provider="boost",
-                include_provenance="boost/algorithm/string/trim.hpp",
+                provider=provider,
+                include_provenance=include_provenance,
             )
         ]
     )
@@ -1318,6 +1325,10 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
         kind="FUNCTION_TEMPLATE",
         usr=usr,
         canonical_signature=signature,
+        project=provider_project,
+        file=provider_file,
+        provider=provider,
+        include_provenance=include_provenance,
     )
     caller_text = "void caller(Range& value) { boost::algorithm::trim(value); }"
     external_id = ip._compute_symbol_id(external_key)
@@ -1343,11 +1354,11 @@ def test_crossrepo_lookup_routes_external_usr_without_caller_project_alias(
                 "usr": usr,
                 "canonical_signature": signature,
                 "symbol_kind": "FUNCTION_TEMPLATE",
-                "project": "",
-                "file": "/opt/boost/include/boost/algorithm/string/trim.hpp",
+                "project": provider_project,
+                "file": provider_file,
                 "line": 10,
-                "provider": "boost",
-                "include_provenance": "boost/algorithm/string/trim.hpp",
+                "provider": provider,
+                "include_provenance": include_provenance,
             }
         ],
         semantic_symbol_ids=symbol_ids,

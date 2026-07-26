@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import numpy as np
 
@@ -77,6 +77,10 @@ PACK_ID_COLUMN = "pack_id"
 INPUT_IDS_COLUMN = "input_ids"
 TARGET_IDS_COLUMN = "target_ids"
 LOSS_MASK_COLUMN = "loss_mask"
+LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
+    "source_token_predicts_next_v1"
+)
+PackingStrategy = Literal["best_fit", "sequential"]
 DOC_IDS_COLUMN = "doc_ids"
 VALID_TOKEN_COUNT_COLUMN = "valid_token_count"
 NUM_DOCS_COLUMN = "num_docs"
@@ -403,6 +407,8 @@ __all__ = [
     "INPUT_IDS_COLUMN",
     "TARGET_IDS_COLUMN",
     "LOSS_MASK_COLUMN",
+    "LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1",
+    "PackingStrategy",
     "DOC_IDS_COLUMN",
     "VALID_TOKEN_COUNT_COLUMN",
     "NUM_DOCS_COLUMN",

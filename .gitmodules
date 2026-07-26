@@ -1,0 +1,3 @@
+[submodule "vendor/tree-sitter-tcsh"]
+	path = vendor/tree-sitter-tcsh
+	url = https://github.com/j3bit/tree-sitter-tcsh.git

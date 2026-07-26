@@ -45,6 +45,7 @@ from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN,
     PACKED_ROWS_TOKEN_METADATA_COLUMNS,
     PACK_ID_COLUMN,
+    PackingStrategy,
     ROW_PLATFORM_IDS_COLUMN,
     SOURCE_DOC_IDS_COLUMN,
     SOURCE_FILEPATH_STABLE_IDS_COLUMN,
@@ -122,7 +123,6 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     TOKEN_TYPE_REFS_COLUMN,
     SOURCE_IDENTITY_REGISTRY_COLUMN,
 )
-from cppmega_mlx.data.packing import PackingStrategy
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,

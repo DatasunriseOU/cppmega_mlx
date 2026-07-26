@@ -106,6 +106,7 @@ class LaneSpec:
     tests: tuple[str, ...]
     default_timeout_seconds: int
     pytest_timeout_seconds: int
+    pytest_args: tuple[str, ...] = ()
     portable: bool = False
 
 
@@ -125,6 +126,7 @@ LANES = {
         tests=LINUX_TESTS,
         default_timeout_seconds=900,
         pytest_timeout_seconds=600,
+        pytest_args=("--noconftest", "-m", "not mlx_runtime"),
         portable=True,
     ),
 }
@@ -505,10 +507,14 @@ def run_lane(args: argparse.Namespace) -> int:
             status = source_probe["status"]
             return 124 if source_probe["timed_out"] else 1
 
-        pytest_command = [effective_python, "-m", "pytest", "-q"]
-        if spec.portable:
-            pytest_command.append("--noconftest")
-        pytest_command.extend(spec.tests)
+        pytest_command = [
+            effective_python,
+            "-m",
+            "pytest",
+            "-q",
+            *spec.pytest_args,
+            *spec.tests,
+        ]
         pytest_step = run_step(
             name="pytest",
             command=pytest_command,

@@ -12,8 +12,9 @@ from typing import Literal, Sequence, cast
 import mlx.core as mx
 import numpy as np
 
+from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import PackingStrategy
+
 OversizedSamplePolicy = Literal["refuse", "truncate"]
-PackingStrategy = Literal["best_fit", "sequential"]
 
 
 @dataclass(frozen=True)
