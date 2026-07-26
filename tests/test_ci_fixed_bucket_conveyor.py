@@ -119,9 +119,11 @@ def test_ci_log_completion_binds_exact_output_and_http_410_gaps(
     tmp_path: Path,
 ) -> None:
     logs = tmp_path / "ci_logs_enriched.jsonl"
+    paired = tmp_path / "ci_paired_enriched.jsonl"
     state = tmp_path / "ci_logs_enriched.fetch-state.jsonl"
     receipt = tmp_path / "ci_logs_enriched.completion.json"
     logs.write_text(json.dumps(_raw_ci_doc(1, 2)) + "\n", encoding="utf-8")
+    paired.write_text(json.dumps(_raw_ci_doc(3, 2)) + "\n", encoding="utf-8")
     state.write_text(
         "\n".join(
             (
@@ -170,6 +172,10 @@ def test_ci_log_completion_binds_exact_output_and_http_410_gaps(
     assert completion["fetched_count"] == 1
     assert completion["expired_count"] == 1
     assert completion["receipt_sha256"] == _sha256(receipt)
+    assert discover_ci_input_files(
+        tmp_path,
+        allowed_auxiliary_jsonl=(state,),
+    ) == [logs.resolve(), paired.resolve()]
 
     logs.write_text("drifted\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="output binding drifted"):

@@ -721,7 +721,11 @@ def capture_ci_code_revision(
     }
 
 
-def discover_ci_input_files(input_path: Path) -> list[Path]:
+def discover_ci_input_files(
+    input_path: Path,
+    *,
+    allowed_auxiliary_jsonl: Iterable[Path] = (),
+) -> list[Path]:
     """Resolve the exact CI source inventory without filename fallbacks."""
 
     if input_path.is_file():
@@ -738,10 +742,12 @@ def discover_ci_input_files(input_path: Path) -> list[Path]:
             f"{input_path}: canonical CI input directory is incomplete; "
             f"missing={missing}"
         )
+    allowed_auxiliary = {path.resolve() for path in allowed_auxiliary_jsonl}
     unexpected = sorted(
         path.name
         for path in input_path.glob("*.jsonl")
         if path.name not in CANONICAL_CI_INPUT_NAMES
+        and path.resolve() not in allowed_auxiliary
     )
     if unexpected:
         raise RuntimeError(
@@ -1865,8 +1871,6 @@ def main() -> None:
             "production CI tokenization requires the canonical input directory "
             f"containing exactly {list(CANONICAL_CI_INPUT_NAMES)}"
         )
-    files = discover_ci_input_files(input_path)
-    source_inventory = inventory_ci_inputs(files)
     if not args.dry_run and args.ci_log_completion_receipt is None:
         parser.error("--ci-log-completion-receipt is required for production")
     source_completion = (
@@ -1874,13 +1878,23 @@ def main() -> None:
         if args.ci_log_completion_receipt is None
         else load_ci_log_completion(
             Path(args.ci_log_completion_receipt),
-            logs_path=next(
-                path
-                for path in files
-                if path.name == "ci_logs_enriched.jsonl"
+            logs_path=(
+                input_path / "ci_logs_enriched.jsonl"
+                if input_path.is_dir()
+                else input_path
             ),
         )
     )
+    allowed_auxiliary_jsonl = (
+        ()
+        if source_completion is None
+        else (Path(str(source_completion["state"]["path"])),)
+    )
+    files = discover_ci_input_files(
+        input_path,
+        allowed_auxiliary_jsonl=allowed_auxiliary_jsonl,
+    )
+    source_inventory = inventory_ci_inputs(files)
     producer_revision = (
         None
         if args.dry_run
