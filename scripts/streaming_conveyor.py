@@ -113,6 +113,8 @@ DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
 DEFAULT_TARGET_LENGTHS_CODE = (1024, 2048, 4096)
 DEFAULT_TARGET_LENGTHS_COMMITS = (1024, 2048, 4096, 8192, 16384)
+DEFAULT_TARGET_LENGTHS_CI = (1024, 2048, 4096, 8192, 16384)
+CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 DEFAULT_PROGRESS_JSONL = CONVEYOR_ROOT / "progress.jsonl"
 DEFAULT_DEDUP_CHECKPOINT_TOKENS = 25_000_000
 DEFAULT_RUN_LOCK_DIR = CONVEYOR_ROOT / "locks"
@@ -4250,9 +4252,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "Default outputs/ci_enriched/.")
     p.add_argument("--ci-output", default=str(MLX_ROOT / "outputs"),
                    help="Output root for packed CI parquet buckets. "
-                        "Default outputs/ (produces reindexed_ci_<ts>_code/).")
-    p.add_argument("--target-lengths-ci", default="1024,2048,4096",
-                   help="Route-by-fit ladder for CI (default 1024,2048,4096).")
+                        "Default outputs/ (produces reindexed_ci_<run-id>_ci/).")
+    p.add_argument(
+        "--ci-log-completion-receipt",
+        default=None,
+        help=(
+            "cppmega_ci_log_extraction_v1 receipt. Defaults to "
+            "--ci-input/ci_logs_enriched.completion.json."
+        ),
+    )
+    p.add_argument(
+        "--target-lengths-ci",
+        default=",".join(str(length) for length in DEFAULT_TARGET_LENGTHS_CI),
+        help=(
+            "Fixed production ladder for CI "
+            f"(required: {','.join(str(length) for length in DEFAULT_TARGET_LENGTHS_CI)})."
+        ),
+    )
     p.add_argument("--conveyor-root", default=str(CONVEYOR_ROOT),
                    help="Root for conveyor manifest, locks, extract cache, "
                         f"progress and tmp defaults. Default {CONVEYOR_ROOT}.")
@@ -4387,19 +4403,83 @@ def _run_ci_stream(args: argparse.Namespace) -> int:
         raise SystemExit(f"CI stream requires {tokenize_ci} (not found)")
     if not ci_input.exists():
         raise SystemExit(f"--ci-input directory does not exist: {ci_input}")
+    expected_lengths = ",".join(str(length) for length in DEFAULT_TARGET_LENGTHS_CI)
+    if args.target_lengths_ci != expected_lengths:
+        raise SystemExit(
+            f"CI production stream requires --target-lengths-ci {expected_lengths}"
+        )
+    if args.expected_code_revision is None:
+        raise SystemExit(
+            "CI production stream requires --expected-code-revision"
+        )
+    run_id = f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}-{os.getpid()}"
     cmd = [
         str(VENV_PYTHON), str(tokenize_ci),
         "--input", str(ci_input),
         "--output", str(ci_output),
         "--seq-lengths", seq_lengths,
+        "--run-id", run_id,
+        "--expected-code-revision", args.expected_code_revision,
+        "--ci-log-completion-receipt",
+        str(
+            Path(args.ci_log_completion_receipt)
+            if args.ci_log_completion_receipt
+            else ci_input / "ci_logs_enriched.completion.json"
+        ),
     ]
     _log(f"CI stream: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=False)
     if result.returncode != 0:
         _log(f"CI stream FAILED (exit {result.returncode})")
-    else:
-        _log("CI stream completed successfully.")
-    return result.returncode
+        return result.returncode
+
+    manifest_path = ci_output / f"reindexed_ci_{run_id}_ci" / "manifest.json"
+    if not manifest_path.is_file():
+        _log(f"CI stream FAILED: success without manifest {manifest_path}")
+        return 1
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        _log(f"CI stream FAILED: invalid manifest {manifest_path}: {error}")
+        return 1
+    counters = manifest.get("counters")
+    producer = manifest.get("producer")
+    revision = producer.get("code_revision") if isinstance(producer, dict) else None
+    source_inventory = manifest.get("source_inventory")
+    source_completion = manifest.get("source_completion")
+    if (
+        manifest.get("schema") != CI_MANIFEST_SCHEMA
+        or manifest.get("kind") != "ci"
+        or manifest.get("seq_lengths") != list(DEFAULT_TARGET_LENGTHS_CI)
+        or manifest.get("verification", {}).get("fixed_width_all_rows") is not True
+        or manifest.get("verification", {}).get("unexpected_rejects") != 0
+        or manifest.get("verification", {}).get("packing_overflow_docs") != 0
+        or not isinstance(counters, dict)
+        or counters.get("input_docs") != counters.get("tokenized_docs")
+        or counters.get("source_tokens") != counters.get("fragment_tokens")
+        or not isinstance(revision, dict)
+        or revision.get("schema") != "cppmega_ci_code_revision_v2"
+        or revision.get("git_commit") != args.expected_code_revision
+        or not isinstance(revision.get("source_tree_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", revision["source_tree_sha256"]) is None
+        or not isinstance(source_inventory, list)
+        or len(source_inventory) != 2
+        or any(not isinstance(entry, dict) for entry in source_inventory)
+        or [
+            entry.get("name")
+            for entry in source_inventory
+            if isinstance(entry, dict)
+        ]
+        != ["ci_logs_enriched.jsonl", "ci_paired_enriched.jsonl"]
+        or not isinstance(source_completion, dict)
+        or source_completion.get("schema") != "cppmega_ci_log_extraction_v1"
+        or source_completion.get("status") != "complete"
+        or source_completion.get("unresolved_count") != 0
+    ):
+        _log(f"CI stream FAILED: manifest closure rejected {manifest_path}")
+        return 1
+    _log(f"CI stream completed and verified: {manifest_path}")
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -4414,7 +4494,11 @@ def main(argv: list[str]) -> int:
     if args.streams == "all":
         ci_rc = _run_ci_stream(args)
         if ci_rc != 0:
-            _log(f"CI stream failed (exit {ci_rc}); continuing with code+commits.")
+            _log(
+                f"CI stream failed (exit {ci_rc}); refusing code+commits "
+                "because --streams all is atomic at the stream-success boundary."
+            )
+            return ci_rc
         args.streams = "both"
 
     try:
