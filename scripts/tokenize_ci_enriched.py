@@ -18,6 +18,8 @@ Usage:
         --seq-lengths 4096 --dry-run
 """
 
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import argparse
@@ -44,7 +46,6 @@ import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
 from cppmega_mlx.data.domain_schema import (
     DOMAIN_SCHEMA_SHA256,
-    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     DomainKind,
     DomainRoleKind,
     ParseConfidence,
@@ -59,15 +60,10 @@ from cppmega_mlx.data.diagnostic_parsers import (
     parse_test_output,
 )
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
-    DOC_IDS_COLUMN,
     INPUT_IDS_COLUMN,
     LOSS_MASK_COLUMN,
-    NUM_DOCS_COLUMN,
     PACK_ID_COLUMN,
     PACKED_ROWS_TOKEN_METADATA_COLUMNS,
-    ROW_PLATFORM_IDS_COLUMN,
-    SOURCE_DOC_IDS_COLUMN,
-    SOURCE_PLATFORM_IDS_COLUMN,
     TARGET_IDS_COLUMN,
     VALID_TOKEN_COUNT_COLUMN,
 )
@@ -78,38 +74,27 @@ from cppmega_mlx.data.nanochat_pipeline.tokenized_enriched_schema import (
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
     SOURCE_IDENTITY_REGISTRY_COLUMN,
-    TOKEN_AST_DEPTH_COLUMN,
-    TOKEN_AST_NODE_TYPE_COLUMN,
     TOKEN_BUILD_EDGES_COLUMN,
     TOKEN_CALL_EDGES_COLUMN,
     TOKEN_CHUNK_DEP_LEVELS_COLUMN,
     TOKEN_CHUNK_ENDS_COLUMN,
     TOKEN_CHUNK_KINDS_COLUMN,
     TOKEN_CHUNK_STARTS_COLUMN,
-    TOKEN_CONFIDENCE_IDS_COLUMN,
     TOKEN_CROSS_DOMAIN_EDGES_COLUMN,
-    TOKEN_DEP_LEVELS_COLUMN,
     TOKEN_DIAGNOSTIC_EDGES_COLUMN,
     TOKEN_DOMAIN_EDGES_COLUMN,
-    TOKEN_DOMAIN_IDS_COLUMN,
     TOKEN_IDS_COLUMN,
-    TOKEN_ROLE_IDS_COLUMN,
     TOKEN_SHELL_EDGES_COLUMN,
-    TOKEN_SIBLING_INDEX_COLUMN,
-    TOKEN_STRUCTURE_IDS_COLUMN,
     TOKEN_TYPE_EDGES_COLUMN,
     TOKENIZED_ENRICHED_OBJECTIVE_COLUMNS,
 )
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
-    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
 )
 from cppmega_mlx.data.tokenizer_contract import (
-    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
-    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
 )
 from scripts.nanochat_data.pack_enriched_rows import (
     PACKED_ROW_OUTPUT_SCHEMA,
