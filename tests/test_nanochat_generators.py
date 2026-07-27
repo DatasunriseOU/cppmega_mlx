@@ -264,16 +264,17 @@ def test_local_convert_backfills_static_code_repo_provenance(
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "out.parquet"
+    text = "int add(int a, int b) { return a + b; }"
     input_path.write_text(
         json.dumps(
             {
                 "symbol_identity_schema_version": 3,
                 "symbol_identities": [],
-                "text": "int add(int a, int b) { return a + b; }",
+                "text": text,
                 "filepath": "include/math.hpp",
-                "structure_ids": [3] * 40,
+                "structure_ids": [3] * len(text),
                 "chunk_boundaries": [
-                    {"start": 0, "end": 40, "kind": 3, "dep_level": 0}
+                    {"start": 0, "end": len(text), "kind": 3, "dep_level": 0}
                 ],
                 "call_edges": [],
                 "type_edges": [],
@@ -596,7 +597,11 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     )
 
     parquet_file = pq.ParquetFile(output_path)
-    assert summary == {"docs_in": 2, "docs_out": 2}
+    assert summary["docs_in"] == 2
+    assert summary["docs_out"] == 2
+    assert summary["source_docs_emitted"] == 2
+    assert summary["dropped_input_docs"] == 0
+    assert summary["materialized_rows"] == 2
     assert parquet_file.metadata.num_rows == 2
     assert parquet_file.metadata.num_row_groups == 2
     # V7-G02: when the input row doesn't carry an explicit

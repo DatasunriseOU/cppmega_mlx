@@ -525,7 +525,11 @@ def test_case3_mixed_indexer_batch_reaches_converter_parquet(tmp_path: Path) -> 
     )
     table = pq.read_table(output_path)
 
-    assert summary == {"docs_in": len(docs), "docs_out": len(docs)}
+    assert summary["docs_in"] == len(docs)
+    assert summary["docs_out"] == len(docs)
+    assert summary["source_docs_emitted"] == len(docs)
+    assert summary["dropped_input_docs"] == 0
+    assert summary["materialized_rows"] == len(docs)
     assert table.num_rows == len(docs)
     assert table.schema.metadata[
         converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")

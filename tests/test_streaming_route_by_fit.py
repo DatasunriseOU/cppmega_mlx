@@ -5,11 +5,12 @@ import sys
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 
-def test_route_by_fit_drops_docs_longer_than_largest_fixed_bucket(tmp_path):
+def test_route_by_fit_fails_closed_before_writing_any_fixed_bucket(tmp_path):
     sys.path.insert(0, "scripts")
-    from streaming_reindex_commits import bucket_for, route_by_fit, read_dropped_overlong
+    from streaming_reindex_commits import RepoFailure, bucket_for, route_by_fit
 
     source = tmp_path / "tok.parquet"
     table = pa.Table.from_pylist(
@@ -26,20 +27,25 @@ def test_route_by_fit_drops_docs_longer_than_largest_fixed_bucket(tmp_path):
     assert bucket_for(17, [8, 16]) is None
 
     route_dir = tmp_path / "routed"
-    routed = route_by_fit(source, [8, 16], route_dir)
+    with pytest.raises(
+        RepoFailure,
+        match=r"overlong_rows=1 overlong_tokens=17.*fixed_shape_max=16",
+    ) as caught:
+        route_by_fit(source, [8, 16], route_dir, repo="owner/repo")
 
-    assert sorted(routed) == [8, 16]
-    assert pq.read_table(routed[8]).column("name").to_pylist() == ["small"]
-    assert pq.read_table(routed[16]).column("name").to_pylist() == ["medium"]
+    assert caught.value.repo == "owner/repo"
+    assert not (route_dir / "route_8.parquet").exists()
+    assert not (route_dir / "route_16.parquet").exists()
+    assert not (route_dir / "dropped_overlong.json").exists()
 
-    drop_report = json.loads((route_dir / "dropped_overlong.json").read_text())
-    assert drop_report["max_length"] == 16
-    assert drop_report["dropped_overlong_rows"] == 1
-    assert drop_report["dropped_overlong_tokens"] == 17
 
-    # read_dropped_overlong lifts the receipt counts out so process_range can
-    # record them durably before the per-range temp dir is rmtree'd.
-    assert read_dropped_overlong(route_dir) == {"rows": 1, "tokens": 17}
+def test_token_list_lengths_stay_in_arrow_and_treat_null_as_zero():
+    sys.path.insert(0, "scripts")
+    from streaming_reindex_commits import _token_list_lengths
+
+    values = pa.array([[1, 2, 3], None, [], [4]], type=pa.list_(pa.int64()))
+
+    assert _token_list_lengths(values) == [3, 0, 0, 1]
 
 
 def test_route_by_fit_releases_arrow_pool_after_streaming(tmp_path, monkeypatch):
@@ -69,9 +75,9 @@ def test_route_by_fit_releases_arrow_pool_after_streaming(tmp_path, monkeypatch)
     assert calls == ["released"]
 
 
-def test_read_dropped_overlong_zero_when_all_fit(tmp_path):
+def test_route_by_fit_preserves_all_rows_when_every_document_fits(tmp_path):
     sys.path.insert(0, "scripts")
-    from streaming_reindex_commits import route_by_fit, read_dropped_overlong
+    from streaming_reindex_commits import route_by_fit
 
     source = tmp_path / "tok.parquet"
     pq.write_table(
@@ -88,10 +94,9 @@ def test_read_dropped_overlong_zero_when_all_fit(tmp_path):
     routed = route_by_fit(source, [8, 16], route_dir)
 
     assert sorted(routed) == [8, 16]
-    # No over-long docs: route_by_fit writes no receipt, read returns zeros
-    # (documented contract, not a swallowed error).
+    assert pq.read_table(routed[8]).column("name").to_pylist() == ["small"]
+    assert pq.read_table(routed[16]).column("name").to_pylist() == ["medium"]
     assert not (route_dir / "dropped_overlong.json").exists()
-    assert read_dropped_overlong(route_dir) == {"rows": 0, "tokens": 0}
 
 
 def test_recompress_zstd_max_streams_row_groups_without_full_read(
