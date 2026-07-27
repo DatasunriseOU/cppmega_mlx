@@ -414,6 +414,97 @@ def test_line_oriented_build_domains_use_lossless_bounded_chunks(
     assert "".join(chunk.text for chunk in chunks) == text
 
 
+def test_utf16le_large_sql_chunks_preserve_original_encoded_byte_spans(
+    tmp_path: Path,
+) -> None:
+    sql = (
+        "-- generated SQL\r\n"
+        + "INSERT INTO audit_log VALUES (N'café', N'Москва');\r\n" * 32
+    )
+    encoded = b"\xff\xfe" + sql.encode("utf-16-le")
+    path = tmp_path / "legacy/schema.sql"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    assert discover_project_domain_files(tmp_path) == [
+        DiscoveredDomainFile(
+            path=path,
+            domain=DomainKind.SQL,
+            adapter="sql-lexical",
+        )
+    ]
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=128))
+    assert len(chunks) > 2
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"utf-16-le"}
+    assert all(chunk.byte_end - chunk.byte_start <= 128 for chunk in chunks)
+
+    byte_cursor = 0
+    char_cursor = 0
+    for chunk in chunks:
+        assert (chunk.byte_start, chunk.char_start) == (byte_cursor, char_cursor)
+        raw = encoded[chunk.byte_start : chunk.byte_end]
+        if chunk.index == 0:
+            assert raw.startswith(b"\xff\xfe")
+            raw = raw[2:]
+        assert raw.decode("utf-16-le") == chunk.text
+        assert chunk.source_span()["source_encoding"] == "utf-16-le"
+        byte_cursor = chunk.byte_end
+        char_cursor = chunk.char_end
+    assert (byte_cursor, char_cursor) == (len(encoded), len(sql))
+
+
+def test_utf16be_chunks_do_not_split_non_bmp_code_points(tmp_path: Path) -> None:
+    sql = "SELECT N'😀';\n" * 12
+    encoded = b"\xfe\xff" + sql.encode("utf-16-be")
+    path = tmp_path / "legacy-be.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=24))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"utf-16-be"}
+    for chunk in chunks:
+        raw = encoded[chunk.byte_start : chunk.byte_end]
+        if chunk.index == 0:
+            raw = raw[2:]
+        assert raw.decode("utf-16-be") == chunk.text
+
+
+def test_windows_1252_sql_is_decoded_strictly_without_replacement(
+    tmp_path: Path,
+) -> None:
+    sql = "-- Microsoft’s legacy export\r\nSELECT 'café';\r\n"
+    encoded = sql.encode("cp1252")
+    path = tmp_path / "legacy.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=32))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"windows-1252"}
+    assert b"".join(chunk.text.encode("cp1252") for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
+
+
+def test_single_trailing_nul_is_preserved_as_explicit_source_terminator(
+    tmp_path: Path,
+) -> None:
+    sql = "BEGIN TRANSACTION;\r\nCOMMIT TRANSACTION;\r\n"
+    encoded = sql.encode("utf-8") + b"\0"
+    path = tmp_path / "terminated.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=24))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert chunks[-1].byte_end == len(encoded)
+    assert all(chunk.source_trailing_nul_bytes == 1 for chunk in chunks)
+    assert all(
+        chunk.source_span()["source_trailing_nul_bytes"] == 1
+        for chunk in chunks
+    )
+    rebuilt = b"".join(chunk.text.encode("utf-8") for chunk in chunks) + b"\0"
+    assert rebuilt == encoded
+
+
 def test_large_domain_policy_skips_untyped_and_rejects_malformed_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,8 +546,8 @@ def test_large_domain_policy_skips_untyped_and_rejects_malformed_text(
 
     invalid_root = tmp_path / "invalid"
     invalid_root.mkdir()
-    (invalid_root / "schema.sql").write_bytes(b"SELECT 1;" + oversized + b"\xff")
-    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+    (invalid_root / "schema.sql").write_bytes(b"SELECT 1;" + oversized + b"\x81")
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
         discover_project_domain_files(invalid_root)
 
     unreadable_root = tmp_path / "unreadable"
@@ -484,13 +575,21 @@ def test_domain_discovery_skips_binary_generic_text_candidates(
     assert discover_project_domain_files(tmp_path) == []
 
 
-def test_domain_discovery_skips_non_utf8_generic_text_candidates(
+def test_domain_discovery_accepts_windows_1252_generic_text_candidates(
     tmp_path: Path,
 ) -> None:
     generic = tmp_path / "compiler-output.txt"
-    generic.write_bytes(b"error: invalid candidate\xff")
+    generic.write_bytes(
+        "main.cpp:12:3: error: compiler’s invalid candidate\n".encode("cp1252")
+    )
 
-    assert discover_project_domain_files(tmp_path) == []
+    assert discover_project_domain_files(tmp_path) == [
+        DiscoveredDomainFile(
+            path=generic,
+            domain=DomainKind.COMPILER_DIAGNOSTIC,
+            adapter="clang-diagnostic",
+        )
+    ]
 
 
 @pytest.mark.parametrize("name", ["module.py", "script.ksh"])
@@ -499,9 +598,9 @@ def test_domain_discovery_rejects_non_utf8_explicit_domain_files(
     name: str,
 ) -> None:
     explicit = tmp_path / name
-    explicit.write_bytes(b"explicit domain\xff")
+    explicit.write_bytes(b"explicit domain\x81")
 
-    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
         discover_project_domain_files(tmp_path)
 
 
@@ -511,7 +610,7 @@ def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
     name: str,
 ) -> None:
     explicit = tmp_path / name
-    explicit.write_bytes(b"explicit domain\xff")
+    explicit.write_bytes(b"explicit domain\x81")
     rejected: list[tuple[Path, str]] = []
 
     discovered = discover_project_domain_files(
@@ -522,4 +621,4 @@ def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
     assert discovered == []
     assert len(rejected) == 1
     assert rejected[0][0] == explicit
-    assert rejected[0][1].startswith("invalid UTF-8 domain input")
+    assert rejected[0][1].startswith("invalid UTF-8 or Windows-1252")

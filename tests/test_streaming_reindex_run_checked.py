@@ -185,7 +185,7 @@ def test_non_github_repo_list_identity_reaches_code_indexer(
     assert captured[project_id_arg + 1] == (
         "android.googlesource.com/platform%2Fframeworks%2Fav"
     )
-    assert "--skip-invalid-domain-inputs" in captured
+    assert "--skip-invalid-domain-inputs" not in captured
     assert output == work / "aosp-frameworks-av.enriched.jsonl"
 
 
