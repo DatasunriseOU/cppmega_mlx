@@ -8022,9 +8022,11 @@ def _parse_file_batch(args_tuple):
         except SymbolIdentityError:
             raise
         except Exception as exc:
+            cause = exc.__cause__ or exc
+            context = f"; {exc}" if cause is not exc else ""
             raise RuntimeError(
                 f"C/C++ parse failed for {filepath}: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(cause).__name__}: {cause}{context}"
             ) from exc
         now = time.monotonic()
         if (
@@ -8266,9 +8268,11 @@ def process_project(
             except SymbolIdentityError:
                 raise
             except Exception as exc:
+                cause = exc.__cause__ or exc
+                context = f"; {exc}" if cause is not exc else ""
                 raise RuntimeError(
                     f"C/C++ parse failed for {filepath}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(cause).__name__}: {cause}{context}"
                 ) from exc
             processed = parsed
             now = time.monotonic()
