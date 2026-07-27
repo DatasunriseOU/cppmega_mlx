@@ -264,16 +264,17 @@ def test_local_convert_backfills_static_code_repo_provenance(
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     output_path = tmp_path / "out.parquet"
+    text = "int add(int a, int b) { return a + b; }"
     input_path.write_text(
         json.dumps(
             {
                 "symbol_identity_schema_version": 3,
                 "symbol_identities": [],
-                "text": "int add(int a, int b) { return a + b; }",
+                "text": text,
                 "filepath": "include/math.hpp",
-                "structure_ids": [3] * 40,
+                "structure_ids": [3] * len(text),
                 "chunk_boundaries": [
-                    {"start": 0, "end": 40, "kind": 3, "dep_level": 0}
+                    {"start": 0, "end": len(text), "kind": 3, "dep_level": 0}
                 ],
                 "call_edges": [],
                 "type_edges": [],
