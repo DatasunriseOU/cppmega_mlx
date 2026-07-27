@@ -343,12 +343,12 @@ def test_non_utf8_domain_input_fails_closed_without_lossy_decode(
     from tools.clang_indexer import index_project
 
     script = tmp_path / "invalid.sh"
-    script.write_bytes(b"#!/bin/sh\nprintf '\xff'\n")
+    script.write_bytes(b"#!/bin/sh\nprintf '\x81'\n")
 
-    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
         discover_project_domain_files(tmp_path)
 
-    with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+    with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
         index_project.emit_build_documents(
             [(str(script), "sh")],
             default_build_info=None,
@@ -368,6 +368,23 @@ def test_shell_shebang_overrides_generic_sh_suffix_in_both_discovery_paths(
 
     assert resolve_domain_parser(script, text).domain == DomainKind.BASH
     assert index_project.find_shell_files(str(tmp_path)) == [(str(script), "bash")]
+
+
+def test_shell_discovery_accepts_a_single_trailing_nul_terminator(
+    tmp_path: Path,
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import discover_project_domain_files
+    from cppmega_mlx.data.domain_schema import DomainKind
+    from tools.clang_indexer import index_project
+
+    script = tmp_path / "single.ksh"
+    script.write_bytes(b"#!/bin/ksh\nprint ok\0")
+
+    assert index_project.find_shell_files(str(tmp_path)) == [(str(script), "ksh")]
+    discovered = discover_project_domain_files(tmp_path)
+    assert [(item.path, item.domain) for item in discovered] == [
+        (script, DomainKind.KSH)
+    ]
 
 
 def test_process_project_emits_every_discovered_domain_once_with_source_identity(
