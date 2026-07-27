@@ -10,7 +10,7 @@ if str(CLANG_INDEXER) not in sys.path:
     sys.path.insert(0, str(CLANG_INDEXER))
 
 
-def test_empty_build_files_are_counted_and_skipped(tmp_path, capsys):
+def test_whitespace_build_source_is_preserved_losslessly(tmp_path, capsys):
     from index_project import emit_build_documents
     from cppmega_mlx.data.domain_schema import DomainEdgeKind, DomainKind, DomainRoleKind
 
@@ -28,14 +28,19 @@ def test_empty_build_files_are_counted_and_skipped(tmp_path, capsys):
         default_build_info=None,
     )
 
-    assert len(docs) == 1
-    assert docs[0]["doc_type"] == "build"
-    assert docs[0]["build_kind"] == "cmake"
-    assert docs[0]["domain_kind"] == int(DomainKind.CMAKE)
-    assert len(docs[0]["domain_ids"]) == len(docs[0]["text"])
-    assert int(DomainRoleKind.TARGET) in docs[0]["domain_role_ids"]
+    assert len(docs) == 2
+    by_kind = {doc["build_kind"]: doc for doc in docs}
+    assert by_kind["bazel"]["text"] == "  \n\t\n"
+    assert by_kind["bazel"]["doc_type"] == "build"
+    assert len(by_kind["bazel"]["domain_ids"]) == len(by_kind["bazel"]["text"])
+    assert by_kind["cmake"]["doc_type"] == "build"
+    assert by_kind["cmake"]["domain_kind"] == int(DomainKind.CMAKE)
+    assert len(by_kind["cmake"]["domain_ids"]) == len(by_kind["cmake"]["text"])
+    assert int(DomainRoleKind.TARGET) in by_kind["cmake"]["domain_role_ids"]
     assert any(
         edge["kind"] == int(DomainEdgeKind.BUILD_TARGET_DEP)
-        for edge in docs[0]["build_edges"]
+        for edge in by_kind["cmake"]["build_edges"]
     )
-    assert "skipped_empty=1" in capsys.readouterr().err
+    log = capsys.readouterr().err
+    assert "source_chars_in=80 source_chars_out=80" in log
+    assert "skipped_zero_length=0" in log

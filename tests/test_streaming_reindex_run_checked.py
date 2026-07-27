@@ -92,51 +92,47 @@ def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(tmp_path
     assert "started" in log_path.read_text(encoding="utf-8")
 
 
-def test_materialize_uses_canonical_project_identity(monkeypatch, tmp_path) -> None:
+def test_materialize_command_uses_canonical_project_identity(tmp_path) -> None:
     import streaming_reindex
 
-    captured: list[str] = []
-
-    def fake_run_checked(_repo, _stage, cmd, *, log_path):
-        del log_path
-        captured.extend(str(value) for value in cmd)
-        output = tmp_path / "cjson.tok.parquet"
-        output.write_bytes(b"parquet-placeholder")
-
-    monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
     enriched = tmp_path / "cjson.enriched.jsonl"
-    enriched.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "cjson.tok.parquet"
+    receipt = streaming_reindex.materialize_stats_path(output)
+    command = [
+        str(value)
+        for value in streaming_reindex._materialize_command(
+            repo="cjson",
+            enriched=enriched,
+            tok=output,
+            stats_path=receipt,
+            memory_limit_gb=10.0,
+            max_tokens=65533,
+            project_id="DaveGamble/cJSON",
+        )
+    ]
 
-    output = streaming_reindex.stage_materialize(
-        "cjson",
-        enriched,
-        tmp_path,
-        project_id="DaveGamble/cJSON",
-    )
-
-    default_repo = captured.index("--default-repo")
-    assert captured[default_repo + 1] == "DaveGamble/cJSON"
-    assert output == tmp_path / "cjson.tok.parquet"
+    default_repo = command.index("--default-repo")
+    assert command[default_repo + 1] == "DaveGamble/cJSON"
+    assert command[command.index("--overflow-policy") + 1] == "split"
+    assert command[command.index("--size") + 1] == "65533"
+    assert command[command.index("--stats-file") + 1] == str(receipt)
 
 
-def test_materialize_rejects_bare_project_identity_before_subprocess(
-    monkeypatch, tmp_path
-) -> None:
+def test_materialize_command_rejects_bare_project_identity(tmp_path) -> None:
     import streaming_reindex
 
-    monkeypatch.setattr(
-        streaming_reindex,
-        "run_checked",
-        lambda *_args, **_kwargs: pytest.fail("subprocess must not start"),
-    )
+    output = tmp_path / "cjson.tok.parquet"
     with pytest.raises(
         streaming_reindex.SymbolIdentityError,
         match="exactly one slash",
     ):
-        streaming_reindex.stage_materialize(
-            "cjson",
-            tmp_path / "input.jsonl",
-            tmp_path,
+        streaming_reindex._materialize_command(
+            repo="cjson",
+            enriched=tmp_path / "input.jsonl",
+            tok=output,
+            stats_path=streaming_reindex.materialize_stats_path(output),
+            memory_limit_gb=10.0,
+            max_tokens=65533,
             project_id="cjson",
         )
 

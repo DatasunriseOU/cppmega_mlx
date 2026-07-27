@@ -7407,6 +7407,7 @@ def emit_build_documents(
     project_id: str | None = None,
     default_build_info: dict | None,
     compile_index: object | None = None,
+    max_chunk_bytes: int = BUILD_FILE_SIZE_CAP,
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
     dedup_stage_id: str | None = None,
@@ -7415,18 +7416,20 @@ def emit_build_documents(
     emit_doc: Callable[[dict[str, object]], None] | None = None,
     skip_invalid_inputs: bool = False,
 ) -> list[dict]:
-    """Emit bounded domain docs with tokenized-hash dedup.
+    """Emit every bounded domain source chunk in source order.
 
     Inputs within the domain cap remain one whole-file document. Oversized SQL,
-    build, shell, and diagnostic text use deterministic typed chunks; each
-    chunk is deduplicated independently and carries its exact source
-    byte/character span. Uses the SAME shared DedupStore tables (token-id exact
-    + near) so domain docs dedup globally and resumably.
+    build, shell, and diagnostic text use deterministic typed chunks; each chunk
+    carries its exact source byte/character span. Chunk-level content dedup is
+    intentionally disabled: repeated source chunks are still distinct source
+    spans, and dropping one would create an unrecoverable hole. The tokenizer
+    and dedup parameters remain accepted for caller compatibility; code function
+    dedup continues in ``dedup_root_functions``.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    that tokenizes empty RAISES. NUL-bearing and invalid UTF-8 explicit domain
-    inputs also raise before any chunk is emitted. Truly empty/whitespace files
-    are counted and skipped.
+    with invalid text RAISES. NUL-bearing and invalid UTF-8 explicit domain
+    inputs also raise before any chunk is emitted. Only zero-length inputs are
+    skipped; whitespace is source content and remains losslessly represented.
     """
     docs: list[dict] = []
     if not build_files:
@@ -7442,23 +7445,9 @@ def emit_build_documents(
             emit_doc(doc)
         emitted += 1
 
-    tok = None
-    store = None
-    seen_local: set[bytes] = set()
-    if tokenizer_path:
-        tok = _load_cppmega_tokenizer(tokenizer_path)
-        if dedup_db:
-            from dedup_store import DedupStore
-            store = DedupStore(
-                dedup_db,
-                near=dedup_near,
-                commit_every=2000,
-                stage_id=dedup_stage_id,
-                stage_db_path=dedup_stage_db,
-            )
-
-    dropped = 0
-    skipped_empty = 0
+    skipped_zero_length = 0
+    source_chars_in = 0
+    source_chars_out = 0
     from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
 
     sorted_build_files = sorted(build_files)
@@ -7474,7 +7463,7 @@ def emit_build_documents(
         try:
             source_chunks = iter_domain_file_chunks(
                 filepath,
-                max_chunk_bytes=BUILD_FILE_SIZE_CAP,
+                max_chunk_bytes=max_chunk_bytes,
             )
             for source_chunk in source_chunks:
                 processed_chunks += 1
@@ -7485,8 +7474,9 @@ def emit_build_documents(
                     last_build_heartbeat,
                 )
                 text = source_chunk.text
-                if not text or not text.strip():
-                    skipped_empty += 1
+                source_chars_in += len(text)
+                if not text:
+                    skipped_zero_length += 1
                     continue
 
                 per_file_build_info = dict(default_build_info) if default_build_info else {}
@@ -7507,28 +7497,6 @@ def emit_build_documents(
                 }:
                     per_file_build_info["build_system"] = build_kind
 
-                if tok is not None:
-                    token_ids = tok.encode(text)
-                    if not token_ids:
-                        raise RuntimeError(
-                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                        )
-                    if store is not None:
-                        if store.seen_exact_tokens(token_ids):
-                            dropped += 1
-                            continue
-                        if dedup_near and store.seen_near_tokens(token_ids):
-                            dropped += 1
-                            continue
-                    else:
-                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-                        h = _sha1_tokens(token_ids)
-                        if h in seen_local:
-                            dropped += 1
-                            continue
-                        seen_local.add(h)
-
                 record_doc(
                     build_build_doc(
                         filepath,
@@ -7540,6 +7508,7 @@ def emit_build_documents(
                         source_span=source_chunk.source_span(),
                     )
                 )
+                source_chars_out += len(text)
         except ValueError as exc:
             if skip_invalid_inputs and str(exc).startswith(
                 (
@@ -7561,14 +7530,12 @@ def emit_build_documents(
         force=True,
     )
 
-    if store is not None:
-        store.commit()
-        store.close()
-
     print(
-        f"  Build docs: emitted={emitted} dropped_dup={dropped} "
-        f"skipped_empty={skipped_empty} "
-        "(bounded-domain tokenized-hash dedup)",
+        f"  Build docs: emitted={emitted} "
+        f"source_chars_in={source_chars_in} "
+        f"source_chars_out={source_chars_out} "
+        f"skipped_zero_length={skipped_zero_length} "
+        "source_chunk_dedup=disabled_for_lossless_spans",
         file=sys.stderr,
     )
     return docs

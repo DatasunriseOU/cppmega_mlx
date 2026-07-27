@@ -596,7 +596,11 @@ def test_local_parquet_conversion_streams_row_groups(tmp_path: Path) -> None:
     )
 
     parquet_file = pq.ParquetFile(output_path)
-    assert summary == {"docs_in": 2, "docs_out": 2}
+    assert summary["docs_in"] == 2
+    assert summary["docs_out"] == 2
+    assert summary["source_docs_emitted"] == 2
+    assert summary["dropped_input_docs"] == 0
+    assert summary["materialized_rows"] == 2
     assert parquet_file.metadata.num_rows == 2
     assert parquet_file.metadata.num_row_groups == 2
     # V7-G02: when the input row doesn't carry an explicit
