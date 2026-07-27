@@ -652,7 +652,12 @@ def export_pr_parquet(
                 memory_limit_gb=float(args.memory_limit_gb),
                 max_fixed_tokens=max(lengths),
             )
-            routed = route_by_fit(tok, lengths, work / "routed")
+            routed = route_by_fit(
+                tok,
+                lengths,
+                work / "routed",
+                repo=args.repo,
+            )
             if not routed:
                 raise RuntimeError(f"no PR docs routed for {jsonl}")
             per_length: dict[str, dict] = {}

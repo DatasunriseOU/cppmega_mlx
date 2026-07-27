@@ -30,12 +30,22 @@ def test_route_by_fit_fails_closed_before_writing_any_fixed_bucket(tmp_path):
     with pytest.raises(
         RepoFailure,
         match=r"overlong_rows=1 overlong_tokens=17.*fixed_shape_max=16",
-    ):
-        route_by_fit(source, [8, 16], route_dir)
+    ) as caught:
+        route_by_fit(source, [8, 16], route_dir, repo="owner/repo")
 
+    assert caught.value.repo == "owner/repo"
     assert not (route_dir / "route_8.parquet").exists()
     assert not (route_dir / "route_16.parquet").exists()
     assert not (route_dir / "dropped_overlong.json").exists()
+
+
+def test_token_list_lengths_stay_in_arrow_and_treat_null_as_zero():
+    sys.path.insert(0, "scripts")
+    from streaming_reindex_commits import _token_list_lengths
+
+    values = pa.array([[1, 2, 3], None, [], [4]], type=pa.list_(pa.int64()))
+
+    assert _token_list_lengths(values) == [3, 0, 0, 1]
 
 
 def test_route_by_fit_releases_arrow_pool_after_streaming(tmp_path, monkeypatch):
