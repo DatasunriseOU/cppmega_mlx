@@ -43,12 +43,12 @@ def test_build_context_ignores_build_directory_named_like_bazel_file(tmp_path: P
     assert "-std=c++17" in default_args
 
 
-def test_windows_source_dumps_are_not_code_worktree_repos() -> None:
+def test_windows_source_dumps_are_code_worktree_repos() -> None:
     from scripts.streaming_reindex import is_code_worktree_repo
 
     assert not is_code_worktree_repo("repo.bare")
-    assert not is_code_worktree_repo("windows_10_shared_source_kit")
-    assert not is_code_worktree_repo("windows_ce_5_121231")
+    assert is_code_worktree_repo("windows_10_shared_source_kit")
+    assert is_code_worktree_repo("windows_ce_5_121231")
     assert is_code_worktree_repo("llvm-project")
 
 
