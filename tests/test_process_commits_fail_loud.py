@@ -283,6 +283,7 @@ def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
                 "reviews": [],
                 "linked_issues": [],
             },
+            scan_id="a" * 64,
         )
         process_commits._pr_store_mod.upsert_record(
             conn,
@@ -296,6 +297,7 @@ def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
                 "reviews": [],
                 "linked_issues": [],
             },
+            scan_id="a" * 64,
         )
         process_commits._pr_store_mod.upsert_record(
             conn,
@@ -309,17 +311,8 @@ def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
                 "reviews": [],
                 "linked_issues": [],
             },
+            scan_id="b" * 64,
         )
-        conn.execute("ALTER TABLE prs ADD COLUMN scan_id TEXT")
-        conn.execute(
-            "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
-            ("a" * 64, "owner/repo", 1),
-        )
-        conn.execute(
-            "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
-            ("b" * 64, "owner/repo", 2),
-        )
-        conn.commit()
     finally:
         conn.close()
 

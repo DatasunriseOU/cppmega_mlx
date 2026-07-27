@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -19,14 +18,6 @@ MLX_ROOT = Path(__file__).resolve().parents[1]
 PR_INGEST = MLX_ROOT / "scripts" / "pr_ingest"
 if str(PR_INGEST) not in sys.path:
     sys.path.insert(0, str(PR_INGEST))
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _record(pr_number: int, *, repo: str = "owner/repo", body: str = "body") -> dict:
@@ -55,26 +46,28 @@ def _verified_pr_inputs(
     stale_records: list[dict] | None = None,
 ) -> tuple[Path, Path, Path, str]:
     import pr_store
+    from scripts.pr_ingest.graphql_pr_stream import (
+        GRAPHQL_MANIFEST_SCHEMA,
+        GRAPHQL_QUERY_CONTRACT_SHA256,
+    )
+    from scripts.pr_ingest.verify_pr_completion import verify_pr_completion
 
     scan_id = "1" * 64
     store = tmp_path / "prs.sqlite"
     conn = pr_store.connect(str(store), create=True)
     try:
-        conn.execute("ALTER TABLE prs ADD COLUMN scan_id TEXT")
         for record in records:
-            pr_store.upsert_record(conn, record)
-            conn.execute(
-                "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
-                (scan_id, record["repo"], int(record["pr_number"])),
+            pr_store.upsert_record(
+                conn,
+                record,
+                scan_id=scan_id,
             )
         for record in stale_records or []:
-            pr_store.upsert_record(conn, record)
-            conn.execute(
-                "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
-                ("2" * 64, record["repo"], int(record["pr_number"])),
+            pr_store.upsert_record(
+                conn,
+                record,
+                scan_id="2" * 64,
             )
-        conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
 
@@ -84,41 +77,42 @@ def _verified_pr_inputs(
         json.dumps({"repos": [{"owner_repo": repo} for repo in repos]}) + "\n",
         encoding="utf-8",
     )
-    expected_repos_sha256 = hashlib.sha256(
-        json.dumps(
-            repos,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    receipt = tmp_path / "pr_completion.json"
-    receipt.write_text(
+    repo_counts = {
+        repo: sum(1 for record in records if record["repo"] == repo)
+        for repo in repos
+    }
+    manifest = tmp_path / "graphql_manifest.json"
+    manifest.write_text(
         json.dumps(
             {
-                "schema": "cppmega_pr_completion_v2",
-                "status": "verified",
-                "pr_store": {
-                    "path": str(store.resolve()),
-                    "sha256": _sha256(store),
-                    "size": store.stat().st_size,
-                },
-                "repo_list": {
-                    "path": str(repo_list.resolve()),
-                    "sha256": _sha256(repo_list),
-                },
+                "schema": GRAPHQL_MANIFEST_SCHEMA,
+                "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
                 "scan_id": scan_id,
-                "expected_repos_sha256": expected_repos_sha256,
-                "expected_repo_count": len(repos),
-                "declared_pr_count": len(records),
-                "stored_pr_count": len(records),
-                "unverified_store_pr_count": len(stale_records or []),
+                "repos": {
+                    repo: {
+                        "status": "done",
+                        "cursor": None,
+                        "prs": count,
+                        "initial_total_count": count,
+                        "total_count": count,
+                        "source_growth_count": 0,
+                        "truncated": 0,
+                    }
+                    for repo, count in sorted(repo_counts.items())
+                },
             },
             indent=2,
             sort_keys=True,
         )
         + "\n",
         encoding="utf-8",
+    )
+    receipt = tmp_path / "pr_completion.json"
+    verify_pr_completion(
+        repo_list_path=repo_list,
+        graphql_manifest_path=manifest,
+        store_path=store,
+        output_path=receipt,
     )
     return store, repo_list, receipt, scan_id
 

@@ -1,101 +1,58 @@
 #!/usr/bin/env bash
-# Tier-2 PR ingest, component (2): bq runner for gharchive_query.sql.
+# GH Archive FALLBACK runner (only used when GraphQL hits a wall).
 #
-# Drives the GH Archive extraction with the user's OWN GCP project + creds.
-# It ALWAYS dry-runs first (prints bytes-scanned + a cost estimate), then runs
-# the real query into a destination table, then exports that table to local
-# newline-delimited JSON for component (3) pr_store.py to ingest.
+# HYBRID strategy: GraphQL is PRIMARY. This script is the documented fallback
+# path that graphql_pr_stream.TokenExhausted points at. It runs the BigQuery
+# extraction in gharchive_query.sql for the resolved repo list, then optionally
+# loads the resulting PR/Review/Comment events into the unified pr_store when
+# PR_STORE_DB is set. The SQL emits both raw and projected fields so old root
+# receipts and the normalized production store remain compatible.
 #
-# Creds the user must provide (RULE #1: no silent fallback — fails if missing):
-#   * A GCP project with billing + BigQuery enabled (BQ_PROJECT).
-#   * `gcloud auth login` (or a service account) so `bq` is authenticated.
-#   * A GCS bucket (BQ_GCS_BUCKET) for the export step (BigQuery exports go to
-#     GCS, then we `gsutil cp` to local).
-#
-# Usage:
-#   BQ_PROJECT=my-gcp-proj \
-#   BQ_DATASET=pr_ingest \
-#   BQ_GCS_BUCKET=gs://my-bucket/pr_ingest \
-#   REPO_LIST=/path/to/repo_list.json \
-#   SUFFIX_START=1501 SUFFIX_END=2606 \
-#   OUT_DIR=/mnt/nvme/cppmega_data/pr_ingest \
-#   ./scripts/pr_ingest/gharchive_run.sh
-#
-# Set DRY_RUN_ONLY=1 to stop after the dry run (recommended first pass).
+# RULE #1: no silent success. If bq is missing or the query fails, we exit
+# non-zero and print why -- we do NOT pretend data was fetched.
 set -euo pipefail
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SQL="${here}/gharchive_query.sql"
+PROJECT="${BQ_PROJECT:-natural-bison-491019-t9}"
+TABLE_GLOB="${TABLE_GLOB:-githubarchive.month.20*}"
+REPO_LIST="${REPO_LIST:-outputs/pr_ingest/repo_list.json}"
+OUT="${OUT:-outputs/pr_ingest/gharchive_events.json}"
+PR_STORE_DB="${PR_STORE_DB:-}"
 
-: "${BQ_PROJECT:?set BQ_PROJECT to your GCP project id}"
-: "${BQ_DATASET:?set BQ_DATASET (e.g. pr_ingest) — it must exist or be creatable}"
-: "${BQ_GCS_BUCKET:?set BQ_GCS_BUCKET (gs://bucket/prefix) for the export step}"
-: "${REPO_LIST:?set REPO_LIST to the repo_list.json from build_repo_list.py}"
-: "${SUFFIX_START:=1501}"   # GH Archive monthly shards begin 2015-01
-: "${SUFFIX_END:=$(date +%y%m)}"  # current month as YYMM
-: "${OUT_DIR:=./pr_ingest_out}"
-: "${DEST_TABLE:=pr_discussion_raw}"
-
-# --- Build the repo_names ARRAY parameter from repo_list.json --------------
-if ! command -v jq >/dev/null 2>&1; then
-  echo "[gharchive_run] FAIL: jq is required to read ${REPO_LIST}" >&2
-  exit 1
+if ! command -v bq >/dev/null 2>&1; then
+  echo "FATAL: bq (BigQuery CLI) not found; cannot run GH Archive fallback." >&2
+  exit 2
 fi
-mapfile -t REPO_NAMES < <(jq -r '.repo_names[]' "${REPO_LIST}")
-if [ "${#REPO_NAMES[@]}" -eq 0 ]; then
-  echo "[gharchive_run] FAIL: repo_list has 0 repo_names (${REPO_LIST})" >&2
-  exit 1
-fi
-# bq array param syntax: name:ARRAY<STRING>:["a","b"]
-REPO_JSON="$(printf '%s\n' "${REPO_NAMES[@]}" | jq -R . | jq -cs .)"
-REPO_PARAM="repo_names:ARRAY<STRING>:${REPO_JSON}"
-echo "[gharchive_run] ${#REPO_NAMES[@]} repos; shards ${SUFFIX_START}..${SUFFIX_END}" >&2
-
-# --- 1) DRY RUN (cost estimate; scans nothing, bills nothing) ---------------
-echo "[gharchive_run] === DRY RUN (no bytes billed) ===" >&2
-DRY_JSON="$(
-  bq --project_id="${BQ_PROJECT}" query \
-    --use_legacy_sql=false --dry_run --format=prettyjson \
-    --parameter="suffix_start:STRING:${SUFFIX_START}" \
-    --parameter="suffix_end:STRING:${SUFFIX_END}" \
-    --parameter="${REPO_PARAM}" \
-    "$(cat "${SQL}")"
-)"
-echo "${DRY_JSON}"
-BYTES="$(printf '%s' "${DRY_JSON}" | jq -r '.statistics.query.totalBytesProcessed // .statistics.totalBytesProcessed // empty')"
-if [ -n "${BYTES}" ]; then
-  TB=$(python3 -c "print(f'{${BYTES}/1e12:.4f}')")
-  USD=$(python3 -c "print(f'{${BYTES}/1e12*6.25:.2f}')")  # on-demand ~\$6.25/TB
-  echo "[gharchive_run] dry-run: ${BYTES} bytes (~${TB} TB) -> ~\$${USD} on-demand" >&2
+if [[ ! -f "$REPO_LIST" ]]; then
+  echo "FATAL: repo list not found at $REPO_LIST (run repo_list_from_tarball.py)" >&2
+  exit 2
 fi
 
-if [ "${DRY_RUN_ONLY:-0}" = "1" ]; then
-  echo "[gharchive_run] DRY_RUN_ONLY=1 set; stopping before real query." >&2
+# Build the IN-list from GitHub-only repo_names. Mixed-forge identities stay in
+# repo_list.json but are intentionally excluded from this GitHub-only query.
+IN_LIST=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); names=d.get('repo_names') or [r['owner_repo'] for r in d.get('repos', []) if r.get('owner_repo')]; print(', '.join(\"'\"+name.replace(\"'\", \"''\")+\"'\" for name in names))")
+if [[ -z "$IN_LIST" ]]; then
+  echo "FATAL: repo list resolved to zero repos; refusing to query." >&2
+  exit 2
+fi
+
+SQL=$(sed -e "s|{table_glob}|$TABLE_GLOB|g" -e "s|{repo_in_list}|$IN_LIST|g" \
+  "$(dirname "$0")/gharchive_query.sql")
+
+REPO_COUNT=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); print(len(d.get('repo_names') or [r for r in d.get('repos', []) if r.get('owner_repo')]))")
+echo "[gharchive] project=$PROJECT table=$TABLE_GLOB repos=$REPO_COUNT" >&2
+echo "[gharchive] dry-run cost gate" >&2
+bq --project_id="$PROJECT" query --use_legacy_sql=false --dry_run "$SQL"
+if [[ "${DRY_RUN_ONLY:-0}" == "1" ]]; then
+  echo "[gharchive] DRY_RUN_ONLY=1; stopping before real query." >&2
   exit 0
 fi
 
-# --- 2) REAL QUERY -> destination table -------------------------------------
-echo "[gharchive_run] === REAL QUERY -> ${BQ_PROJECT}:${BQ_DATASET}.${DEST_TABLE} ===" >&2
-bq --project_id="${BQ_PROJECT}" mk -f --dataset "${BQ_PROJECT}:${BQ_DATASET}" >/dev/null 2>&1 || true
-bq --project_id="${BQ_PROJECT}" query \
-  --use_legacy_sql=false \
-  --destination_table="${BQ_PROJECT}:${BQ_DATASET}.${DEST_TABLE}" \
-  --replace \
-  --parameter="suffix_start:STRING:${SUFFIX_START}" \
-  --parameter="suffix_end:STRING:${SUFFIX_END}" \
-  --parameter="${REPO_PARAM}" \
-  "$(cat "${SQL}")"
-
-# --- 3) EXPORT table -> GCS (NDJSON) -> local -------------------------------
-GCS_GLOB="${BQ_GCS_BUCKET%/}/${DEST_TABLE}-*.json"
-echo "[gharchive_run] === EXPORT -> ${GCS_GLOB} ===" >&2
-bq --project_id="${BQ_PROJECT}" extract \
-  --destination_format=NEWLINE_DELIMITED_JSON \
-  "${BQ_PROJECT}:${BQ_DATASET}.${DEST_TABLE}" \
-  "${GCS_GLOB}"
-
-mkdir -p "${OUT_DIR}"
-gsutil -m cp "${GCS_GLOB}" "${OUT_DIR}/"
-echo "[gharchive_run] downloaded NDJSON shards -> ${OUT_DIR}/" >&2
-echo "[gharchive_run] next: python3 scripts/pr_ingest/pr_store.py ingest-gharchive \\" >&2
-echo "                  --store ${OUT_DIR}/pr_store.sqlite --input '${OUT_DIR}/${DEST_TABLE}-*.json'" >&2
+mkdir -p "$(dirname "$OUT")"
+bq --project_id="$PROJECT" query --use_legacy_sql=false --format=prettyjson "$SQL" > "$OUT"
+echo "[gharchive] wrote $OUT" >&2
+if [[ -n "$PR_STORE_DB" ]]; then
+  python3 "$(dirname "$0")/pr_store.py" ingest-gharchive \
+    --store "$PR_STORE_DB" --input "$OUT"
+else
+  echo "[gharchive] PR_STORE_DB not set; raw events only, pr_store load skipped." >&2
+fi
