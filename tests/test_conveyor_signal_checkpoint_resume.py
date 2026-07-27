@@ -26,6 +26,7 @@ its work temp are never referenced.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -85,6 +86,9 @@ def _build(ckpt_root: Path):
         "work_parent": conveyor / "tmp",
         "run_lock_dir": conveyor / "locks",
         "progress": conveyor / "progress.jsonl",
+        "pr_store": out / "pr_ingest" / "prs.sqlite",
+        "repo_list": out / "pr_ingest" / "repo_list.json",
+        "pr_completion": out / "pr_ingest" / "pr_completion.json",
         "markers": out / "reindexed_commits" / "markers",
         "extract_events": ckpt_root / "events" / "extract_events.jsonl",
         "range_events": ckpt_root / "events" / "range_events.jsonl",
@@ -98,6 +102,54 @@ def _build(ckpt_root: Path):
         "CKPT_EXTRACT_EVENTS": str(paths["extract_events"]),
         "CKPT_RANGE_EVENTS": str(paths["range_events"]),
     })
+    paths["pr_store"].parent.mkdir(parents=True, exist_ok=True)
+    paths["pr_store"].write_bytes(b"immutable harness PR store")
+    paths["repo_list"].write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {
+                        "name": repo,
+                        "owner_repo": f"test/{repo}",
+                        "project_identity": f"test/{repo}",
+                    }
+                    for repo in REPOS
+                ]
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    paths["pr_completion"].write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_pr_completion_v2",
+                "status": "verified",
+                "pr_store": {
+                    "path": str(paths["pr_store"].resolve()),
+                    "sha256": sha256(paths["pr_store"]),
+                },
+                "repo_list": {
+                    "path": str(paths["repo_list"].resolve()),
+                    "sha256": sha256(paths["repo_list"]),
+                },
+                "expected_repos_sha256": "2" * 64,
+                "scan_id": "3" * 64,
+                "expected_repo_count": len(REPOS),
+                "declared_pr_count": 0,
+                "stored_pr_count": 0,
+                "unverified_store_pr_count": 0,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     argv = [
         "--expected-code-revision", TEST_CODE_REVISION,
         "--streams", "both",
@@ -110,8 +162,9 @@ def _build(ckpt_root: Path):
         "--run-lock-dir", str(paths["run_lock_dir"]),
         "--progress-jsonl", str(paths["progress"]),
         "--dedup-db", "",
-        "--pr-store", "",
-        "--repo-list", "",
+        "--pr-store", str(paths["pr_store"]),
+        "--repo-list", str(paths["repo_list"]),
+        "--pr-completion-receipt", str(paths["pr_completion"]),
         "--dedup-checkpoint-tokens", "0",
         "--memory-limit-gb", "99",
         "--memory-budget-gb", "0",

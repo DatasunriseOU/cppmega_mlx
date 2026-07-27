@@ -150,6 +150,7 @@ conv.DEFAULT_WORK_PARENT = conv.CONVEYOR_ROOT / "tmp"
 conv.DEFAULT_DEDUP_DB = OUT / "dedup_seen.sqlite"
 conv.DEFAULT_PR_STORE = OUT / "pr_ingest" / "prs.sqlite"
 conv.DEFAULT_REPO_LIST = OUT / "pr_ingest" / "repo_list.json"
+conv.VENV_PYTHON = Path(sys.executable)
 sr.OUTPUT_ROOT = OUT / "reindexed"
 src.COMMIT_OUTPUT_ROOT = OUT / "reindexed_commits"
 MARKERS = src.COMMIT_OUTPUT_ROOT / "markers"
@@ -158,7 +159,6 @@ MARKERS = src.COMMIT_OUTPUT_ROOT / "markers"
 # without invoking any real binary; point every required path at this harness
 # file (which exists). The stages that would USE them are faked below.
 for _mod, _name in (
-    (conv, "VENV_PYTHON"),
     (conv, "EXTRACT_GIT"),
     (sr, "TOKENIZER_PATH"),
     (sr, "MATERIALIZER"),
@@ -187,9 +187,19 @@ def fake_get_commit_list(repo_dir):
     return list(range(NRECORDS))
 
 
-def fake_stage_extract_commits(repo, repo_dir, cache_dir):
+def fake_stage_extract_commits(
+    repo,
+    repo_dir,
+    cache_dir,
+    *,
+    project_id=None,
+):
     """The EXPENSIVE extract. Writes <repo>_commits.jsonl with NRECORDS lines and
     records ONE durable event so the test can prove it ran exactly once / repo."""
+    if project_id != f"test/{repo}":
+        raise AssertionError(
+            f"unexpected harness project identity: {project_id!r}"
+        )
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     jsonl = cache_dir / f"{repo}_commits.jsonl"
@@ -239,10 +249,13 @@ def fake_run_code_half(
 
 def fake_process_range(repo, repo_dir, records_jsonl, start, end, lengths_sorted,
                        repo_work, dedup_db, dedup_near, pr_store, repo_list,
-                       memory_limit_gb=10.0, analysis_cache_entries=128):
+                       memory_limit_gb=10.0, analysis_cache_entries=128, *,
+                       pr_scan_id=None):
     """Fake per-range commit stage. Sleeps (so the test can SIGTERM mid-repo),
     records ONE durable event per ACTUAL execution, and writes a persistent
     marker 'parquet' so final completeness can be checked."""
+    if pr_scan_id != "3" * 64:
+        raise AssertionError(f"unexpected harness PR scan id: {pr_scan_id!r}")
     time.sleep(RANGE_SLEEP)
     _append_event(RANGE_EVENTS, {
         "repo": repo, "start": int(start), "end": int(end),

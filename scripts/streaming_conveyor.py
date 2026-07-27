@@ -189,6 +189,10 @@ class CodeRevisionDriftError(CodeRevisionError):
     """The checkout changed after the conveyor captured its revision."""
 
 
+class PRCompletionBindingError(RuntimeError):
+    """The commit stream is not bound to one verified PR snapshot."""
+
+
 def verify_libclang_preflight(python: Path = VENV_PYTHON) -> str:
     """Prove the stage interpreter can load and initialize libclang."""
 
@@ -224,6 +228,281 @@ def verify_libclang_preflight(python: Path = VENV_PYTHON) -> str:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        before = path.stat()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError as exc:
+        raise PRCompletionBindingError(
+            f"cannot hash PR completion input {path}: {exc}"
+        ) from exc
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise PRCompletionBindingError(
+            f"PR completion input changed while hashing: {path}"
+        )
+    return digest.hexdigest()
+
+
+def _require_sha256(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise PRCompletionBindingError(
+            f"PR completion receipt has invalid {field}: {value!r}"
+        )
+    return value
+
+
+def load_pr_completion_binding(
+    receipt_path: Path,
+    *,
+    pr_store: Path,
+    repo_list: Path,
+) -> dict[str, object]:
+    """Validate and normalize an immutable, already-verified PR receipt."""
+
+    receipt_path = receipt_path.expanduser().resolve()
+    pr_store = pr_store.expanduser().resolve()
+    repo_list = repo_list.expanduser().resolve()
+    for label, path in (
+        ("PR completion receipt", receipt_path),
+        ("PR store", pr_store),
+        ("PR repo list", repo_list),
+    ):
+        if not path.is_file():
+            raise PRCompletionBindingError(f"{label} is missing: {path}")
+    pr_store_wal = Path(f"{pr_store}-wal")
+    if pr_store_wal.exists() and pr_store_wal.stat().st_size:
+        raise PRCompletionBindingError(
+            "PR store has an uncheckpointed WAL and is not the immutable snapshot "
+            f"bound by the receipt: {pr_store_wal}"
+        )
+    receipt_max_bytes = 4 * 1024 * 1024
+    try:
+        with receipt_path.open("rb") as handle:
+            receipt_bytes = handle.read(receipt_max_bytes + 1)
+    except OSError as exc:
+        raise PRCompletionBindingError(
+            f"cannot read PR completion receipt {receipt_path}: {exc}"
+        ) from exc
+    if len(receipt_bytes) > receipt_max_bytes:
+        raise PRCompletionBindingError(
+            "PR completion receipt exceeds the 4 MiB metadata bound: "
+            f"{receipt_path}"
+        )
+    try:
+        receipt = json.loads(receipt_bytes)
+    except json.JSONDecodeError as exc:
+        raise PRCompletionBindingError(
+            f"PR completion receipt is invalid JSON: {receipt_path}: {exc}"
+        ) from exc
+    if not isinstance(receipt, dict):
+        raise PRCompletionBindingError("PR completion receipt must be an object")
+    if receipt.get("schema") != "cppmega_pr_completion_v2":
+        raise PRCompletionBindingError(
+            f"unsupported PR completion schema: {receipt.get('schema')!r}"
+        )
+    if receipt.get("status") != "verified":
+        raise PRCompletionBindingError(
+            f"PR completion status is not verified: {receipt.get('status')!r}"
+        )
+
+    def require_bound_artifact(field: str, expected_path: Path) -> str:
+        artifact = receipt.get(field)
+        if not isinstance(artifact, dict):
+            raise PRCompletionBindingError(
+                f"PR completion receipt lacks {field} binding"
+            )
+        raw_path = artifact.get("path")
+        if not isinstance(raw_path, str):
+            raise PRCompletionBindingError(
+                f"PR completion receipt has invalid {field}.path"
+            )
+        try:
+            bound_path = Path(raw_path).expanduser().resolve()
+        except OSError as exc:
+            raise PRCompletionBindingError(
+                f"cannot resolve PR completion {field}.path: {raw_path}: {exc}"
+            ) from exc
+        if bound_path != expected_path:
+            raise PRCompletionBindingError(
+                f"PR completion {field} path mismatch: "
+                f"receipt={bound_path} requested={expected_path}"
+            )
+        expected_sha256 = _require_sha256(
+            artifact.get("sha256"),
+            field=f"{field}.sha256",
+        )
+        actual_sha256 = _sha256_file(expected_path)
+        if actual_sha256 != expected_sha256:
+            raise PRCompletionBindingError(
+                f"PR completion {field} hash mismatch: "
+                f"receipt={expected_sha256} current={actual_sha256}"
+            )
+        return actual_sha256
+
+    pr_store_sha256 = require_bound_artifact("pr_store", pr_store)
+    if pr_store_wal.exists() and pr_store_wal.stat().st_size:
+        raise PRCompletionBindingError(
+            "PR store WAL appeared while validating the immutable snapshot: "
+            f"{pr_store_wal}"
+        )
+    repo_list_sha256 = require_bound_artifact("repo_list", repo_list)
+    expected_repos_sha256 = _require_sha256(
+        receipt.get("expected_repos_sha256"),
+        field="expected_repos_sha256",
+    )
+    scan_id = _require_sha256(
+        receipt.get("scan_id"),
+        field="scan_id",
+    )
+    expected_repo_count = receipt.get("expected_repo_count")
+    stored_pr_count = receipt.get("stored_pr_count")
+    declared_pr_count = receipt.get("declared_pr_count")
+    unverified_store_pr_count = receipt.get("unverified_store_pr_count")
+    if (
+        isinstance(expected_repo_count, bool)
+        or not isinstance(expected_repo_count, int)
+        or expected_repo_count <= 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion expected_repo_count must be a positive integer"
+        )
+    if (
+        isinstance(stored_pr_count, bool)
+        or not isinstance(stored_pr_count, int)
+        or stored_pr_count < 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion stored_pr_count must be a non-negative integer"
+        )
+    if declared_pr_count != stored_pr_count:
+        raise PRCompletionBindingError(
+            "PR completion declared_pr_count does not match stored_pr_count"
+        )
+    if (
+        isinstance(unverified_store_pr_count, bool)
+        or not isinstance(unverified_store_pr_count, int)
+        or unverified_store_pr_count < 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion unverified_store_pr_count must be a "
+            "non-negative integer"
+        )
+    return {
+        "schema": "cppmega_pr_completion_v2",
+        "status": "verified",
+        "receipt_sha256": _sha256_bytes(receipt_bytes),
+        "pr_store_sha256": pr_store_sha256,
+        "repo_list_sha256": repo_list_sha256,
+        "expected_repos_sha256": expected_repos_sha256,
+        "scan_id": scan_id,
+        "expected_repo_count": expected_repo_count,
+        "stored_pr_count": stored_pr_count,
+        "unverified_store_pr_count": unverified_store_pr_count,
+    }
+
+
+def _pr_completion_identity(binding: dict) -> tuple:
+    required = (
+        "schema",
+        "status",
+        "receipt_sha256",
+        "pr_store_sha256",
+        "repo_list_sha256",
+        "expected_repos_sha256",
+        "scan_id",
+        "expected_repo_count",
+        "stored_pr_count",
+        "unverified_store_pr_count",
+    )
+    missing = [field for field in required if field not in binding]
+    if missing:
+        raise PRCompletionBindingError(
+            "manifest PR completion binding is missing: " + ", ".join(missing)
+        )
+    if binding["schema"] != "cppmega_pr_completion_v2":
+        raise PRCompletionBindingError(
+            f"manifest PR completion schema is unsupported: {binding['schema']!r}"
+        )
+    if binding["status"] != "verified":
+        raise PRCompletionBindingError(
+            f"manifest PR completion status is not verified: {binding['status']!r}"
+        )
+    for field in (
+        "receipt_sha256",
+        "pr_store_sha256",
+        "repo_list_sha256",
+        "expected_repos_sha256",
+        "scan_id",
+    ):
+        _require_sha256(binding[field], field=field)
+    if (
+        isinstance(binding["expected_repo_count"], bool)
+        or not isinstance(binding["expected_repo_count"], int)
+        or binding["expected_repo_count"] <= 0
+    ):
+        raise PRCompletionBindingError(
+            "manifest PR completion expected_repo_count is invalid"
+        )
+    if (
+        isinstance(binding["stored_pr_count"], bool)
+        or not isinstance(binding["stored_pr_count"], int)
+        or binding["stored_pr_count"] < 0
+    ):
+        raise PRCompletionBindingError(
+            "manifest PR completion stored_pr_count is invalid"
+        )
+    if (
+        isinstance(binding["unverified_store_pr_count"], bool)
+        or not isinstance(binding["unverified_store_pr_count"], int)
+        or binding["unverified_store_pr_count"] < 0
+    ):
+        raise PRCompletionBindingError(
+            "manifest PR completion unverified_store_pr_count is invalid"
+        )
+    return tuple(binding[field] for field in required)
+
+
+def revalidate_pr_completion_binding(
+    binding: dict,
+    receipt_path: Path,
+    *,
+    pr_store: Path,
+    repo_list: Path,
+) -> None:
+    """Prove the commit stream's external PR inputs stayed unchanged."""
+
+    current = load_pr_completion_binding(
+        receipt_path,
+        pr_store=pr_store,
+        repo_list=repo_list,
+    )
+    if _pr_completion_identity(current) != _pr_completion_identity(binding):
+        raise PRCompletionBindingError(
+            "PR completion binding changed while the commit stream was running"
+        )
 
 
 def _bounded_git_output(
@@ -2034,6 +2313,7 @@ class ConcurrentManifest(Manifest):
         done: dict | None = None,
         failed: dict | None = None,
         code_revision: dict | None = None,
+        pr_completion: dict | None = None,
     ):
         # Bypass the dataclass __init__ so we can attach lock state.
         self.path = path
@@ -2041,6 +2321,9 @@ class ConcurrentManifest(Manifest):
         self.failed = dict(failed or {})
         self.code_revision = (
             json.loads(json.dumps(code_revision)) if code_revision is not None else None
+        )
+        self.pr_completion = (
+            json.loads(json.dumps(pr_completion)) if pr_completion is not None else None
         )
         self._lock_path = Path(str(path) + ".lock")
         self._thread_lock = threading.Lock()
@@ -2055,6 +2338,7 @@ class ConcurrentManifest(Manifest):
             done=blob.get("done", {}),
             failed=blob.get("failed", {}),
             code_revision=blob.get("code_revision"),
+            pr_completion=blob.get("pr_completion"),
         )
 
     def _read_disk(self) -> dict:
@@ -2064,8 +2348,14 @@ class ConcurrentManifest(Manifest):
                 "done": blob.get("done", {}),
                 "failed": blob.get("failed", {}),
                 "code_revision": blob.get("code_revision"),
+                "pr_completion": blob.get("pr_completion"),
             }
-        return {"done": {}, "failed": {}, "code_revision": None}
+        return {
+            "done": {},
+            "failed": {},
+            "code_revision": None,
+            "pr_completion": None,
+        }
 
     def _atomic_replace(self, done: dict, failed: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -2075,9 +2365,16 @@ class ConcurrentManifest(Manifest):
             "_pending_code_revision",
             self.code_revision,
         )
+        pr_completion = getattr(
+            self,
+            "_pending_pr_completion",
+            self.pr_completion,
+        )
         payload = {"done": done, "failed": failed}
         if code_revision is not None:
             payload["code_revision"] = code_revision
+        if pr_completion is not None:
+            payload["pr_completion"] = pr_completion
         tmp.write_text(
             json.dumps(payload, indent=2, sort_keys=True)
         )
@@ -2095,13 +2392,16 @@ class ConcurrentManifest(Manifest):
                 state = self._read_disk()
                 apply_change(state)
                 self._pending_code_revision = state["code_revision"]
+                self._pending_pr_completion = state["pr_completion"]
                 try:
                     self._atomic_replace(state["done"], state["failed"])
                 finally:
                     del self._pending_code_revision
+                    del self._pending_pr_completion
                 self.done = state["done"]
                 self.failed = state["failed"]
                 self.code_revision = state["code_revision"]
+                self.pr_completion = state["pr_completion"]
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
                 fh.close()
@@ -2180,6 +2480,38 @@ class ConcurrentManifest(Manifest):
                     f"{existing.get('dirty_fingerprint')} requested="
                     f"{receipt.get('git_commit')}:{receipt.get('dirty_fingerprint')}; "
                     "resume requires the same revision or a new conveyor/output root"
+                )
+
+        self._merge_under_lock(apply)
+
+    def bind_pr_completion(self, binding: dict) -> None:
+        """Atomically bind every commit receipt to one verified PR snapshot."""
+        requested_identity = _pr_completion_identity(binding)
+
+        def apply(state: dict) -> None:
+            existing = state["pr_completion"]
+            if existing is None:
+                commit_keys = [
+                    key
+                    for key in (*state["done"], *state["failed"])
+                    if re.search(
+                        r"::(?:r\d+|commits|commit_plan|no_git|repo)$",
+                        key,
+                    )
+                ]
+                if commit_keys:
+                    raise PRCompletionBindingError(
+                        "existing conveyor manifest has commit work receipts but "
+                        "no PR completion binding; use a new conveyor/output root"
+                    )
+                state["pr_completion"] = json.loads(json.dumps(binding))
+                return
+            if _pr_completion_identity(existing) != requested_identity:
+                raise PRCompletionBindingError(
+                    "conveyor manifest PR completion mismatch: "
+                    f"manifest={existing.get('receipt_sha256')} requested="
+                    f"{binding.get('receipt_sha256')}; resume requires the same "
+                    "PR snapshot or a new conveyor/output root"
                 )
 
         self._merge_under_lock(apply)
@@ -3368,6 +3700,7 @@ def run_commits_half(
     commit_records_override: CommitRecordsProvider | None = None,
     revision_guard: CodeRevisionGuard | None = None,
     project_id: str | None = None,
+    pr_scan_id: str | None = None,
 ) -> tuple[int, int, bool]:
     """Extract commit records once (checkpointed), fan ranges to the pool.
 
@@ -3594,13 +3927,19 @@ def run_commits_half(
         active_process_range = (
             process_range if range_runner_override is None else range_runner_override
         )
+        scan_kwargs = (
+            {"pr_scan_id": pr_scan_id}
+            if active_process_range is process_range
+            else {}
+        )
         if defer_range_promotes:
             return active_process_range(
                 *args,
                 defer_promote=True,
                 deferred_stage_dir=deferred_stage_dir,
+                **scan_kwargs,
             )
-        return active_process_range(*args)
+        return active_process_range(*args, **scan_kwargs)
 
     def mark_failed_range(
         failed_start: int,
@@ -3898,6 +4237,7 @@ def process_one_repo(
     dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
     retain_partial_work: bool = False,
     revision_guard: CodeRevisionGuard | None = None,
+    pr_scan_id: str | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -4093,6 +4433,7 @@ def process_one_repo(
                     range_target_bytes=range_target_bytes,
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 result["commits_done"] = done
                 result["commits_failed"] = failed
@@ -4293,14 +4634,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         f"Default {DEFAULT_DEDUP_DB}.")
     p.add_argument("--no-near-dedup", action="store_true",
                    help="Disable MinHash-LSH near dedup (exact-only) for both.")
-    p.add_argument("--pr-store", default=str(DEFAULT_PR_STORE),
-                   help="Tier-2 PR-discussion SQLite store passed to "
-                        "process_commits; on a hit the rendered PR discussion is "
-                        "injected as record['pr_discussion'] (HEAD of the commit "
-                        f"doc). Default {DEFAULT_PR_STORE}.")
-    p.add_argument("--repo-list", default=str(DEFAULT_REPO_LIST),
-                   help="repo_list.json (bare-name -> owner/repo) for resolving "
-                        f"the PR-store key. Default {DEFAULT_REPO_LIST}.")
+    p.add_argument(
+        "--pr-store",
+        default=None,
+        help="Explicit Tier-2 PR-discussion SQLite store passed to "
+             "process_commits. Required for commits/both/all together with "
+             "--pr-completion-receipt; there is no implicit production default.",
+    )
+    p.add_argument(
+        "--repo-list",
+        default=None,
+        help="Explicit repo_list.json for resolving PR-store keys. Required for "
+             "commits/both/all together with --pr-completion-receipt.",
+    )
+    p.add_argument(
+        "--pr-completion-receipt",
+        default=None,
+        help="Verified cppmega_pr_completion_v2 JSON receipt. Required for "
+             "commits/both/all and hash-checked against the explicit --pr-store "
+             "and --repo-list before any stream starts.",
+    )
     p.add_argument("--global-symbol-index", default=None,
                    help="Path to the GLOBAL cross-repo base-lib symbol SQLite store "
                         "(built by scripts/crossrepo/build_global_symbol_index.py). "
@@ -4485,6 +4838,60 @@ def _run_ci_stream(args: argparse.Namespace) -> int:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_runtime_paths_from_args(args)
+    pr_store = (
+        Path(args.pr_store).expanduser().resolve()
+        if args.pr_store
+        else None
+    )
+    repo_list = (
+        Path(args.repo_list).expanduser().resolve()
+        if args.repo_list
+        else None
+    )
+    pr_completion_receipt_path = (
+        Path(args.pr_completion_receipt).expanduser().resolve()
+        if args.pr_completion_receipt
+        else None
+    )
+    pr_completion_binding: dict[str, object] | None = None
+    if args.streams in {"both", "commits", "all"}:
+        missing_pr_options = [
+            option
+            for option, value in (
+                ("--pr-store", args.pr_store),
+                ("--repo-list", args.repo_list),
+                ("--pr-completion-receipt", args.pr_completion_receipt),
+            )
+            if not value
+        ]
+        if missing_pr_options:
+            raise SystemExit(
+                "commits/both/all requires explicit immutable PR inputs: "
+                + ", ".join(missing_pr_options)
+            )
+        assert pr_store is not None
+        assert repo_list is not None
+        assert pr_completion_receipt_path is not None
+        try:
+            pr_completion_binding = load_pr_completion_binding(
+                pr_completion_receipt_path,
+                pr_store=pr_store,
+                repo_list=repo_list,
+            )
+        except PRCompletionBindingError as exc:
+            raise SystemExit(f"PR_COMPLETION_FAILED: {exc}") from exc
+        _log(
+            "PR-store: verified immutable completion receipt "
+            f"{pr_completion_binding['receipt_sha256']} for {pr_store}; "
+            f"repos={pr_completion_binding['expected_repo_count']} "
+            f"prs={pr_completion_binding['stored_pr_count']} "
+            f"(repo_list={repo_list})"
+        )
+    pr_scan_id = (
+        str(pr_completion_binding["scan_id"])
+        if pr_completion_binding is not None
+        else None
+    )
 
     # CI-only stream: run tokenize_ci_enriched.py and exit (no per-repo conveyor).
     if args.streams == "ci":
@@ -4666,15 +5073,10 @@ def main(argv: list[str]) -> int:
              f"tokenized hash)")
 
     # PR-discussion live lookup (fail-loud on bad paths up front).
-    pr_store = Path(args.pr_store) if args.pr_store else None
-    repo_list = Path(args.repo_list) if args.repo_list else None
     if pr_store is not None and not pr_store.exists():
         raise SystemExit(f"--pr-store does not exist: {pr_store}")
     if repo_list is not None and not repo_list.exists():
         raise SystemExit(f"--repo-list does not exist: {repo_list}")
-    if pr_store is not None and args.streams in {"both", "commits"}:
-        _log(f"PR-store: inject record['pr_discussion'] from {pr_store} "
-             f"(repo_list={repo_list})")
 
     # Optional cross-repo base-lib symbol index. FAIL LOUD if given but missing.
     global_symbol_index = (
@@ -4702,11 +5104,13 @@ def main(argv: list[str]) -> int:
             submitted_code_project_identities.setdefault(project_id, repo_name)
     try:
         manifest.bind_code_revision(revision_guard.receipt)
+        if pr_completion_binding is not None:
+            manifest.bind_pr_completion(pr_completion_binding)
         child_guard_path = install_code_revision_child_guard(
             revision_guard,
             CONVEYOR_ROOT,
         )
-    except CodeRevisionError as exc:
+    except (CodeRevisionError, PRCompletionBindingError) as exc:
         raise SystemExit(str(exc)) from exc
     manifest_lock = threading.Lock()
     resume = not args.no_resume
@@ -4735,6 +5139,7 @@ def main(argv: list[str]) -> int:
     progress.emit(
         "run_started",
         code_revision=revision_guard.receipt,
+        pr_completion=pr_completion_binding,
         code_revision_child_guard=str(child_guard_path),
         streams=args.streams,
         workers=workers,
@@ -4866,6 +5271,8 @@ def main(argv: list[str]) -> int:
                 "source_cache_populate_only": True,
                 "source_cache_report": report,
                 "manifest": str(CONVEYOR_MANIFEST),
+                "code_revision": revision_guard.receipt,
+                "pr_completion": pr_completion_binding,
                 "extract_cache": extract_cache_config_receipt(),
                 "interrupted": STOP_EVENT.is_set(),
             }
@@ -4967,6 +5374,7 @@ def main(argv: list[str]) -> int:
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -5075,6 +5483,7 @@ def main(argv: list[str]) -> int:
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -5110,6 +5519,22 @@ def main(argv: list[str]) -> int:
             lock.close()
         if recompress_error is not None:
             raise recompress_error
+
+    pr_completion_reverified_at_finish = False
+    if pr_completion_binding is not None and not interrupted:
+        assert pr_store is not None
+        assert repo_list is not None
+        assert pr_completion_receipt_path is not None
+        try:
+            revalidate_pr_completion_binding(
+                pr_completion_binding,
+                pr_completion_receipt_path,
+                pr_store=pr_store,
+                repo_list=repo_list,
+            )
+        except PRCompletionBindingError as exc:
+            raise SystemExit(f"PR_COMPLETION_DRIFT: {exc}") from exc
+        pr_completion_reverified_at_finish = True
 
     # ----- cumulative per-length report from the manifest (both streams) -----
     def _empty_totals(lengths):
@@ -5153,6 +5578,10 @@ def main(argv: list[str]) -> int:
         "pr_store": str(pr_store) if pr_store else None,
         "manifest": str(CONVEYOR_MANIFEST),
         "code_revision": revision_guard.receipt,
+        "pr_completion": pr_completion_binding,
+        "pr_completion_reverified_at_finish": (
+            pr_completion_reverified_at_finish
+        ),
         "extract_cache": extract_cache_config_receipt(),
         "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,

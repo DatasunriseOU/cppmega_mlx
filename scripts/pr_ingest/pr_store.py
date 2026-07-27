@@ -273,10 +273,23 @@ def upsert_record(conn: sqlite3.Connection, rec: dict, *, commit: bool = True) -
         conn.commit()
 
 
-def _assemble(conn: sqlite3.Connection, repo: str, pr_number: int) -> Optional[dict]:
-    row = conn.execute(
-        "SELECT * FROM prs WHERE repo=? AND pr_number=?", (repo, pr_number)
-    ).fetchone()
+def _assemble(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    scan_id: str | None = None,
+) -> Optional[dict]:
+    if scan_id is None:
+        row = conn.execute(
+            "SELECT * FROM prs WHERE repo=? AND pr_number=?",
+            (repo, pr_number),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM prs WHERE repo=? AND pr_number=? AND scan_id=?",
+            (repo, pr_number, scan_id),
+        ).fetchone()
     if row is None:
         return None
     comments = [
@@ -308,24 +321,64 @@ def _assemble(conn: sqlite3.Connection, repo: str, pr_number: int) -> Optional[d
         "merge_commit_sha": row["merge_commit_sha"],
         "pr_title": row["pr_title"],
         "pr_body": row["pr_body"],
+        "scan_id": row["scan_id"] if "scan_id" in row.keys() else None,
         "comments": comments,
         "reviews": reviews,
         "linked_issues": linked,
     }
 
 
-def get_by_pr(conn: sqlite3.Connection, repo: str, pr_number: int) -> Optional[dict]:
-    return _assemble(conn, repo, int(pr_number))
+def get_by_pr(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    scan_id: str | None = None,
+) -> Optional[dict]:
+    return _assemble(conn, repo, int(pr_number), scan_id=scan_id)
 
 
-def get_by_sha(conn: sqlite3.Connection, repo: str, sha: str) -> Optional[dict]:
-    row = conn.execute(
-        "SELECT pr_number FROM pr_by_sha WHERE repo=? AND merge_commit_sha=?",
-        (repo, sha),
-    ).fetchone()
+def get_by_sha(
+    conn: sqlite3.Connection,
+    repo: str,
+    sha: str,
+    *,
+    scan_id: str | None = None,
+) -> Optional[dict]:
+    if scan_id is None:
+        row = conn.execute(
+            """
+            SELECT p.pr_number
+            FROM pr_by_sha AS s
+            JOIN prs AS p
+              ON p.repo=s.repo
+             AND p.pr_number=s.pr_number
+             AND p.merge_commit_sha=s.merge_commit_sha
+            WHERE s.repo=? AND s.merge_commit_sha=?
+            """,
+            (repo, sha),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT p.pr_number
+            FROM pr_by_sha AS s
+            JOIN prs AS p
+              ON p.repo=s.repo
+             AND p.pr_number=s.pr_number
+             AND p.merge_commit_sha=s.merge_commit_sha
+            WHERE s.repo=? AND s.merge_commit_sha=? AND p.scan_id=?
+            """,
+            (repo, sha, scan_id),
+        ).fetchone()
     if row is None:
         return None
-    return _assemble(conn, repo, int(row["pr_number"]))
+    return _assemble(
+        conn,
+        repo,
+        int(row["pr_number"]),
+        scan_id=scan_id,
+    )
 
 
 def _iter_ndjson(paths: list[str]):

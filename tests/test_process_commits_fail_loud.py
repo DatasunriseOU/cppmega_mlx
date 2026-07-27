@@ -265,3 +265,90 @@ def test_sha_pr_lookup_restores_number_title_and_uses_readonly_store(
             lookup._conn.execute("CREATE TABLE forbidden(value INTEGER)")
     finally:
         lookup.close()
+
+
+def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
+    store = tmp_path / "prs.sqlite"
+    conn = process_commits._pr_store_mod.connect(str(store), create=True)
+    try:
+        process_commits._pr_store_mod.upsert_record(
+            conn,
+            {
+                "repo": "owner/repo",
+                "pr_number": 1,
+                "merge_commit_sha": "old-sha",
+                "pr_title": "Old membership",
+                "pr_body": "Must not be attached.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+        )
+        process_commits._pr_store_mod.upsert_record(
+            conn,
+            {
+                "repo": "owner/repo",
+                "pr_number": 1,
+                "merge_commit_sha": "current-sha",
+                "pr_title": "Current membership",
+                "pr_body": "Verified discussion.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+        )
+        process_commits._pr_store_mod.upsert_record(
+            conn,
+            {
+                "repo": "owner/repo",
+                "pr_number": 2,
+                "merge_commit_sha": "stale-sha",
+                "pr_title": "Stale row",
+                "pr_body": "Must not be attached.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+        )
+        conn.execute("ALTER TABLE prs ADD COLUMN scan_id TEXT")
+        conn.execute(
+            "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
+            ("a" * 64, "owner/repo", 1),
+        )
+        conn.execute(
+            "UPDATE prs SET scan_id=? WHERE repo=? AND pr_number=?",
+            ("b" * 64, "owner/repo", 2),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    lookup = process_commits.PRDiscussionLookup(
+        str(store),
+        None,
+        scan_id="a" * 64,
+    )
+    try:
+        current = {"repo": "owner/repo", "commit_hash": "current-sha"}
+        assert lookup.attach(current) is True
+        assert current["pr_number"] == 1
+        assert "Verified discussion." in current["pr_discussion"]
+
+        assert lookup.attach(
+            {"repo": "owner/repo", "commit_hash": "old-sha"}
+        ) is False
+        assert lookup.attach(
+            {"repo": "owner/repo", "commit_hash": "stale-sha"}
+        ) is False
+        assert lookup.attach(
+            {"repo": "owner/repo", "pr_number": 2}
+        ) is False
+    finally:
+        lookup.close()
+
+    with pytest.raises(ValueError, match="invalid PR scan_id"):
+        process_commits.PRDiscussionLookup(
+            str(store),
+            None,
+            scan_id="not-a-scan",
+        )
