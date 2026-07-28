@@ -23,6 +23,250 @@ def _std_flags(args: list[str]) -> list[str]:
     return [arg for arg in args if arg.startswith("-std=")]
 
 
+def test_autoconf_compile_context_keeps_operands_and_truthful_standard() -> None:
+    from cppmega_mlx.data.nanochat_pipeline.build_context import (
+        detect_build_context_from_loader,
+    )
+
+    configure = (
+        "AC_PROG_CC\n"
+        "CFLAGS='-std=iso9899:201x -I include -D FEATURE=1 -U OLD "
+        "-include config.h -imacrosdefs.h --target x86_64-linux-gnu'\n"
+    )
+
+    platform, args, compile_index = detect_build_context_from_loader(
+        lambda name: configure if name == "configure.ac" else None
+    )
+
+    assert compile_index is None
+    assert platform["compiler"] == "gcc"
+    assert platform["standard"] == "c11"
+    assert args[:2] == ["-x", "c"]
+    assert "-std=iso9899:201x" in args
+    for option, operand in (
+        ("-I", "include"),
+        ("-D", "FEATURE=1"),
+        ("-U", "OLD"),
+        ("-include", "config.h"),
+        ("--target", "x86_64-linux-gnu"),
+    ):
+        option_index = args.index(option)
+        assert args[option_index + 1] == operand
+    assert "-imacrosdefs.h" in args
+    assert args[-2:] == ["-fsyntax-only", "-Wno-everything"]
+
+
+def test_detected_build_without_standard_does_not_claim_cpp17() -> None:
+    from cppmega_mlx.data.nanochat_pipeline.build_context import (
+        detect_build_context_from_loader,
+    )
+
+    platform, args, compile_index = detect_build_context_from_loader(
+        lambda name: "AC_PROG_CC\n" if name == "configure.ac" else None
+    )
+
+    assert compile_index is None
+    assert platform["build_system"] == "autoconf"
+    assert platform["compiler"] == "gcc"
+    assert "standard" not in platform
+    assert args[:2] == ["-x", "c"]
+    assert not _std_flags(args)
+
+
+@pytest.mark.parametrize(
+    "compile_args",
+    (
+        [
+            "-x",
+            "c",
+            "-std=iso9899:199x",
+            "-D",
+            "FEATURE=1",
+            "-U",
+            "OLD",
+            "-include",
+            "config.h",
+        ],
+        ["-xc++", "--std=c++20", "-m64"],
+        ["-x", "cl", "-cl-std=CL3.0"],
+    ),
+)
+def test_strict_compile_arg_validation_accepts_coherent_contexts(
+    compile_args: list[str],
+) -> None:
+    assert ip._is_sane_compile_args(compile_args)
+
+
+@pytest.mark.parametrize(
+    "compile_args",
+    (
+        [],
+        ["-march=@<:@^"],
+        ["-DVERSION=@VERSION@"],
+        ["-D"],
+        ["-x", "not-a-clang-language"],
+        ["-m32", "-m64"],
+        ["-x", "c++", "-std=c++17", "-std=c++20"],
+        ["-x", "c++", "-std=c11"],
+        ["-cl-std=CL3.0"],
+    ),
+)
+def test_strict_compile_arg_validation_rejects_unusable_aggregates(
+    compile_args: list[str],
+) -> None:
+    assert not ip._is_sane_compile_args(compile_args)
+
+
+def test_unusable_default_context_falls_back_atomically(tmp_path: Path) -> None:
+    args, build_info = ip._resolve_default_compile_context(
+        str(tmp_path),
+        {
+            "build_system": "autoconf",
+            "source": "build_files",
+            "compiler": "g++",
+            "standard": "c++20",
+        },
+        ["-x", "c++", "-std=c++17", "-std=c++20"],
+    )
+
+    assert args[:2] == ["-fsyntax-only", "-Wno-everything"]
+    assert build_info == {
+        "build_system": "autoconf",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
+    }
+
+
+def test_per_file_context_matches_adapted_args_and_preserves_legacy_cpp_c(
+    tmp_path: Path,
+) -> None:
+    plain_c = tmp_path / "plain.c"
+    plain_c.write_text("int plain(void) { return 1; }\n", encoding="utf-8")
+    legacy_cpp_c = tmp_path / "compiler-regression.c"
+    legacy_cpp_c.write_text(
+        "char *legacy(void) { return(::new char[2] ('a', 'b')); }\n",
+        encoding="utf-8",
+    )
+    default_build_info = {
+        "build_system": "cmake",
+        "source": "build_files",
+        "compiler": "clang++",
+        "standard": "c++20",
+    }
+
+    plain_args, plain_build_info = ip._compile_context_for_rel_file(
+        plain_c.name,
+        project_dir=str(tmp_path),
+        compile_db=None,
+        default_args=["-std=c++20"],
+        default_build_info=default_build_info,
+    )
+    legacy_args, legacy_build_info = ip._compile_context_for_rel_file(
+        legacy_cpp_c.name,
+        project_dir=str(tmp_path),
+        compile_db=None,
+        default_args=["-std=c++20"],
+        default_build_info=default_build_info,
+    )
+
+    assert plain_args[:3] == ["-x", "c", "-std=c11"]
+    assert plain_build_info["standard"] == "c11"
+    assert legacy_args[:2] == ["-x", "c++"]
+    assert "-std=c++20" in legacy_args
+    assert legacy_build_info["standard"] == "c++20"
+
+    compile_db_args, compile_db_build_info = ip._compile_context_for_rel_file(
+        plain_c.name,
+        project_dir=str(tmp_path),
+        compile_db={
+            str(plain_c): {
+                "compile_args": ["-x", "c", "-std=iso9899:199x"],
+                "build_info": {
+                    "build_system": "compile_commands",
+                    "source": "compile_commands",
+                    "compiler": "clang",
+                    "standard": "c++20",
+                },
+            }
+        },
+        default_args=["-std=c++20"],
+        default_build_info=default_build_info,
+    )
+    assert compile_db_args[:2] == ["-x", "c"]
+    assert "-std=iso9899:199x" in compile_db_args
+    assert compile_db_build_info["standard"] == "c99"
+
+
+def test_emitted_function_sidecar_matches_per_file_adapted_args(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "plain.c"
+    function_text = (
+        "int plain(int first, int second, int third) { "
+        "int pair = first + second; int bounded = third < 0 ? 0 : third; "
+        "return pair + bounded; }"
+    )
+    source.write_text(f"{function_text}\n", encoding="utf-8")
+    index = ip.ProjectIndex()
+    index.add_function(
+        ip.FunctionDef(
+            name="plain",
+            qualified_name="plain",
+            file=source.name,
+            line=1,
+            text=function_text,
+            callees=[],
+        )
+    )
+
+    documents = ip.build_training_documents(
+        index,
+        enriched=True,
+        project_dir=str(tmp_path),
+        project_id="tests/source-sidecar-port",
+        default_args=["-std=c++20"],
+        default_build_info={
+            "build_system": "cmake",
+            "source": "build_files",
+            "compiler": "clang++",
+            "standard": "c++20",
+        },
+    )
+
+    assert len(documents) == 1
+    assert documents[0]["build_info"]["standard"] == "c11"
+    assert documents[0]["language_info"]["primary_language"] == "c"
+    assert documents[0]["language_info"]["primary_standard"] == "c11"
+
+
+def test_recovery_include_discovery_includes_vex_public_headers(
+    tmp_path: Path,
+) -> None:
+    vex_public = tmp_path / "VEX" / "pub"
+    vex_public.mkdir(parents=True)
+    (vex_public / "libvex_basictypes.h").write_text(
+        "typedef unsigned long UWord;\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "drd" / "client.h"
+    source.parent.mkdir()
+    source.write_text(
+        '#include "libvex_basictypes.h"\n',
+        encoding="utf-8",
+    )
+
+    assert str(vex_public) in ip._discover_recovery_include_dirs(str(tmp_path))
+    recovered_args, added_dirs, unresolved = ip._include_recovery_args(
+        ["-x", "c-header"],
+        filepath=str(source),
+        project_dir=str(tmp_path),
+        include_names=["libvex_basictypes.h"],
+    )
+    assert added_dirs == ["VEX/pub"]
+    assert recovered_args[-1] == f"-I{vex_public}"
+    assert unresolved == []
+
+
 def test_unknown_libclang_cursor_kind_is_opaque_not_fatal() -> None:
     class UnknownCursor:
         _kind_id = 437
