@@ -290,7 +290,10 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             _require_sha256(getattr(self, field_name), where=f"metadata.{field_name}")
         if self.ci_exact_unique_payload_tokens < _CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS:
             raise ValueError(
-                "production metadata lacks the minimum exact unique CI payload"
+                "metadata.ci_exact_unique_payload_tokens is below the production "
+                "minimum: "
+                f"observed={self.ci_exact_unique_payload_tokens}, "
+                f"required={_CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS}"
             )
 
     def provenance_receipt(self) -> dict[str, object]:
