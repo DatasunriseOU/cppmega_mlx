@@ -61,6 +61,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -130,6 +131,11 @@ DEFAULT_DEDUP_PROMOTE_BATCH_SIZE = 8
 DEFAULT_MIN_FREE_DISK_GB = 50.0
 
 CODE_REVISION_SCHEMA_VERSION = 2
+CODE_REVISION_PRODUCER_ROLE = "canonical_source_conveyor"
+# GitHub repository/component slug. The separate CI tokenizer receipt keeps its
+# historical "cppmega.mlx" producer identity; cross-repository resumes compare
+# this slug exactly and therefore fail closed instead of treating them as aliases.
+CODE_REVISION_REPOSITORY_IDENTITY = "cppmega_mlx"
 CODE_REVISION_DRIFT_MARKER = "CPPMEGA_CODE_REVISION_DRIFT"
 CODE_REVISION_DRIFT_EXIT_CODE = 86
 CODE_REVISION_MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -176,6 +182,16 @@ import clang.cindex as cindex
 cindex.Index.create()
 print(cindex.__file__)
 """
+
+
+def _handle_source_stream_read_error(
+    error: tarfile.ReadError,
+    *,
+    interrupted: bool,
+) -> None:
+    if not interrupted:
+        raise error
+    _log(f"Source stream closed after checkpoint signal: {error}")
 
 
 class CodeRevisionError(RuntimeError):
@@ -743,6 +759,8 @@ def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
     )
     return {
         "schema_version": CODE_REVISION_SCHEMA_VERSION,
+        "producer_role": CODE_REVISION_PRODUCER_ROLE,
+        "repository_identity": CODE_REVISION_REPOSITORY_IDENTITY,
         "git_commit": head_before,
         "dirty": bool(status),
         "dirty_fingerprint": dirty_fingerprint,
@@ -766,6 +784,8 @@ def capture_code_revision(repo_root: Path = MLX_ROOT) -> dict:
 def _code_revision_identity(receipt: dict) -> tuple:
     required = (
         "schema_version",
+        "producer_role",
+        "repository_identity",
         "git_commit",
         "dirty",
         "dirty_fingerprint",
@@ -5531,6 +5551,8 @@ def main(argv: list[str]) -> int:
 
             while inflight:
                 drain_one_or_more(block=True)
+    except tarfile.ReadError as exc:
+        _handle_source_stream_read_error(exc, interrupted=STOP_EVENT.is_set())
     finally:
         recompress_error: Exception | None = None
         if repo_pool is not None:
