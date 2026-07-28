@@ -467,6 +467,79 @@ def test_repo_file_location_identity_is_checkout_independent_and_normalized(
     assert windows_casefolded == windows_key
 
 
+def test_repo_file_location_create_and_parse_preserve_interior_spaces() -> None:
+    repository_path = (
+        "third_party/libsdl2/Xcode-iOS/Template/"
+        "SDL iOS Application/main.c"
+    )
+
+    key = ip.canonical_symbol_identity(
+        qname="randomInt",
+        kind="FUNCTION_DECL",
+        project="google/filament",
+        file=repository_path,
+        line=7,
+        column=4,
+        repo_file_location_fallback=True,
+    )
+    parsed = ip.parse_repo_file_location_identity(key)
+
+    assert parsed.file == repository_path
+    assert f"file={repository_path}" in key
+
+
+@pytest.mark.parametrize(
+    "repository_path",
+    (
+        " src/main.c",
+        "src/main.c ",
+    ),
+)
+def test_repo_file_location_creation_rejects_padded_paths(
+    repository_path: str,
+) -> None:
+    with pytest.raises(
+        ip.SymbolIdentityError,
+        match="canonical.*repo",
+    ):
+        ip.canonical_symbol_identity(
+            qname="route",
+            kind="FUNCTION_DECL",
+            project="owner/repo",
+            file=repository_path,
+            line=7,
+            column=4,
+            repo_file_location_fallback=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "repository_path",
+    (
+        " src/main.c",
+        "src/main.c ",
+    ),
+)
+def test_repo_file_location_parser_rejects_padded_paths(
+    repository_path: str,
+) -> None:
+    raw_key = (
+        "repo_file_location:schema=v3"
+        "\x1fproject=owner/repo"
+        f"\x1ffile={repository_path}"
+        "\x1fline=7"
+        "\x1fcolumn=4"
+        "\x1fkind=FUNCTION_DECL"
+        "\x1fqname=route"
+    )
+
+    with pytest.raises(
+        ip.SymbolIdentityError,
+        match="canonical.*repo",
+    ):
+        ip.parse_repo_file_location_identity(raw_key)
+
+
 def test_usr_extraction_error_fails_loud(tmp_path: Path) -> None:
     cursor = _fallback_cursor(tmp_path / "repo" / "route.hpp", with_signature=False)
 

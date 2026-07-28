@@ -226,7 +226,8 @@ def parse_repo_file_location_identity(
     file = fields["file"]
     normalized_file = posixpath.normpath(file)
     if (
-        file != normalized_file
+        file != file.strip()
+        or file != normalized_file
         or file.startswith("/")
         or _WINDOWS_LOCAL_PATH_RE.match(file)
         or "\\" in file

@@ -147,11 +147,13 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
     b = _load_builder()
     db = str(tmp_path / "location.sqlite")
     store = b.GlobalSymbolStore(db)
+    repository_path = "third_party/SDL iOS Application/boost/route.hpp"
+    include_provenance = "boost/route.hpp"
     symbol_key = b.ip.canonical_symbol_identity(
         qname="boost::route",
         kind="FUNCTION_DECL",
         project="boostorg/boost",
-        file="boost/route.hpp",
+        file=repository_path,
         line=7,
         column=4,
         repo_file_location_fallback=True,
@@ -164,7 +166,7 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
                 base_repo="boostorg/boost",
                 kind=2,
                 sym_type="func",
-                file="boost/route.hpp",
+                file=repository_path,
                 line=7,
                 end_line=9,
                 is_public=1,
@@ -174,7 +176,7 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
                 symbol_key=symbol_key,
                 symbol_kind="FUNCTION_DECL",
                 provider="boost",
-                include_provenance="boost/route.hpp",
+                include_provenance=include_provenance,
             )
         ]
     )
@@ -186,6 +188,59 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
     assert record is not None
     assert record["symbol_key"] == symbol_key
     reader.close()
+
+
+@pytest.mark.parametrize(
+    "repository_path",
+    (
+        " boost/route.hpp",
+        "boost/route.hpp ",
+    ),
+)
+def test_store_rejects_padded_repo_file_location_identity(
+    tmp_path: Path,
+    repository_path: str,
+) -> None:
+    b = _load_builder()
+    store = b.GlobalSymbolStore(str(tmp_path / "padded-location.sqlite"))
+    symbol_key = (
+        "repo_file_location:schema=v3"
+        "\x1fproject=boostorg/boost"
+        f"\x1ffile={repository_path}"
+        "\x1fline=7"
+        "\x1fcolumn=4"
+        "\x1fkind=FUNCTION_DECL"
+        "\x1fqname=boost::route"
+    )
+    try:
+        with pytest.raises(
+            b.ip.SymbolIdentityError,
+            match="canonical.*repo",
+        ):
+            store.insert_symbols(
+                [
+                    b.GlobalSymbolRecord(
+                        qname="boost::route",
+                        base_lib="boost",
+                        base_repo="boostorg/boost",
+                        kind=2,
+                        sym_type="func",
+                        file=repository_path,
+                        line=7,
+                        end_line=9,
+                        is_public=1,
+                        token_est=8,
+                        body_len=32,
+                        text="void route() { /* padded location fallback */ }",
+                        symbol_key=symbol_key,
+                        symbol_kind="FUNCTION_DECL",
+                        provider="boost",
+                        include_provenance="boost/route.hpp",
+                    )
+                ]
+            )
+    finally:
+        store.close()
 
 
 def test_store_reader_normalizes_std_inline_namespace(tmp_path):
@@ -594,6 +649,8 @@ def test_crosslink_budget_bounds():
 def _tiny_index(ip):
     idx = ip.ProjectIndex()
     signature = "display=trim(R &)|type=void (R &)"
+    provider = "boost"
+    include_provenance = "boost/algorithm/string/trim.hpp"
     external_key = ip.canonical_symbol_identity(
         qname="boost::algorithm::trim",
         kind="FUNCTION_TEMPLATE",
@@ -612,11 +669,14 @@ def _tiny_index(ip):
             "usr": "",
             "canonical_signature": signature,
             "symbol_kind": "FUNCTION_TEMPLATE",
-            "project": "",
-            "file": "/opt/boost/include/boost/algorithm/string/trim.hpp",
+            "project": ip.external_provider_project(provider),
+            "file": ip.canonical_external_provider_file(
+                provider,
+                include_provenance,
+            ),
             "line": 5,
-            "provider": "boost",
-            "include_provenance": "boost/algorithm/string/trim.hpp",
+            "provider": provider,
+            "include_provenance": include_provenance,
         }],
         is_definition=True,
     )
