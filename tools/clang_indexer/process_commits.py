@@ -110,11 +110,12 @@ class PartialParseError(RuntimeError):
 class PRDiscussionLookup:
     """Live (repo, pr_number|merge_commit_sha) -> pr_discussion lookup glue.
 
-    Opens the Tier-2 PR store (read-only) once, plus the bare-name -> owner/repo
-    map from outputs/pr_ingest/repo_list.json. For each commit record it queries
-    the store FIRST by (owner_repo, pr_number) then by (owner_repo, commit_hash),
-    renders the assembled PR record via render_discussion, and writes the result
-    into ``record['pr_discussion']`` IN PLACE.
+    Opens the Tier-2 PR store (read-only) once. Verified scans use one explicit
+    fixed owner/repo key; unverified direct/dev callers may still provide the
+    legacy bare-name map. For each commit record it queries the store FIRST by
+    (owner_repo, pr_number) then by (owner_repo, commit_hash), renders the
+    assembled PR record via render_discussion, and writes the result into
+    ``record['pr_discussion']`` IN PLACE.
 
     RULE #1 (fail-loud): a missing store / repo_list / malformed JSON RAISES at
     construction time. A per-record MISS is the NORMAL Tier-1 (git-only) path and
@@ -127,43 +128,73 @@ class PRDiscussionLookup:
         repo_list_path: str | None,
         *,
         scan_id: str | None = None,
+        owner_repo: str | None = None,
     ) -> None:
         if not os.path.exists(store_path):
             raise FileNotFoundError(f"--pr-store does not exist: {store_path}")
         if scan_id is not None and re.fullmatch(r"[0-9a-f]{64}", scan_id) is None:
             raise ValueError(f"invalid PR scan_id: {scan_id!r}")
-        self.scan_id = scan_id
-        # Read-only connection; create=False RAISES on a missing store (fail-loud).
-        self._conn = _pr_store_mod.connect(
-            store_path,
-            create=False,
-            readonly=True,
+        self._fixed_owner_repo = (
+            require_project_identity(
+                owner_repo,
+                source="process_commits --pr-repo",
+            )
+            if owner_repo is not None
+            else None
         )
+        if scan_id is not None and self._fixed_owner_repo is None:
+            raise ValueError("PR scan_id requires an explicit PR owner/repo key")
+        self.scan_id = scan_id
         self._name_to_owner_repo: dict[str, str] = {}
         if repo_list_path:
             if not os.path.exists(repo_list_path):
                 raise FileNotFoundError(
                     f"--repo-list does not exist: {repo_list_path}")
-            with open(repo_list_path, "r") as fh:
+            with open(repo_list_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            for entry in data.get("repos", []):
-                name = entry.get("name")
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} must contain a JSON object"
+                )
+            entries = data.get("repos", [])
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} field 'repos' must be a list"
+                )
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"--repo-list {repo_list_path} field 'repos[{index}]' "
+                        "must be an object"
+                    )
+                name = entry.get("bare_name") or entry.get("name")
                 owner_repo = entry.get("owner_repo")
                 if name and owner_repo:
                     self._name_to_owner_repo[name] = owner_repo
+        # Validate every control input before acquiring the read-only handle.
+        # create=False still raises on a store that disappeared after the
+        # initial existence check.
+        self._conn = _pr_store_mod.connect(
+            store_path,
+            create=False,
+            readonly=True,
+        )
         self.hits = 0
         self.misses = 0
 
     def _store_key(self, record: dict) -> str | None:
         """Resolve the (store-keyed) owner/repo for a record.
 
-        The store is keyed by canonical owner/repo. extract_git_history already
-        rewrites record['repo'] to owner/repo when the clone's git remote
-        resolves, so a record['repo'] that already contains '/' IS the key.
-        Otherwise map the bare directory name via repo_list.json.
+        Verified production scans always use the fixed ``--pr-repo`` key. The
+        record-derived/list-derived path remains only for unverified direct/dev
+        invocations.
         """
+        if self._fixed_owner_repo is not None:
+            return self._fixed_owner_repo
         repo = (record.get("repo") or "").strip()
         if not repo:
+            return None
+        if repo.startswith("corpus.local/"):
             return None
         if "/" in repo:
             return repo
@@ -2933,6 +2964,12 @@ def main() -> int:
              'treated as normal misses.',
     )
     parser.add_argument(
+        '--pr-repo', default=None,
+        help='Explicit fixed owner/repo key for every PR-store lookup in this '
+             'process. Required with --pr-scan-id; record repo values cannot '
+             'override it.',
+    )
+    parser.add_argument(
         '--repo-list', default=None,
         help='Path to outputs/pr_ingest/repo_list.json (bare-name -> owner/repo '
              'map) used to resolve the PR-store key for records whose repo is a '
@@ -2944,8 +2981,23 @@ def main() -> int:
         if re.fullmatch(r"[0-9a-f]{64}", args.pr_scan_id) is None:
             print(f"ERROR: invalid --pr-scan-id: {args.pr_scan_id!r}", file=sys.stderr)
             return 1
+        if not args.pr_store or not args.pr_repo:
+            print(
+                "ERROR: --pr-scan-id requires --pr-store and --pr-repo",
+                file=sys.stderr,
+            )
+            return 1
+    if args.pr_repo is not None:
         if not args.pr_store:
-            print("ERROR: --pr-scan-id requires --pr-store", file=sys.stderr)
+            print("ERROR: --pr-repo requires --pr-store", file=sys.stderr)
+            return 1
+        try:
+            args.pr_repo = require_project_identity(
+                args.pr_repo,
+                source="process_commits --pr-repo",
+            )
+        except SymbolIdentityError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
             return 1
     missing_inputs = [path for path in args.inputs if not os.path.exists(path)]
     if missing_inputs:
@@ -3044,9 +3096,11 @@ def main() -> int:
             args.pr_store,
             args.repo_list,
             scan_id=args.pr_scan_id,
+            owner_repo=args.pr_repo,
         )
         print(f"  pr_store: live lookup at {args.pr_store} "
-              f"(repo_list={args.repo_list}, scan_id={args.pr_scan_id})",
+              f"(pr_repo={args.pr_repo}, repo_list={args.repo_list}, "
+              f"scan_id={args.pr_scan_id})",
               file=sys.stderr)
 
     clang_index = Index.create()

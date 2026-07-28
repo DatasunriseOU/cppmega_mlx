@@ -121,10 +121,11 @@ def test_run_commits_half_fails_for_no_commit_records(tmp_path: Path) -> None:
                 resume=True,
                 cumulative={"valid": 0},
                 dedup_db=None,
-                dedup_near=True,
-                pr_store=None,
-                repo_list=None,
-                commit_records_override=no_records,
+                    dedup_near=True,
+                    pr_store=None,
+                    project_id="tests/repo",
+                    pr_owner_repo=None,
+                    commit_records_override=no_records,
             )
 
     assert "repo::commits" not in streaming_conveyor.ConcurrentManifest.load(

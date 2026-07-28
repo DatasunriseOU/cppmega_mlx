@@ -343,7 +343,8 @@ def test_process_one_repo_never_deletes_external_cache(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            project_id="tests/repo",
+            pr_owner_repo=None,
             streams="commits",
         )
 
@@ -493,7 +494,8 @@ def test_external_cache_flag_and_per_repo_receipts(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            project_id="tests/repo",
+            pr_owner_repo=None,
             progress=progress,
             range_target_bytes=0,
             range_runner_override=range_runner,

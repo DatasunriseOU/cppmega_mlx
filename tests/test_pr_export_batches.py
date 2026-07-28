@@ -72,9 +72,31 @@ def _verified_pr_inputs(
         conn.close()
 
     repos = sorted({str(record["repo"]) for record in records})
+    repo_rows = [
+        {
+            "bare_name": f"repo-{index}",
+            "project_identity": repo,
+            "owner_repo": repo,
+        }
+        for index, repo in enumerate(repos)
+    ]
     repo_list = tmp_path / "repo_list.json"
     repo_list.write_text(
-        json.dumps({"repos": [{"owner_repo": repo} for repo in repos]}) + "\n",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "repos": repo_rows,
+                "by_bare_name": {
+                    row["bare_name"]: row["project_identity"]
+                    for row in repo_rows
+                },
+                "project_identities": sorted(repos),
+                "repo_names": sorted(repos),
+                "unresolved": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     repo_counts = {

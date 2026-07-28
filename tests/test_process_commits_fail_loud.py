@@ -267,6 +267,34 @@ def test_sha_pr_lookup_restores_number_title_and_uses_readonly_store(
         lookup.close()
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "must contain a JSON object"),
+        ({"repos": "owner/repo"}, "field 'repos' must be a list"),
+        (
+            {"repos": ["owner/repo"]},
+            r"field 'repos\[0\]' must be an object",
+        ),
+    ],
+)
+def test_pr_lookup_rejects_malformed_repo_list_shape_with_path(
+    tmp_path: Path,
+    payload: object,
+    message: str,
+) -> None:
+    store = tmp_path / "prs.sqlite"
+    connection = process_commits._pr_store_mod.connect(str(store), create=True)
+    connection.close()
+    repo_list = tmp_path / "malformed-repos.json"
+    repo_list.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message) as exc_info:
+        process_commits.PRDiscussionLookup(str(store), str(repo_list))
+
+    assert str(repo_list) in str(exc_info.value)
+
+
 def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
     store = tmp_path / "prs.sqlite"
     conn = process_commits._pr_store_mod.connect(str(store), create=True)
@@ -320,6 +348,7 @@ def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
         str(store),
         None,
         scan_id="a" * 64,
+        owner_repo="owner/repo",
     )
     try:
         current = {"repo": "owner/repo", "commit_hash": "current-sha"}
