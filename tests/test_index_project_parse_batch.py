@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 import sys
 from pathlib import Path
+from threading import Timer
 
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
@@ -93,3 +94,34 @@ def test_parse_batch_results_reject_invalid_submit_window():
                 max_in_flight=0,
             )
         )
+
+
+def test_parse_batch_results_emit_heartbeat_while_batch_is_running(capsys):
+    import index_project
+
+    class DelayedExecutor:
+        def __init__(self):
+            self.future = Future()
+            self.timer = Timer(
+                0.05,
+                self.future.set_result,
+                args=[("batch-result", 1)],
+            )
+
+        def submit(self, _fn, _batch):
+            self.timer.start()
+            return self.future
+
+    executor = DelayedExecutor()
+    results = list(
+        index_project._iter_parse_batch_results(
+            executor,
+            ["slow-batch"],
+            max_in_flight=1,
+            heartbeat_interval_s=0.01,
+        )
+    )
+    executor.timer.join()
+
+    assert results == [("batch-result", 1)]
+    assert "Parse pool heartbeat:" in capsys.readouterr().err
