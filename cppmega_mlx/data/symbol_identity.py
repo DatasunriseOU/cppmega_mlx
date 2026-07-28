@@ -392,10 +392,8 @@ def canonical_external_usr_identity(
         or not usr
         or usr != usr.strip()
         or "\x1f" in usr
-        or any(
-            char.isspace() or ord(char) < 32 or ord(char) == 127
-            for char in usr
-        )
+        # Conversion-operator USRs legitimately contain semantic spaces.
+        or any(ord(char) < 32 or ord(char) == 127 for char in usr)
     ):
         raise SymbolIdentityError(f"{source}: clang USR is missing or unsafe")
     signature = " ".join(str(canonical_signature or "").split())
