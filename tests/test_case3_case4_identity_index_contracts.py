@@ -231,6 +231,42 @@ def test_external_provider_reference_keeps_provider_identity(tmp_path: Path) -> 
     assert identity.identity_include_provenance == "vector"
 
 
+def test_vendored_provider_named_directory_keeps_repository_identity(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    vendored_header = (
+        project
+        / "VTK"
+        / "Infovis"
+        / "Boost"
+        / "vtkVariantBoostSerialization.h"
+    )
+    vendored_header.parent.mkdir(parents=True)
+    vendored_header.write_text("#pragma once\n", encoding="utf-8")
+    cursor = _cursor(
+        vendored_header,
+        usr="c:@F@vtkVariantBoostSerialization",
+    )
+
+    reference = indexer.symbol_reference_for_cursor(
+        cursor,
+        project_dir=str(project),
+        project_id="Kitware/ParaView",
+    )
+
+    assert reference["project"] == "Kitware/ParaView"
+    assert reference["file"] == "VTK/Infovis/Boost/vtkVariantBoostSerialization.h"
+    assert reference["provider"] == ""
+    assert reference["include_provenance"] == ""
+    normalized = indexer._normalize_symbol_reference(reference)
+    assert normalized is not None
+    assert normalized["project"] == "Kitware/ParaView"
+    assert normalized["file"] == "VTK/Infovis/Boost/vtkVariantBoostSerialization.h"
+    assert normalized["provider"] == ""
+    assert normalized["include_provenance"] == ""
+
+
 def test_external_reference_receipt_is_typed_and_fail_closed(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     project.mkdir()
