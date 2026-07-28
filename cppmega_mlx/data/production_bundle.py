@@ -37,11 +37,31 @@ if TYPE_CHECKING:
     from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
 
 
-_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v1"
+_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v2"
 _BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 _PREFIX_TOKENIZER_CONTRACT = "megacpp"
 _EXPECTED_VOCAB_SIZE = 65536
 _TRAINING_CONTRACT = "objective_materialized"
+_IMPLEMENTATION_BINDING_SCHEMA = "cppmega_implementation_binding_v1"
+_PRODUCER_IMPLEMENTATION_COMPONENTS = (
+    "cppmega",
+    "cppmega_mlx",
+    "clang_indexer",
+)
+_TRAINING_IMPLEMENTATION_COMPONENTS = (
+    "cppmega",
+    "megatron",
+    "cppmega_mlx",
+    "clang_indexer",
+)
+_IMPLEMENTATION_COMPONENT_FIELDS = {
+    "cppmega": frozenset({"commit", "tree_sha256"}),
+    "cppmega_mlx": frozenset({"commit", "tree_sha256"}),
+    "clang_indexer": frozenset(
+        {"source_sha256", "dependency_closure_sha256"}
+    ),
+    "megatron": frozenset({"commit"}),
+}
 _OBJECTIVE_BUCKETS_SCHEMA = "cppmega_bucketed_objective_materializations_v1"
 _OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 _OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v2"
@@ -77,9 +97,10 @@ _CASE5_RECEIPT_KEY = "case5_domain_ingestion_receipt"
 _CASE5_SCHEMA = "case5_domain_routes_v1"
 _SOURCE_IDENTITY_REGISTRY_SCHEMA = "cppmega_source_identity_registry_v1"
 _RESTORE_RECEIPT_SCHEMA = "cppmega_megatron_restore_receipt_v1"
-_RESTORE_BINDING_SCHEMA = "cppmega_case6_receipt_binding_v1"
+_RESTORE_BINDING_SCHEMA = "cppmega_case6_receipt_binding_v2"
 _NO_CHECKPOINT_SHA256 = hashlib.sha256(b"cppmega:no-checkpoint:v1").hexdigest()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RELEVANT_UNLISTED_SUFFIXES = frozenset({".bin", ".idx", ".json"})
@@ -472,6 +493,11 @@ def _validate_logical_manifest(
         raise ValueError(
             "production bundle must use training_contract='objective_materialized'"
         )
+    _validate_implementation_binding(
+        manifest.get("implementation"),
+        where="production bundle",
+        required_components=_PRODUCER_IMPLEMENTATION_COMPONENTS,
+    )
     if manifest.get("bundle_id") != expected_bundle_id:
         raise ValueError(
             f"bundle_id mismatch: {manifest.get('bundle_id')!r} != {expected_bundle_id!r}"
@@ -1245,6 +1271,7 @@ def _validate_restore_receipt(
         "config_sha256",
         "command_sha256",
         "run_id",
+        "implementation",
     }
     if set(binding) != expected_binding_fields:
         raise ValueError("restore receipt binding fields drifted")
@@ -1268,6 +1295,10 @@ def _validate_restore_receipt(
         sorted(expected_prefix_hashes.items())
     ):
         raise ValueError("restore receipt prefix-manifest binding drifted")
+    _validate_training_implementation_extension(
+        manifest.get("implementation"),
+        binding.get("implementation"),
+    )
     return _RestoreValidation(
         receipt_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
         run_id=run_id,
@@ -1716,6 +1747,111 @@ def _require_sha256(value: object, *, where: str) -> str:
     if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
         raise ValueError(f"{where} must be a lowercase SHA-256")
     return value
+
+
+def _validate_implementation_binding(
+    value: object,
+    *,
+    where: str,
+    required_components: Iterable[str],
+) -> dict[str, object]:
+    binding = dict(
+        _require_mapping(value, where=f"{where} implementation binding")
+    )
+    expected_fields = {"schema", "components"}
+    if set(binding) != expected_fields:
+        raise ValueError(
+            f"{where} implementation binding fields drifted: "
+            f"missing={sorted(expected_fields - set(binding))} "
+            f"extra={sorted(set(binding) - expected_fields)}"
+        )
+    if binding.get("schema") != _IMPLEMENTATION_BINDING_SCHEMA:
+        raise ValueError(f"{where} implementation binding schema drifted")
+    components = _require_mapping(
+        binding.get("components"),
+        where=f"{where} implementation components",
+    )
+    expected_components = set(required_components)
+    actual_components = set(components)
+    if actual_components != expected_components:
+        raise ValueError(
+            f"{where} implementation components drifted: "
+            f"missing={sorted(expected_components - actual_components)} "
+            f"extra={sorted(actual_components - expected_components)}"
+        )
+
+    normalized: dict[str, dict[str, str]] = {}
+    for name, raw_component in components.items():
+        if not isinstance(name, str) or _RUN_ID_RE.fullmatch(name) is None:
+            raise ValueError(f"{where} implementation component name is invalid")
+        component = dict(
+            _require_mapping(
+                raw_component,
+                where=f"{where} implementation component {name}",
+            )
+        )
+        expected_fields = _IMPLEMENTATION_COMPONENT_FIELDS[name]
+        actual_fields = set(component)
+        if actual_fields != expected_fields:
+            raise ValueError(
+                f"{where} implementation component {name} fields drifted: "
+                f"missing={sorted(expected_fields - actual_fields)} "
+                f"extra={sorted(actual_fields - expected_fields)}"
+            )
+        normalized_component: dict[str, str] = {}
+        if "commit" in component:
+            commit = component["commit"]
+            if not isinstance(commit, str) or _COMMIT_RE.fullmatch(commit) is None:
+                raise ValueError(
+                    f"{where} implementation {name}.commit must be a lowercase "
+                    "Git commit SHA"
+                )
+            normalized_component["commit"] = commit
+        for field in (
+            "tree_sha256",
+            "source_sha256",
+            "dependency_closure_sha256",
+        ):
+            if field in component:
+                normalized_component[field] = _require_sha256(
+                    component[field],
+                    where=f"{where} implementation {name}.{field}",
+                )
+        normalized[name] = dict(sorted(normalized_component.items()))
+    return {
+        "schema": _IMPLEMENTATION_BINDING_SCHEMA,
+        "components": dict(sorted(normalized.items())),
+    }
+
+
+def _validate_training_implementation_extension(
+    producer_value: object,
+    training_value: object,
+) -> None:
+    producer = _validate_implementation_binding(
+        producer_value,
+        where="production bundle",
+        required_components=_PRODUCER_IMPLEMENTATION_COMPONENTS,
+    )
+    training = _validate_implementation_binding(
+        training_value,
+        where="restore receipt",
+        required_components=_TRAINING_IMPLEMENTATION_COMPONENTS,
+    )
+    producer_components = producer["components"]
+    training_components = training["components"]
+    expected_training_components = set(producer_components) | {"megatron"}
+    if set(training_components) != expected_training_components:
+        raise ValueError(
+            "restore receipt implementation component set does not exactly "
+            "extend the bundle producer"
+        )
+    for name, producer_component in producer_components.items():
+        if training_components.get(name) != producer_component:
+            raise ValueError(
+                "restore receipt implementation does not extend the bundle "
+                f"producer for {name}"
+            )
 
 
 __all__ = [
