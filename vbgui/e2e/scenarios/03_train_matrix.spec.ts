@@ -25,17 +25,6 @@ const FAMILY_REPS = [
   "nemotron3", "zaya1", "arcee_trinity", "granite_4_1",
 ] as const;
 
-// Presets whose bricks use TileLang/TVM Metal kernels lacking a vjp
-// implementation (Primitive::vjp Not implemented for TVMFFIMetalCall).
-// Their `train` stage is expected to FAIL on this Mac; overall_status
-// in the modal will be "fail" but the cell is xfail-asserted to catch
-// future regressions in the OTHER stages (parse/verify/...) which must
-// still run cleanly.
-const EXPECTED_TRAIN_FAIL: ReadonlySet<string> = new Set([
-  "kimi_linear",  // contains `kda` brick (Kimi delta-attention, Metal only)
-  "qwen3_next",   // contains `gdn` brick (gated delta net, Metal only)
-]);
-
 const SCENARIOS = FAMILY_REPS.flatMap((preset) =>
   TOKENIZER_NAMES.flatMap((tok) =>
     PARQUET_SCHEMAS.map((parq) => ({ preset, tok, parq,
@@ -60,17 +49,10 @@ test.describe("mini-train matrix (192 cells)", () => {
       const trainRow = modal.getByTestId("run-result-stage-train");
       await expect(trainRow).toBeVisible();
 
-      if (EXPECTED_TRAIN_FAIL.has(preset)) {
-        // Train must FAIL with a typed error (vjp / Metal path). Earlier
-        // stages still must be green to prove the GUI walk works.
-        await expect(trainRow).toContainText("fail");
-        await snapshot(page, "03_train_matrix/xfail", key);
-      } else {
-        await assertOverallStatus(modal, "ok");
-        await expect(trainRow).toContainText("ok");
-        if (Math.random() < 0.10) {
-          await snapshot(page, "03_train_matrix", key);
-        }
+      await assertOverallStatus(modal, "ok");
+      await expect(trainRow).toContainText("ok");
+      if (Math.random() < 0.10) {
+        await snapshot(page, "03_train_matrix", key);
       }
       await closeModal(page);
       expect(SCENARIOS.length).toBe(192);

@@ -9,7 +9,7 @@ from typing import Any, Callable, Literal
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_merge, tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from cppmega_mlx.training._quantize_8bit import (
     DEFAULT_BLOCK_SIZE as MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE,
@@ -558,18 +558,50 @@ class MuonAdamWMulti(optim.Optimizer):
     def apply_gradients(self, gradients: Any, parameters: Any) -> Any:
         muon_grads, adamw_grads = self._split(gradients)
         muon_params, adamw_params = self._split(parameters)
-        merged: Any = {}
-        if muon_grads:
-            merged = tree_merge(
-                merged,
-                self._muon.apply_gradients(muon_grads, muon_params),
+        routed_updates: dict[str, mx.array] = {}
+        groups = (
+            ("muon", self._muon, muon_grads, muon_params),
+            ("adamw", self._adamw, adamw_grads, adamw_params),
+        )
+        for group_name, optimizer, group_grads, group_params in groups:
+            if not group_grads:
+                continue
+            updates = optimizer.apply_gradients(group_grads, group_params)
+            for name, value in tree_flatten(updates):
+                if not isinstance(value, mx.array):
+                    raise TypeError(
+                        f"{group_name} optimizer returned a non-array update "
+                        f"for {name!r}: {type(value).__name__}"
+                    )
+                if name in routed_updates:
+                    raise ValueError(
+                        f"optimizer groups both returned an update for {name!r}"
+                    )
+                routed_updates[name] = value
+
+        gradient_names = [
+            name
+            for name, value in tree_flatten(gradients)
+            if isinstance(value, mx.array)
+        ]
+        if not gradient_names:
+            return {}
+        expected_names = set(gradient_names)
+        actual_names = set(routed_updates)
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            extra = sorted(actual_names - expected_names)
+            raise ValueError(
+                "composite optimizer update coverage mismatch: "
+                f"missing={missing}, extra={extra}"
             )
-        if adamw_grads:
-            merged = tree_merge(
-                merged,
-                self._adamw.apply_gradients(adamw_grads, adamw_params),
-            )
-        return merged
+
+        # ``tree_merge`` cannot combine sparse list-shaped pytrees: empty
+        # placeholders at different layer indices are treated as colliding
+        # leaves. Rebuild once from the two groups' disjoint flat paths.
+        return tree_unflatten(
+            [(name, routed_updates[name]) for name in gradient_names]
+        )
 
     def update(self, model: nn.Module, gradients: Any) -> None:
         model.update(self.apply_gradients(gradients, model))
