@@ -734,6 +734,37 @@ def test_restore_implementation_must_extend_bundle_producer() -> None:
         )
 
 
+def test_bundle_implementation_rejects_training_component(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads(
+        (fixture.root / "manifest.json").read_text(encoding="utf-8")
+    )
+    manifest["implementation"]["components"]["megatron"] = {"commit": "7" * 40}
+
+    with pytest.raises(ValueError, match=r"components drifted: .*extra=\['megatron'\]"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
+def test_bundle_implementation_rejects_extra_component_field() -> None:
+    producer = _producer_implementation()
+    producer["components"]["cppmega"]["source_sha256"] = "8" * 64
+
+    with pytest.raises(
+        ValueError,
+        match=r"component cppmega fields drifted: .*extra=\['source_sha256'\]",
+    ):
+        production_bundle._validate_implementation_binding(
+            producer,
+            where="production bundle",
+            required_components=production_bundle._PRODUCER_IMPLEMENTATION_COMPONENTS,
+        )
+
+
 @pytest.mark.mlx_runtime
 def test_open_production_megatron_bundle_accepts_bounded_source_sampling(
     tmp_path: Path,

@@ -54,6 +54,14 @@ _TRAINING_IMPLEMENTATION_COMPONENTS = (
     "cppmega_mlx",
     "clang_indexer",
 )
+_IMPLEMENTATION_COMPONENT_FIELDS = {
+    "cppmega": frozenset({"commit", "tree_sha256"}),
+    "cppmega_mlx": frozenset({"commit", "tree_sha256"}),
+    "clang_indexer": frozenset(
+        {"source_sha256", "dependency_closure_sha256"}
+    ),
+    "megatron": frozenset({"commit"}),
+}
 _OBJECTIVE_BUCKETS_SCHEMA = "cppmega_bucketed_objective_materializations_v1"
 _OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 _OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v2"
@@ -1763,21 +1771,16 @@ def _validate_implementation_binding(
         binding.get("components"),
         where=f"{where} implementation components",
     )
-    required = set(required_components)
-    missing = required - set(components)
-    if missing:
+    expected_components = set(required_components)
+    actual_components = set(components)
+    if actual_components != expected_components:
         raise ValueError(
-            f"{where} implementation binding is missing components: "
-            f"{sorted(missing)}"
+            f"{where} implementation components drifted: "
+            f"missing={sorted(expected_components - actual_components)} "
+            f"extra={sorted(actual_components - expected_components)}"
         )
 
     normalized: dict[str, dict[str, str]] = {}
-    allowed_fields = {
-        "commit",
-        "tree_sha256",
-        "source_sha256",
-        "dependency_closure_sha256",
-    }
     for name, raw_component in components.items():
         if not isinstance(name, str) or _RUN_ID_RE.fullmatch(name) is None:
             raise ValueError(f"{where} implementation component name is invalid")
@@ -1787,11 +1790,13 @@ def _validate_implementation_binding(
                 where=f"{where} implementation component {name}",
             )
         )
-        unknown = set(component) - allowed_fields
-        if unknown:
+        expected_fields = _IMPLEMENTATION_COMPONENT_FIELDS[name]
+        actual_fields = set(component)
+        if actual_fields != expected_fields:
             raise ValueError(
-                f"{where} implementation component {name} has unknown fields: "
-                f"{sorted(unknown)}"
+                f"{where} implementation component {name} fields drifted: "
+                f"missing={sorted(expected_fields - actual_fields)} "
+                f"extra={sorted(actual_fields - expected_fields)}"
             )
         normalized_component: dict[str, str] = {}
         if "commit" in component:
@@ -1812,23 +1817,6 @@ def _validate_implementation_binding(
                     component[field],
                     where=f"{where} implementation {name}.{field}",
                 )
-        if name in {"cppmega", "cppmega_mlx"} and name in required and not {
-            "commit",
-            "tree_sha256",
-        }.issubset(component):
-            raise ValueError(
-                f"{where} implementation {name} requires commit and tree_sha256"
-            )
-        if name == "megatron" and name in required and "commit" not in component:
-            raise ValueError(f"{where} implementation megatron requires a commit")
-        if name == "clang_indexer" and name in required and not {
-            "source_sha256",
-            "dependency_closure_sha256",
-        }.issubset(component):
-            raise ValueError(
-                f"{where} implementation clang_indexer requires source_sha256 "
-                "and dependency_closure_sha256"
-            )
         normalized[name] = dict(sorted(normalized_component.items()))
     return {
         "schema": _IMPLEMENTATION_BINDING_SCHEMA,
