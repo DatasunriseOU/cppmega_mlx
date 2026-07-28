@@ -47,6 +47,8 @@ def _guard(repo: Path) -> sc.CodeRevisionGuard:
 
 def test_code_revision_unchanged_passes_and_ignores_outputs(source_repo: Path) -> None:
     guard = _guard(source_repo)
+    assert guard.receipt["producer_role"] == "canonical_source_conveyor"
+    assert guard.receipt["repository_identity"] == "cppmega_mlx"
     output = source_repo / "outputs" / "corpus" / "large.parquet"
     output.parent.mkdir(parents=True)
     output.write_bytes(b"not-source")
