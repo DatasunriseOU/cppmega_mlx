@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import json
@@ -346,6 +347,181 @@ def _write_source_composition_provenance(root: Path) -> dict[str, object]:
     }
 
 
+def _write_ci_production_provenance(
+    root: Path,
+    *,
+    source_size: int,
+    source_sha256: str,
+) -> dict[str, object]:
+    provenance = root / "provenance"
+    staged_ledgers = provenance / "ci_export"
+    staged_ledgers.mkdir(parents=True, exist_ok=True)
+    ledger_names = {
+        "representative_ledger": "representative_ledger.jsonl",
+        "fragment_ledger": "fragment_ledger.jsonl",
+        "dropped_graph_edges": "dropped_graph_edges.jsonl",
+        "representative_metadata": "representative_metadata.jsonl",
+        "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
+        "source_binding_projection": "source_binding_projection.jsonl",
+    }
+    artifacts: list[dict[str, object]] = [
+        {
+            "path": f"{_BUCKET}/ci-case5-train-{_BUCKET}-000000.parquet",
+            "kind": "case5_parquet",
+            "bucket": _BUCKET,
+            "split": "train",
+            "rows": 1,
+            "byte_size": source_size,
+            "sha256": source_sha256,
+        }
+    ]
+    for kind, name in ledger_names.items():
+        path = staged_ledgers / name
+        path.write_text("{}\n", encoding="utf-8")
+        artifacts.append(
+            {
+                "path": name,
+                "kind": kind,
+                "rows": 1,
+                "byte_size": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+
+    fetch_state_sha256 = "1" * 64
+    fetch_state_logical_sha256 = "2" * 64
+    fetch_sidecar_set_sha256 = "3" * 64
+    representative_ledger_sha256 = "4" * 64
+    store_receipt_sha256 = "5" * 64
+    source_binding = {
+        "fetch_state_sqlite_logical_sha256": fetch_state_logical_sha256,
+        "fetch_state_sidecar_set_sha256": fetch_sidecar_set_sha256,
+        "representative_ledger_sha256": representative_ledger_sha256,
+    }
+    exact_tokens = 20_000_000_123
+    acquisition = {
+        "completion_mode": "inventory-exhaustive",
+        "production_complete": True,
+        "inventory": {
+            "path": "/immutable-ci/inventory.sqlite3",
+            "sha256": "6" * 64,
+            "logical_sha256": "7" * 64,
+            "receipt_path": "/immutable-ci/inventory_receipt.json",
+            "receipt_sha256": "8" * 64,
+        },
+        "fetch": {
+            "state_path": "/immutable-ci/fetch_state.sqlite3",
+            "state_sha256": fetch_state_sha256,
+            "receipt_path": "/immutable-ci/fetch_receipt.json",
+            "receipt_sha256": "9" * 64,
+            "attempt_set_sha256": "a" * 64,
+            "terminal_proof_sha256": "b" * 64,
+        },
+        "store": {
+            "path": "/immutable-ci/store",
+            "receipt_path": "/immutable-ci/store_receipt.json",
+            "receipt_sha256": store_receipt_sha256,
+        },
+        "merge": {
+            "receipt_path": "/immutable-ci/merge_receipt.json",
+            "receipt_sha256": "c" * 64,
+            "schema": "cppmega_ci_stream_shard_union_receipt_v3",
+        },
+    }
+    payload = {
+        "schema": "cppmega_ci_content_store_case5_export_v3",
+        "status": "complete",
+        "completion_mode": "inventory-exhaustive",
+        "production_complete": True,
+        "exporter_script_sha256": "d" * 64,
+        "input_store": {
+            "schema": "cppmega_ci_content_store_v1",
+            "receipt_schema": "cppmega_ci_content_store_receipt_v1",
+            "receipt_sha256": store_receipt_sha256,
+            "policy_sha256": "e" * 64,
+            "sqlite_schema_sha256": "f" * 64,
+            "logical_content_set_sha256": "0" * 64,
+            "logical_token_sequence_set_sha256": "1" * 64,
+            "occurrence_set_sha256": "2" * 64,
+            "sqlite_logical_sha256": "3" * 64,
+            "pack_hashes": [{"path": "pack-00000000.cicp", "sha256": "4" * 64}],
+            "verified_before_export": True,
+            "unchanged_after_export": True,
+        },
+        "input_fetch_state": {
+            "schema": "cppmega_ci_stream_fetch_v4",
+            "artifact": {
+                "path": "/immutable-ci/fetch_state.sqlite3",
+                "sha256": fetch_state_sha256,
+            },
+            "sqlite_schema_sha256": "5" * 64,
+            "sqlite_logical_sha256": fetch_state_logical_sha256,
+            "sidecar_set_sha256": fetch_sidecar_set_sha256,
+            "settings": {
+                "fetcher_script_sha256": "6" * 64,
+                "parser_script_sha256": "7" * 64,
+                "content_store_script_sha256": "8" * 64,
+            },
+        },
+        "case5_contract": {
+            "buckets": [_BUCKET],
+            "overflow_rows": 0,
+            "parquet_shard_max_rows": 512,
+            "parquet_layout": "bucket-first-split-in-filename-v1",
+        },
+        "eligibility": {
+            "target_exact_unique_payload_tokens": 20_000_000_000,
+            "target_met": True,
+            "eligible": {
+                "unique_token_sequences": 1,
+                "exact_unique_payload_tokens": exact_tokens,
+            },
+            "conservation": {
+                "exact_unique_payload_tokens": True,
+                "unique_token_sequences": True,
+            },
+        },
+        "representatives": {
+            "count": 1,
+            "ledger_sha256": representative_ledger_sha256,
+        },
+        "counts": {
+            "representatives": 1,
+            "fragments": 1,
+            "payload_tokens": exact_tokens,
+            "valid_tokens": _BUCKET - 1,
+            "trained_tokens": _BUCKET - 1,
+            "capacity_tokens": _BUCKET,
+        },
+        "graph_accounting": {
+            "cross_chunk_outbound_edges_dropped": 0,
+            "cross_fragment_edges_dropped": 0,
+        },
+        "artifacts": artifacts,
+        "validation": {
+            "all_passed": True,
+            "fixed_widths": True,
+            "zero_overflow": True,
+            "payload_conserved": True,
+            "payload_identity_and_order_verified": True,
+            "post_normalize_pack_sidecars_and_edges_verified": True,
+        },
+        "acquisition_provenance": acquisition,
+    }
+    path = provenance / "ci_manifest.json"
+    _write_json(path, payload)
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "sha256": _sha256(path),
+        "source_inventory_sha256": _canonical_sha256(source_binding),
+        "input_docs": 1,
+        "fragments": 1,
+        "valid_tokens": _BUCKET - 1,
+        "cross_boundary_chunk_edges": 0,
+        "cross_boundary_token_edges": 0,
+    }
+
+
 def _write_mmididx(prefix: Path, tokens: np.ndarray) -> None:
     tokens.astype(np.int32, copy=False).tofile(prefix.with_suffix(".bin"))
     with prefix.with_suffix(".idx").open("wb") as handle:
@@ -595,10 +771,13 @@ def _build_bundle(
         "file_count": 1,
         "files": [
             {
-                "kind": "code",
+                "kind": "ci",
                 "bucket": _BUCKET,
-                "source": "/immutable-source/code_8.parquet",
-                "snapshot": "code/8/code_8.parquet",
+                "source": (
+                    f"/immutable-source/{_BUCKET}/"
+                    f"ci-case5-train-{_BUCKET}-000000.parquet"
+                ),
+                "snapshot": (f"ci/{_BUCKET}/ci-case5-train-{_BUCKET}-000000.parquet"),
                 "size": len(source_bytes),
                 "mtime_ns": 1,
                 "sha256": source_digest,
@@ -611,9 +790,9 @@ def _build_bundle(
         "changed_files": 0,
         "files": [
             {
-                "kind": "code",
+                "kind": "ci",
                 "bucket": _BUCKET,
-                "snapshot": "code/8/code_8.parquet",
+                "snapshot": (f"ci/{_BUCKET}/ci-case5-train-{_BUCKET}-000000.parquet"),
                 "size": len(source_bytes),
                 "source_sha256": source_digest,
                 "snapshot_sha256": source_digest,
@@ -625,6 +804,11 @@ def _build_bundle(
     repaired_manifest_path = provenance / "repaired_snapshot_manifest.json"
     _write_json(source_manifest_path, source_manifest)
     _write_json(repaired_manifest_path, repaired_manifest)
+    ci_manifest = _write_ci_production_provenance(
+        root,
+        source_size=len(source_bytes),
+        source_sha256=source_digest,
+    )
 
     tokenizer_root = root / "tokenizer"
     tokenizer_root.mkdir()
@@ -771,6 +955,7 @@ def _build_bundle(
             "repaired_manifest": repaired_manifest_path.relative_to(root).as_posix(),
             "local_snapshot_retained": False,
             "source_composition": source_composition,
+            "ci_manifest": ci_manifest,
         },
         "buckets": [_BUCKET],
         "bucket_results": [
@@ -848,6 +1033,23 @@ def _forbid_mmap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(np, "memmap", forbidden)
 
 
+def _rewrite_ci_manifest_for_validation(
+    fixture: _BundleFixture,
+    update: Callable[[dict[str, Any]], None],
+) -> tuple[dict[str, Any], dict[str, dict[str, object]]]:
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    descriptor = manifest["source_snapshot"]["ci_manifest"]
+    path = fixture.root / descriptor["path"]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    update(payload)
+    _write_json(path, payload)
+    descriptor["sha256"] = _sha256(path)
+    artifacts = {str(record["path"]): dict(record) for record in manifest["artifacts"]}
+    artifacts[descriptor["path"]]["size"] = path.stat().st_size
+    artifacts[descriptor["path"]]["sha256"] = descriptor["sha256"]
+    return manifest, artifacts
+
+
 @pytest.mark.mlx_runtime
 def test_open_production_megatron_bundle_records_validated_provenance(
     tmp_path: Path,
@@ -879,6 +1081,16 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert (
         dataset.metadata.global_dedup_logical_sha256 == dedup_payload["logical_sha256"]
     )
+    ci_descriptor = json.loads(
+        (fixture.root / "manifest.json").read_text(encoding="utf-8")
+    )["source_snapshot"]["ci_manifest"]
+    assert dataset.metadata.ci_manifest_sha256 == ci_descriptor["sha256"]
+    assert (
+        dataset.metadata.ci_source_inventory_sha256
+        == ci_descriptor["source_inventory_sha256"]
+    )
+    assert dataset.metadata.ci_acquisition_provenance_sha256
+    assert dataset.metadata.ci_exact_unique_payload_tokens == 20_000_000_123
     assert dataset.metadata.objective_contract_sha256
     assert dataset.metadata.objective_artifact_set_sha256
     assert dataset.metadata.tokenizer_contract_sha256 == TOKENIZER_CONTRACT_SHA256
@@ -886,6 +1098,90 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.document_ids is not None
     assert batch.graph_batch is not None
+
+
+def test_ci_ingress_rejects_legacy_fetch_state(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture,
+        lambda payload: payload["input_fetch_state"].update(
+            {"schema": "cppmega_ci_stream_fetch_v3"}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="input store/fetch contract drifted"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_requires_receipt_bound_manifest(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads(
+        (fixture.root / "manifest.json").read_text(encoding="utf-8")
+    )
+    del manifest["source_snapshot"]["ci_manifest"]
+    artifacts = {
+        str(record["path"]): dict(record) for record in manifest["artifacts"]
+    }
+
+    with pytest.raises(ValueError, match="source_snapshot.ci_manifest"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_rejects_less_than_twenty_billion_tokens(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture,
+        lambda payload: payload["eligibility"].update(
+            {"target_exact_unique_payload_tokens": 19_999_999_999}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exact-token or aggregate accounting"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_rejects_legacy_merge_receipt(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture,
+        lambda payload: payload["acquisition_provenance"]["merge"].update(
+            {"schema": "cppmega_ci_stream_shard_union_receipt_v2"}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="proof chain is not mutually bound"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_rejects_unbound_parquet_inventory(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+
+    def replace_parquet_digest(payload: dict[str, Any]) -> None:
+        parquet = next(
+            record
+            for record in payload["artifacts"]
+            if record["kind"] == "case5_parquet"
+        )
+        parquet["sha256"] = "f" * 64
+
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture, replace_parquet_digest
+    )
+
+    with pytest.raises(ValueError, match="differs from source snapshot"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
 
 
 def test_legacy_objective_artifact_shape_requires_regeneration() -> None:
