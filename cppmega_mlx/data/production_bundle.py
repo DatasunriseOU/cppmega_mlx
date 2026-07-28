@@ -108,6 +108,19 @@ _SOURCE_TARGETED_LAUNCH_SCHEMA = (
 _SOURCE_TARGETED_EXIT_SCHEMA = (
     "cppmega.canonical_source_targeted_retry_exit_v1"
 )
+_CI_PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
+_CI_FETCH_STATE_SCHEMA = "cppmega_ci_stream_fetch_v4"
+_CI_PRODUCTION_MERGE_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
+_CI_COMPLETION_MODE = "inventory-exhaustive"
+_CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS = 20_000_000_000
+_CI_PROVENANCE_LEDGER_NAMES = {
+    "representative_ledger": "representative_ledger.jsonl",
+    "fragment_ledger": "fragment_ledger.jsonl",
+    "dropped_graph_edges": "dropped_graph_edges.jsonl",
+    "representative_metadata": "representative_metadata.jsonl",
+    "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
+    "source_binding_projection": "source_binding_projection.jsonl",
+}
 _SOURCE_EXIT_SCHEMA_BY_LAUNCH = {
     _SOURCE_FULL_LAUNCH_SCHEMA: _SOURCE_FULL_EXIT_SCHEMA,
     _SOURCE_TARGETED_LAUNCH_SCHEMA: _SOURCE_TARGETED_EXIT_SCHEMA,
@@ -223,6 +236,10 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
     source_producer_set_sha256: str = ""
     global_dedup_receipt_sha256: str = ""
     global_dedup_logical_sha256: str = ""
+    ci_manifest_sha256: str = ""
+    ci_source_inventory_sha256: str = ""
+    ci_acquisition_provenance_sha256: str = ""
+    ci_exact_unique_payload_tokens: int = 0
     objective_contract_sha256: str = ""
     objective_contract_file_sha256: str = ""
     objective_artifact_set_sha256: str = ""
@@ -258,6 +275,9 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             "source_producer_set_sha256",
             "global_dedup_receipt_sha256",
             "global_dedup_logical_sha256",
+            "ci_manifest_sha256",
+            "ci_source_inventory_sha256",
+            "ci_acquisition_provenance_sha256",
             "objective_contract_sha256",
             "objective_contract_file_sha256",
             "objective_artifact_set_sha256",
@@ -268,6 +288,10 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             "case5_delimiter_contract_sha256",
         ):
             _require_sha256(getattr(self, field_name), where=f"metadata.{field_name}")
+        if self.ci_exact_unique_payload_tokens < _CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS:
+            raise ValueError(
+                "production metadata lacks the minimum exact unique CI payload"
+            )
 
     def provenance_receipt(self) -> dict[str, object]:
         """Return the stable fields that every run/checkpoint receipt must retain."""
@@ -294,6 +318,12 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             "source_producer_set_sha256": self.source_producer_set_sha256,
             "global_dedup_receipt_sha256": self.global_dedup_receipt_sha256,
             "global_dedup_logical_sha256": self.global_dedup_logical_sha256,
+            "ci_manifest_sha256": self.ci_manifest_sha256,
+            "ci_source_inventory_sha256": self.ci_source_inventory_sha256,
+            "ci_acquisition_provenance_sha256": (
+                self.ci_acquisition_provenance_sha256
+            ),
+            "ci_exact_unique_payload_tokens": self.ci_exact_unique_payload_tokens,
             "objective_contract_sha256": self.objective_contract_sha256,
             "objective_contract_file_sha256": self.objective_contract_file_sha256,
             "objective_artifact_set_sha256": self.objective_artifact_set_sha256,
@@ -336,6 +366,14 @@ class _SourceCompositionValidation:
 
 
 @dataclass(frozen=True)
+class _CIValidation:
+    manifest_sha256: str
+    source_inventory_sha256: str
+    acquisition_provenance_sha256: str
+    exact_unique_payload_tokens: int
+
+
+@dataclass(frozen=True)
 class _ValidatedBundle:
     manifest: dict[str, Any]
     artifacts: dict[str, dict[str, object]]
@@ -345,6 +383,7 @@ class _ValidatedBundle:
     source_manifest_sha256: str
     repaired_source_manifest_sha256: str
     source_composition: _SourceCompositionValidation
+    ci: _CIValidation
     objectives: dict[int, _ObjectiveValidation]
     prefixes: dict[int, _PrefixValidation]
     restore: _RestoreValidation
@@ -442,6 +481,12 @@ def open_production_megatron_bundle(
         global_dedup_logical_sha256=(
             validated.source_composition.dedup_logical_sha256
         ),
+        ci_manifest_sha256=validated.ci.manifest_sha256,
+        ci_source_inventory_sha256=validated.ci.source_inventory_sha256,
+        ci_acquisition_provenance_sha256=(
+            validated.ci.acquisition_provenance_sha256
+        ),
+        ci_exact_unique_payload_tokens=validated.ci.exact_unique_payload_tokens,
         objective_contract_sha256=str(selected_objective.descriptor["contract_sha256"]),
         objective_contract_file_sha256=str(
             selected_objective.descriptor["contract_file_sha256"]
@@ -517,6 +562,7 @@ def _validate_bundle(
     source_sha, repaired_sha, repaired_by_bucket = _validate_source_manifests(
         root, manifest, artifacts
     )
+    ci = _validate_ci_production_acquisition(root, manifest, artifacts)
     buckets = [int(value) for value in manifest["buckets"]]
     objectives = _validate_objectives(
         root,
@@ -551,6 +597,7 @@ def _validate_bundle(
         source_manifest_sha256=source_sha,
         repaired_source_manifest_sha256=repaired_sha,
         source_composition=source_composition,
+        ci=ci,
         objectives=objectives,
         prefixes=prefixes,
         restore=restore,
@@ -1473,6 +1520,338 @@ def _validate_source_manifests(
         str(source_record["sha256"]),
         str(repaired_record["sha256"]),
         repaired_by_bucket,
+    )
+
+
+def _validate_ci_production_acquisition(
+    root: Path,
+    manifest: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, object]],
+) -> _CIValidation:
+    """Bind MLX training ingress to the exhaustive cppmega CI-v4 proof chain."""
+
+    source_snapshot = _require_mapping(
+        manifest.get("source_snapshot"), where="source_snapshot"
+    )
+    descriptor = _require_mapping(
+        source_snapshot.get("ci_manifest"), where="source_snapshot.ci_manifest"
+    )
+    expected_descriptor_fields = {
+        "path",
+        "sha256",
+        "source_inventory_sha256",
+        "input_docs",
+        "fragments",
+        "valid_tokens",
+        "cross_boundary_chunk_edges",
+        "cross_boundary_token_edges",
+    }
+    if set(descriptor) != expected_descriptor_fields:
+        raise ValueError("CI manifest descriptor fields drifted")
+    relative = _require_relative_string(
+        descriptor.get("path"), where="CI manifest path"
+    )
+    if relative != "provenance/ci_manifest.json":
+        raise ValueError("CI manifest must use the canonical provenance path")
+    manifest_record = _require_artifact(artifacts, relative, where="CI export receipt")
+    manifest_sha256 = _require_sha256(
+        descriptor.get("sha256"), where="CI manifest sha256"
+    )
+    if manifest_record["sha256"] != manifest_sha256:
+        raise ValueError("CI manifest descriptor is not artifact-bound")
+    raw, ci_manifest = _load_json_object(
+        _safe_bundle_path(root, relative, where="CI manifest"),
+        where="CI manifest",
+    )
+    if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise ValueError("CI manifest bytes drifted from the descriptor")
+    if (
+        ci_manifest.get("schema") != _CI_PRODUCTION_EXPORT_SCHEMA
+        or ci_manifest.get("status") != "complete"
+        or ci_manifest.get("completion_mode") != _CI_COMPLETION_MODE
+        or ci_manifest.get("production_complete") is not True
+    ):
+        raise ValueError(
+            "production bundle requires an inventory-exhaustive CI export v3"
+        )
+    _require_sha256(
+        ci_manifest.get("exporter_script_sha256"),
+        where="CI exporter script sha256",
+    )
+
+    validation = _require_mapping(
+        ci_manifest.get("validation"), where="CI export validation"
+    )
+    required_validation = (
+        "all_passed",
+        "fixed_widths",
+        "zero_overflow",
+        "payload_conserved",
+        "payload_identity_and_order_verified",
+        "post_normalize_pack_sidecars_and_edges_verified",
+    )
+    if any(validation.get(name) is not True for name in required_validation):
+        raise ValueError("CI export validation is not green")
+
+    buckets = [int(value) for value in manifest["buckets"]]
+    case5 = _require_mapping(
+        ci_manifest.get("case5_contract"), where="CI CASE5 contract"
+    )
+    if (
+        case5.get("buckets") != buckets
+        or case5.get("overflow_rows") != 0
+        or case5.get("parquet_shard_max_rows") != 512
+        or case5.get("parquet_layout") != "bucket-first-split-in-filename-v1"
+    ):
+        raise ValueError("CI CASE5 bucket contract drifted")
+
+    input_store = _require_mapping(
+        ci_manifest.get("input_store"), where="CI input store"
+    )
+    input_fetch_state = _require_mapping(
+        ci_manifest.get("input_fetch_state"), where="CI fetch state"
+    )
+    fetch_artifact = _require_mapping(
+        input_fetch_state.get("artifact"), where="CI fetch-state artifact"
+    )
+    if (
+        input_store.get("schema") != "cppmega_ci_content_store_v1"
+        or input_store.get("receipt_schema") != "cppmega_ci_content_store_receipt_v1"
+        or input_store.get("verified_before_export") is not True
+        or input_store.get("unchanged_after_export") is not True
+        or input_fetch_state.get("schema") != _CI_FETCH_STATE_SCHEMA
+    ):
+        raise ValueError("CI immutable input store/fetch contract drifted")
+    for name in (
+        "receipt_sha256",
+        "policy_sha256",
+        "sqlite_schema_sha256",
+        "logical_content_set_sha256",
+        "logical_token_sequence_set_sha256",
+        "occurrence_set_sha256",
+        "sqlite_logical_sha256",
+    ):
+        _require_sha256(input_store.get(name), where=f"CI input store {name}")
+    if (
+        not isinstance(input_store.get("pack_hashes"), list)
+        or not input_store["pack_hashes"]
+    ):
+        raise ValueError("CI input store pack inventory is empty")
+    _require_sha256(
+        fetch_artifact.get("sha256"), where="CI fetch-state artifact sha256"
+    )
+    for name in (
+        "sqlite_schema_sha256",
+        "sqlite_logical_sha256",
+        "sidecar_set_sha256",
+    ):
+        _require_sha256(input_fetch_state.get(name), where=f"CI fetch state {name}")
+    fetch_settings = _require_mapping(
+        input_fetch_state.get("settings"), where="CI fetch settings"
+    )
+    for name in (
+        "fetcher_script_sha256",
+        "parser_script_sha256",
+        "content_store_script_sha256",
+    ):
+        _require_sha256(fetch_settings.get(name), where=f"CI fetch setting {name}")
+
+    eligibility = _require_mapping(
+        ci_manifest.get("eligibility"), where="CI eligibility"
+    )
+    eligible = _require_mapping(eligibility.get("eligible"), where="CI eligible corpus")
+    conservation = _require_mapping(
+        eligibility.get("conservation"), where="CI eligibility conservation"
+    )
+    counts = _require_mapping(ci_manifest.get("counts"), where="CI counts")
+    representatives = _require_mapping(
+        ci_manifest.get("representatives"), where="CI representatives"
+    )
+    graph = _require_mapping(
+        ci_manifest.get("graph_accounting"), where="CI graph accounting"
+    )
+
+    def require_int(value: object, *, where: str, positive: bool = False) -> int:
+        minimum = 1 if positive else 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{where} must be an integer >= {minimum}")
+        return value
+
+    target_tokens = require_int(
+        eligibility.get("target_exact_unique_payload_tokens"),
+        where="CI target exact unique payload tokens",
+    )
+    eligible_tokens = require_int(
+        eligible.get("exact_unique_payload_tokens"),
+        where="CI eligible exact unique payload tokens",
+        positive=True,
+    )
+    representative_count = require_int(
+        representatives.get("count"), where="CI representative count", positive=True
+    )
+    fragment_count = require_int(
+        counts.get("fragments"), where="CI fragment count", positive=True
+    )
+    valid_tokens = require_int(
+        counts.get("valid_tokens"), where="CI valid token count", positive=True
+    )
+    cross_chunk_edges = require_int(
+        graph.get("cross_chunk_outbound_edges_dropped"),
+        where="CI cross-chunk edge count",
+    )
+    cross_fragment_edges = require_int(
+        graph.get("cross_fragment_edges_dropped"),
+        where="CI cross-fragment edge count",
+    )
+    if (
+        eligibility.get("target_met") is not True
+        or conservation.get("exact_unique_payload_tokens") is not True
+        or conservation.get("unique_token_sequences") is not True
+        or target_tokens < _CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS
+        or eligible_tokens < target_tokens
+        or counts.get("payload_tokens") != eligible_tokens
+        or counts.get("representatives") != representative_count
+        or eligible.get("unique_token_sequences") != representative_count
+        or descriptor.get("input_docs") != representative_count
+        or descriptor.get("fragments") != fragment_count
+        or descriptor.get("valid_tokens") != valid_tokens
+        or descriptor.get("cross_boundary_chunk_edges") != cross_chunk_edges
+        or descriptor.get("cross_boundary_token_edges") != cross_fragment_edges
+    ):
+        raise ValueError("CI exact-token or aggregate accounting drifted")
+
+    representative_ledger_sha256 = _require_sha256(
+        representatives.get("ledger_sha256"),
+        where="CI representative ledger sha256",
+    )
+    source_binding = {
+        "fetch_state_sqlite_logical_sha256": input_fetch_state["sqlite_logical_sha256"],
+        "fetch_state_sidecar_set_sha256": input_fetch_state["sidecar_set_sha256"],
+        "representative_ledger_sha256": representative_ledger_sha256,
+    }
+    source_inventory_sha256 = _canonical_sha256(source_binding)
+    if descriptor.get("source_inventory_sha256") != source_inventory_sha256:
+        raise ValueError("CI source inventory binding drifted")
+
+    acquisition = _require_mapping(
+        ci_manifest.get("acquisition_provenance"),
+        where="CI acquisition provenance",
+    )
+    if (
+        acquisition.get("completion_mode") != _CI_COMPLETION_MODE
+        or acquisition.get("production_complete") is not True
+    ):
+        raise ValueError("CI acquisition provenance is not production-complete")
+    inventory = _require_mapping(
+        acquisition.get("inventory"), where="CI acquisition inventory"
+    )
+    fetch = _require_mapping(acquisition.get("fetch"), where="CI acquisition fetch")
+    store = _require_mapping(acquisition.get("store"), where="CI acquisition store")
+    merge = _require_mapping(acquisition.get("merge"), where="CI acquisition merge")
+    for where, value in (
+        ("inventory sha256", inventory.get("sha256")),
+        ("inventory logical sha256", inventory.get("logical_sha256")),
+        ("inventory receipt sha256", inventory.get("receipt_sha256")),
+        ("fetch state sha256", fetch.get("state_sha256")),
+        ("fetch receipt sha256", fetch.get("receipt_sha256")),
+        ("fetch attempt set sha256", fetch.get("attempt_set_sha256")),
+        ("fetch terminal proof sha256", fetch.get("terminal_proof_sha256")),
+        ("store receipt sha256", store.get("receipt_sha256")),
+        ("merge receipt sha256", merge.get("receipt_sha256")),
+    ):
+        _require_sha256(value, where=f"CI acquisition {where}")
+    if (
+        fetch.get("state_sha256") != fetch_artifact.get("sha256")
+        or store.get("receipt_sha256") != input_store.get("receipt_sha256")
+        or merge.get("schema") != _CI_PRODUCTION_MERGE_SCHEMA
+    ):
+        raise ValueError("CI acquisition proof chain is not mutually bound")
+
+    source_manifest_relative = _require_relative_string(
+        source_snapshot.get("manifest"), where="source manifest path"
+    )
+    _, source_manifest = _load_json_object(
+        _safe_bundle_path(root, source_manifest_relative, where="source manifest"),
+        where="source manifest",
+    )
+    source_ci_artifacts: set[tuple[int, str, int, str]] = set()
+    for raw_record in source_manifest.get("files", []):
+        record = _require_mapping(raw_record, where="source manifest file")
+        if record.get("kind") != "ci":
+            continue
+        snapshot = _require_relative_string(
+            record.get("snapshot"), where="CI source snapshot path"
+        )
+        snapshot_parts = PurePosixPath(snapshot).parts
+        bucket = _require_positive_int(record.get("bucket"), where="CI source bucket")
+        size = _require_positive_int(record.get("size"), where="CI source size")
+        digest = _require_sha256(record.get("sha256"), where="CI source sha256")
+        if (
+            len(snapshot_parts) != 3
+            or snapshot_parts[0] != "ci"
+            or snapshot_parts[1] != str(bucket)
+        ):
+            raise ValueError("CI source snapshot path is not canonical")
+        source_ci_artifacts.add((bucket, snapshot_parts[2], size, digest))
+
+    raw_ci_artifacts = ci_manifest.get("artifacts")
+    if not isinstance(raw_ci_artifacts, list) or not raw_ci_artifacts:
+        raise ValueError("CI export artifact inventory is empty")
+    export_ci_artifacts: set[tuple[int, str, int, str]] = set()
+    observed_ledgers: set[str] = set()
+    observed_paths: set[str] = set()
+    for raw_record in raw_ci_artifacts:
+        record = _require_mapping(raw_record, where="CI export artifact")
+        artifact_relative = _require_relative_string(
+            record.get("path"), where="CI export artifact path"
+        )
+        if artifact_relative in observed_paths:
+            raise ValueError("CI export artifact path is duplicated")
+        observed_paths.add(artifact_relative)
+        size = require_int(record.get("byte_size"), where="CI export artifact size")
+        digest = _require_sha256(
+            record.get("sha256"), where="CI export artifact sha256"
+        )
+        kind = record.get("kind")
+        if kind == "case5_parquet":
+            export_path = PurePosixPath(artifact_relative)
+            bucket = _require_positive_int(
+                record.get("bucket"), where="CI export bucket"
+            )
+            if (
+                len(export_path.parts) != 2
+                or export_path.parts[0] != str(bucket)
+                or bucket not in buckets
+            ):
+                raise ValueError("CI export Parquet path is not canonical")
+            export_ci_artifacts.add((bucket, export_path.name, size, digest))
+            continue
+        expected_name = (
+            _CI_PROVENANCE_LEDGER_NAMES.get(kind) if isinstance(kind, str) else None
+        )
+        if (
+            expected_name is None
+            or artifact_relative != expected_name
+            or kind in observed_ledgers
+        ):
+            raise ValueError("CI export provenance ledger inventory drifted")
+        observed_ledgers.add(kind)
+        staged_relative = f"provenance/ci_export/{artifact_relative}"
+        staged = _require_artifact(
+            artifacts, staged_relative, where=f"CI provenance ledger {kind}"
+        )
+        if staged["size"] != size or staged["sha256"] != digest:
+            raise ValueError(f"CI provenance ledger {kind} is not artifact-bound")
+    if observed_ledgers != set(_CI_PROVENANCE_LEDGER_NAMES):
+        raise ValueError("CI export provenance ledger inventory is incomplete")
+    if not export_ci_artifacts or export_ci_artifacts != source_ci_artifacts:
+        raise ValueError("CI export Parquet inventory differs from source snapshot")
+
+    return _CIValidation(
+        manifest_sha256=manifest_sha256,
+        source_inventory_sha256=source_inventory_sha256,
+        acquisition_provenance_sha256=_canonical_sha256(acquisition),
+        exact_unique_payload_tokens=eligible_tokens,
     )
 
 
