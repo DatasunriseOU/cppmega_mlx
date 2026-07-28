@@ -2,7 +2,7 @@
 """Validate re-indexed packed parquet outputs (per-channel populated %, edge
 block-coordinate correctness, whole-function packing, padding).
 
-Reads outputs/reindexed/{1024,2048,4096}/*.parquet and prints a table.
+Reads outputs/reindexed/{1024,2048,4096,8192,16384}/*.parquet and prints a table.
 Run with the mlx venv python and PYTHONPATH=/Volumes/external/sources/cppmega.mlx.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 ROOT = Path("/Volumes/external/sources/cppmega.mlx/outputs/reindexed")
-LENGTHS = [1024, 2048, 4096]
+LENGTHS = [1024, 2048, 4096, 8192, 16384]
 
 
 def col(t, name):

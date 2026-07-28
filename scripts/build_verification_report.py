@@ -53,7 +53,10 @@ from scripts.render_sidecar_example import (  # noqa: E402
 
 OUT = _REPO_ROOT / "outputs" / "verification_report"
 SAMPLES = OUT / "_samples"
-CODE_GLOBS = [f"outputs/reindexed/{s}/*.parquet" for s in (1024, 2048, 4096)]
+CODE_GLOBS = [
+    f"outputs/reindexed/{s}/*.parquet"
+    for s in (1024, 2048, 4096, 8192, 16384)
+]
 COMMIT_GLOBS = [
     f"outputs/reindexed_commits/{s}/*.parquet" for s in (1024, 2048, 4096, 8192, 16384)
 ]

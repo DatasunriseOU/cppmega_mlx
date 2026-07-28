@@ -9,7 +9,8 @@ Pipeline (one repo at a time, fail-loud per repo, continue on failure):
       -> clang_enriched_to_parquet.py (--materialize-tokenized-enriched,
          --overflow-policy split at the largest fixed bucket)
       -> pack_enriched_rows.py once per --target-length (best_fit, no-crop)
-      -> append packed parquet to outputs/reindexed/{1024,2048,4096}/<repo>.parquet
+      -> append packed parquet to
+         outputs/reindexed/{1024,2048,4096,8192,16384}/<repo>.parquet
       -> mark <repo> done in outputs/reindexed/_done.json
       -> rm temp
 
@@ -88,6 +89,9 @@ TAR_MEMBER_ROOT = "cpp_all"
 OUTPUT_ROOT = MLX_ROOT / "outputs" / "reindexed"
 MANIFEST_PATH = OUTPUT_ROOT / "_done.json"
 DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
+DEFAULT_SOURCE_QUARANTINE_MANIFEST = (
+    MLX_ROOT / "configs" / "source_quarantine_manifest.json"
+)
 
 # Compatibility default for direct stage_materialize callers. Production
 # route-by-fit callers pass a target-derived lossless split budget explicitly.
@@ -101,7 +105,7 @@ LOSSLESS_INDEX_MAX_TOKENS = (1 << 63) - 1
 # the actual token_ids length and fails closed before routing.
 MATERIALIZED_ROW_RESERVED_TOKENS = 3
 MATERIALIZE_SPLIT_STATS_SCHEMA = "cppmega.materialize_split_stats_v1"
-DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
+DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 DEFAULT_CODE_INDEX_TIMEOUT_S = 4 * 60 * 60
 DEFAULT_CODE_INDEX_STALL_TIMEOUT_S = 10 * 60
 
@@ -876,6 +880,7 @@ def stage_index_source(
     parse_workers: int = 2,
     index_timeout_s: int | None = None,
     index_stall_timeout_s: int | None = None,
+    source_quarantine_manifest: Path | None = None,
 ) -> Path:
     """index_project.py --enriched -> <repo>.enriched.jsonl.
 
@@ -913,6 +918,14 @@ def stage_index_source(
         cmd += ["--no-near-dedup"]
     if global_symbol_index is not None:
         cmd += ["--global-symbol-index", str(global_symbol_index)]
+    quarantine_receipt = source_quarantine_receipt_path(work, repo)
+    if source_quarantine_manifest is not None:
+        cmd += [
+            "--source-quarantine-manifest",
+            str(source_quarantine_manifest),
+            "--source-quarantine-receipt",
+            str(quarantine_receipt),
+        ]
     log_path = work / f"{repo}.index.log"
     run_checked(
         repo,
@@ -940,7 +953,39 @@ def stage_index_source(
                 detail=f"empty enriched jsonl after successful index_project: {enriched}",
             )
         raise RepoFailure(repo, "index_project", f"empty enriched jsonl: {enriched}")
+    if source_quarantine_manifest is not None and not quarantine_receipt.is_file():
+        raise RepoFailure(
+            repo,
+            "index_project",
+            f"missing source quarantine receipt: {quarantine_receipt}",
+        )
     return enriched
+
+
+def source_quarantine_receipt_path(work: Path, repo: str) -> Path:
+    return work / f"{repo}.source_quarantine_receipt.json"
+
+
+def read_source_quarantine_receipt(work: Path, repo: str) -> dict[str, object]:
+    path = source_quarantine_receipt_path(work, repo)
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RepoFailure(
+            repo,
+            "source_quarantine_receipt",
+            f"cannot read {path}: {exc}",
+        ) from exc
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != "cppmega.source_quarantine_receipt_v1"
+    ):
+        raise RepoFailure(
+            repo,
+            "source_quarantine_receipt",
+            f"unexpected receipt schema in {path}: {receipt!r}",
+        )
+    return receipt
 
 
 def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
@@ -1487,6 +1532,7 @@ def process_one_repo(
     *,
     project_id: str,
     promote_dedup_on_success: bool = True,
+    source_quarantine_manifest: Path | None = None,
 ) -> dict:
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
@@ -1496,7 +1542,7 @@ def process_one_repo(
     Any residual row longer than the largest bucket fails the repo before
     publication. Each routed bucket is packed independently and landed at
     outputs/reindexed/<L>/<repo>.parquet. A given doc therefore appears in
-    exactly one bucket -- never replicated across 1024/2048/4096.
+    exactly one bucket -- never replicated across target lengths.
     """
     work = work_root / repo
     project_id = require_project_identity(
@@ -1517,6 +1563,7 @@ def process_one_repo(
                 repo, project_id, repo_dir, work, dedup_db, dedup_near,
                 stage_id, stage_db, global_symbol_index, memory_limit_gb,
                 parse_workers, index_timeout_s, index_stall_timeout_s,
+                source_quarantine_manifest,
             )
         except RepoNoTrainingDocs as exc:
             timings["index_project_s"] = round(time.monotonic() - started, 6)
@@ -1526,6 +1573,11 @@ def process_one_repo(
                 f"no training docs ({exc.reason}): {exc.detail}",
             ) from exc
         timings["index_project_s"] = round(time.monotonic() - started, 6)
+        source_quarantine_receipt = (
+            read_source_quarantine_receipt(work, repo)
+            if source_quarantine_manifest is not None
+            else None
+        )
         started = time.monotonic()
         tok = stage_materialize(
             repo=repo,
@@ -1558,12 +1610,15 @@ def process_one_repo(
             promoted = True
         else:
             success_without_promote = True
-        return {
+        result = {
             "source": "code",
             "lengths": per_length,
             "stage_timings_s": timings,
             "materialize_stats": materialize_stats,
         }
+        if source_quarantine_receipt is not None:
+            result["source_quarantine_receipt"] = source_quarantine_receipt
+        return result
     finally:
         if not promoted and not success_without_promote:
             discard_dedup_stage(dedup_db, stage_id, stage_db)
@@ -1650,8 +1705,12 @@ def process_one_commit_source(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--target-lengths", default="1024,2048,4096",
-                   help="Comma-separated packed lengths (default: 1024,2048,4096).")
+    default_target_lengths = ",".join(str(length) for length in DEFAULT_TARGET_LENGTHS)
+    p.add_argument(
+        "--target-lengths",
+        default=default_target_lengths,
+        help=f"Comma-separated packed lengths (default: {default_target_lengths}).",
+    )
     p.add_argument("--max-repos", type=int, default=None,
                    help="Process at most N repos this run (after resume filtering).")
     p.add_argument("--token-budget", type=int, default=None,
@@ -1693,6 +1752,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=str(DEFAULT_REPO_LIST),
         help="repo_list.json mapping bare extraction names to canonical project "
         f"identities. Default {DEFAULT_REPO_LIST}.",
+    )
+    p.add_argument(
+        "--source-quarantine-manifest",
+        default=str(DEFAULT_SOURCE_QUARANTINE_MANIFEST),
+        help="Exact path+size+SHA manifest for verified non-C++ files stored "
+             "under C/C++ suffixes. Passed to every code indexing subprocess; "
+             f"default {DEFAULT_SOURCE_QUARANTINE_MANIFEST}.",
     )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to index/materialize/"
@@ -1750,6 +1816,19 @@ def main(argv: list[str]) -> int:
     resume = not args.no_resume
     source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
     source_dir_roots = [Path(p) for p in args.source_dir_root]
+    source_quarantine_manifest = (
+        Path(args.source_quarantine_manifest)
+        if args.source_quarantine_manifest
+        else None
+    )
+    if (
+        source_quarantine_manifest is not None
+        and not source_quarantine_manifest.is_file()
+    ):
+        raise SystemExit(
+            "--source-quarantine-manifest not found: "
+            f"{source_quarantine_manifest}"
+        )
     if args.source_cache_only and source_cache_dir is None:
         raise SystemExit("--source-cache-only requires --source-cache-dir")
     if args.source_cache_populate_only and source_cache_dir is None:
@@ -1911,7 +1990,10 @@ def main(argv: list[str]) -> int:
                                             args.parse_workers,
                                             args.code_index_timeout_s,
                                             args.code_index_stall_timeout_s,
-                                            project_id=project_id)
+                                            project_id=project_id,
+                                            source_quarantine_manifest=(
+                                                source_quarantine_manifest
+                                            ))
                     manifest.mark_done(repo, info)
                     run_report[repo] = info
                     processed += 1
