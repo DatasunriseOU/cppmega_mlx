@@ -4295,10 +4295,11 @@ def get_default_compile_args(project_dir: str) -> list[str]:
 def _source_looks_like_cpp(filepath: str) -> bool:
     """Detect legacy C++ compiler tests stored under a ``.c`` suffix."""
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
-            source = source_file.read(1_048_576)
+        with open(filepath, "rb") as source_file:
+            source_bytes = source_file.read(1_048_576)
     except OSError:
         return False
+    source, _source_encoding = _decode_source_bytes(source_bytes, filepath)
     return _CPP_SOURCE_MARKER_RE.search(source) is not None
 
 
@@ -7378,8 +7379,8 @@ def register_header_macros(
         if derived:
             return list(derived)
         try:
-            with open(root_abs, "r", encoding="utf-8", errors="replace") as fh:
-                return [(fh.read(), 1)]
+            root_text, _root_bytes, _root_encoding = _read_source_file(root_abs)
+            return [(root_text, 1)]
         except OSError as exc:
             raise RuntimeError(
                 f"failed to read C/C++ macro root for usage scan: {root_abs}"
@@ -7392,8 +7393,7 @@ def register_header_macros(
             stats["directive_cache_hits"] += 1
             return cached
         try:
-            with open(norm_abs, "r", encoding="utf-8", errors="replace") as fh:
-                file_text = fh.read()
+            file_text, _file_bytes, _file_encoding = _read_source_file(norm_abs)
         except OSError as exc:
             raise RuntimeError(f"failed to read C/C++ file for macro scan: {norm_abs}") from exc
 
@@ -8382,8 +8382,9 @@ def emit_header_documents(
         if not abs_path:
             continue
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                header_text = fh.read()
+            header_text, _header_bytes, _header_encoding = _read_source_file(
+                abs_path
+            )
         except OSError as exc:
             raise RuntimeError(f"failed to read header for macro extraction: {abs_path}") from exc
 
