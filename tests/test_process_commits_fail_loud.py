@@ -320,6 +320,7 @@ def test_pr_lookup_filters_stale_rows_by_exact_scan_id(tmp_path: Path) -> None:
         str(store),
         None,
         scan_id="a" * 64,
+        owner_repo="owner/repo",
     )
     try:
         current = {"repo": "owner/repo", "commit_hash": "current-sha"}

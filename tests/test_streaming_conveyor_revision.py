@@ -131,7 +131,27 @@ def _write_pr_completion_fixture(
     repo_list = tmp_path / "repo_list.json"
     receipt_path = tmp_path / "pr_completion.json"
     pr_store.write_bytes(b"immutable sqlite fixture")
-    repo_list.write_text('{"repos":["owner/repo"]}\n', encoding="utf-8")
+    repo_list.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "repos": [
+                    {
+                        "bare_name": "repo",
+                        "project_identity": "owner/repo",
+                        "owner_repo": "owner/repo",
+                    }
+                ],
+                "by_bare_name": {"repo": "owner/repo"},
+                "project_identities": ["owner/repo"],
+                "repo_names": ["owner/repo"],
+                "unresolved": [],
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     def sha256(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -149,7 +169,9 @@ def _write_pr_completion_fixture(
                     "path": str(repo_list.resolve()),
                     "sha256": sha256(repo_list),
                 },
-                "expected_repos_sha256": "a" * 64,
+                "expected_repos_sha256": hashlib.sha256(
+                    b'["owner/repo"]'
+                ).hexdigest(),
                 "scan_id": "1" * 64,
                 "expected_repo_count": 1,
                 "declared_pr_count": 7,
@@ -193,7 +215,9 @@ def test_pr_completion_binding_hashes_explicit_store_and_repo_list(
         "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "pr_store_sha256": hashlib.sha256(pr_store.read_bytes()).hexdigest(),
         "repo_list_sha256": hashlib.sha256(repo_list.read_bytes()).hexdigest(),
-        "expected_repos_sha256": "a" * 64,
+        "expected_repos_sha256": hashlib.sha256(
+            b'["owner/repo"]'
+        ).hexdigest(),
         "scan_id": "1" * 64,
         "expected_repo_count": 1,
         "stored_pr_count": 7,
@@ -343,7 +367,8 @@ def test_commit_stream_requires_explicit_verified_pr_inputs() -> None:
         SystemExit,
         match=(
             r"commits/both/all requires explicit immutable PR inputs: "
-            r"--pr-store, --repo-list, --pr-completion-receipt"
+            r"--repo-list, --pr-store, --pr-repo-list, "
+            r"--pr-completion-receipt"
         ),
     ):
         sc.main(["--streams", "commits"])

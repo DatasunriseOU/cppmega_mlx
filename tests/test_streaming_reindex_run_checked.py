@@ -336,15 +336,12 @@ def test_commit_range_materializes_short_repo_with_repo_list_identity(tmp_path) 
     ]
 
 
-def test_commit_range_materialize_rejects_unresolved_short_repo(tmp_path) -> None:
+def test_commit_range_requires_frozen_project_identity(tmp_path) -> None:
     from scripts import streaming_reindex_commits
 
-    repo_list = tmp_path / "repo_list.json"
-    repo_list.write_text(json.dumps({"repos": []}), encoding="utf-8")
-
     with pytest.raises(
-        streaming_reindex_commits.sr.SymbolIdentityError,
-        match="no canonical project identity for bare repo 's2n-tls'",
+        streaming_reindex_commits.RepoFailure,
+        match="already-resolved project_id",
     ):
         streaming_reindex_commits.process_range(
             repo="s2n-tls",
@@ -354,7 +351,6 @@ def test_commit_range_materialize_rejects_unresolved_short_repo(tmp_path) -> Non
             end_idx=1,
             lengths_sorted=(1024,),
             repo_work=tmp_path / "work",
-            repo_list=repo_list,
         )
 
     assert not (tmp_path / "work").exists()

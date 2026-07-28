@@ -91,7 +91,7 @@ def test_unmapped_code_repo_is_quarantined_without_blocking_next_submission(
 
     assert not streaming_conveyor.claim_code_repo_for_submission(
         repo="unmapped archive",
-        repo_list=repo_list,
+        project_id_by_repo={"public-repo": "tests/public-repo"},
         project_identity_claims=claims,
         manifest=manifest,
         manifest_lock=lock,
@@ -102,7 +102,7 @@ def test_unmapped_code_repo_is_quarantined_without_blocking_next_submission(
 
     assert streaming_conveyor.claim_code_repo_for_submission(
         repo="public-repo",
-        repo_list=repo_list,
+        project_id_by_repo={"public-repo": "tests/public-repo"},
         project_identity_claims=claims,
         manifest=manifest,
         manifest_lock=lock,
@@ -121,8 +121,7 @@ def test_unmapped_code_repo_is_quarantined_without_blocking_next_submission(
     assert events[0]["stream"] == "code"
     assert events[0]["stage"] == "project_identity"
     assert events[0]["detail"] == (
-        f"{repo_list}: no canonical project identity for bare repo "
-        "'unmapped archive'"
+        "source repo list has no mapping for archive repo 'unmapped archive'"
     )
 
 
@@ -449,7 +448,14 @@ def test_empty_after_dedup_commit_range_counts_as_done_interval(tmp_path):
     import streaming_conveyor
     import streaming_reindex_commits
 
-    info = streaming_reindex_commits.empty_after_dedup_info("repo", 500, 750, 250)
+    info = streaming_reindex_commits.empty_after_dedup_info(
+        "repo",
+        500,
+        750,
+        250,
+        project_id="tests/repo",
+        pr_eligible=False,
+    )
     manifest = streaming_conveyor.Manifest(
         path=tmp_path / "_done.json",
         done={
@@ -486,7 +492,8 @@ def test_process_range_adaptive_splits_peak_oom(tmp_path):
         dedup_db,
         dedup_near,
         pr_store,
-        repo_list,
+        project_id,
+        pr_owner_repo,
         memory_limit_gb,
         analysis_cache_entries,
     ):
@@ -515,6 +522,7 @@ def test_process_range_adaptive_splits_peak_oom(tmp_path):
         None,
         False,
         None,
+        "tests/repo",
         None,
         8.0,
         analysis_cache_entries=37,
@@ -932,7 +940,8 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=_repo_identity_map(tmp_path),
+            project_id="tests/repo",
+            pr_owner_repo=None,
         )
 
     assert (done, failed, all_done) == (0, 0, True)
@@ -943,6 +952,8 @@ def test_run_commits_half_skips_extract_when_manifest_proves_complete(tmp_path):
         "completion_proof": "commit_plan_exact_range_coverage",
         "n_records": 612,
         "range_count": 2,
+        "project_id": None,
+        "pr_eligible": False,
     }
     assert "repo::commits" not in manifest.failed
 
@@ -996,7 +1007,8 @@ def test_process_one_repo_cleans_partial_intermediates_by_default(tmp_path, monk
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=_repo_identity_map(tmp_path),
+            project_id="tests/repo",
+            pr_owner_repo=None,
             streams="both",
         )
 
@@ -1035,8 +1047,11 @@ def test_process_one_repo_records_unresolved_project_identity_without_aborting_p
         ),
     )
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        result = streaming_conveyor.process_one_repo(
+    with ThreadPoolExecutor(max_workers=1) as pool, pytest.raises(
+        streaming_conveyor.RepoFailure,
+        match="must contain exactly one slash",
+    ):
+        streaming_conveyor.process_one_repo(
             repo=repo,
             repo_dir=repo_dir,
             lengths_code=(1024,),
@@ -1054,13 +1069,13 @@ def test_process_one_repo_records_unresolved_project_identity_without_aborting_p
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=tmp_path / "repo_list.json",
+            project_id=repo,
+            pr_owner_repo=None,
             streams="code",
         )
 
     assert not called
-    assert result["code"] == "failed"
-    assert manifest.failed[f"{repo}::code"]["stage"] == "project_identity"
+    assert not manifest.done
 
 
 def test_discover_existing_jsonl_never_adopts_unvalidated_stable_cache(
@@ -1192,7 +1207,8 @@ def test_process_one_repo_retains_transactional_extract_checkpoint(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=_repo_identity_map(tmp_path),
+            project_id="tests/repo",
+            pr_owner_repo=None,
             streams="both",
         )
 
@@ -1250,7 +1266,8 @@ def test_process_one_repo_can_retain_partial_work_for_zero_rework_resume(
             dedup_db=None,
             dedup_near=False,
             pr_store=None,
-            repo_list=_repo_identity_map(tmp_path),
+            project_id="tests/repo",
+            pr_owner_repo=None,
             streams="both",
             retain_partial_work=True,
         )
@@ -1312,7 +1329,8 @@ def test_process_one_repo_interrupted_keeps_extract_cache_without_temp(
                 dedup_db=None,
                 dedup_near=False,
                 pr_store=None,
-                repo_list=_repo_identity_map(tmp_path),
+                project_id="tests/repo",
+                pr_owner_repo=None,
                 streams="both",
                 retain_partial_work=False,
             )
@@ -1360,7 +1378,8 @@ def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
         range_dedup_db,
         _dedup_near,
         _pr_store,
-        _repo_list,
+        _project_id,
+        _pr_owner_repo,
         _memory_limit_gb,
         _analysis_cache_entries,
         **kwargs,
@@ -1424,7 +1443,8 @@ def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
             dedup_db=db,
             dedup_near=False,
             pr_store=None,
-            repo_list=None,
+            project_id="tests/repo",
+            pr_owner_repo=None,
             progress=progress,
             range_target_bytes=0,
             dedup_promote_batch_size=2,
@@ -1443,6 +1463,8 @@ def test_run_commits_half_batches_deferred_dedup_promotions(tmp_path):
         "completion_proof": "commit_plan_exact_range_coverage",
         "n_records": 3,
         "range_count": 3,
+        "project_id": "tests/repo",
+        "pr_eligible": False,
     }
     assert "repo::commits" not in manifest.failed
     assert len(observed_kwargs) == 3
@@ -1730,6 +1752,8 @@ def test_should_stage_repo_skips_manifest_proven_complete_both_streams(tmp_path)
         "completion_proof": "commit_plan_exact_range_coverage",
         "n_records": 612,
         "range_count": 2,
+        "project_id": None,
+        "pr_eligible": False,
     }
     assert "repo::commits" not in manifest.failed
     assert streaming_conveyor.should_stage_repo_from_manifest(
