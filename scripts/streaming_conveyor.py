@@ -61,6 +61,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -131,6 +132,9 @@ DEFAULT_MIN_FREE_DISK_GB = 50.0
 
 CODE_REVISION_SCHEMA_VERSION = 2
 CODE_REVISION_PRODUCER_ROLE = "canonical_source_conveyor"
+# GitHub repository/component slug. The separate CI tokenizer receipt keeps its
+# historical "cppmega.mlx" producer identity; cross-repository resumes compare
+# this slug exactly and therefore fail closed instead of treating them as aliases.
 CODE_REVISION_REPOSITORY_IDENTITY = "cppmega_mlx"
 CODE_REVISION_DRIFT_MARKER = "CPPMEGA_CODE_REVISION_DRIFT"
 CODE_REVISION_DRIFT_EXIT_CODE = 86
@@ -178,6 +182,16 @@ import clang.cindex as cindex
 cindex.Index.create()
 print(cindex.__file__)
 """
+
+
+def _handle_source_stream_read_error(
+    error: tarfile.ReadError,
+    *,
+    interrupted: bool,
+) -> None:
+    if not interrupted:
+        raise error
+    _log(f"Source stream closed after checkpoint signal: {error}")
 
 
 class CodeRevisionError(RuntimeError):
@@ -5537,6 +5551,8 @@ def main(argv: list[str]) -> int:
 
             while inflight:
                 drain_one_or_more(block=True)
+    except tarfile.ReadError as exc:
+        _handle_source_stream_read_error(exc, interrupted=STOP_EVENT.is_set())
     finally:
         recompress_error: Exception | None = None
         if repo_pool is not None:

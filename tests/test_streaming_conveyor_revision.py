@@ -5,11 +5,21 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from scripts import streaming_conveyor as sc
+
+
+def test_source_stream_read_error_is_only_suppressed_after_checkpoint_signal() -> None:
+    error = tarfile.ReadError("unexpected end of data")
+
+    with pytest.raises(tarfile.ReadError, match="unexpected end of data"):
+        sc._handle_source_stream_read_error(error, interrupted=False)
+
+    sc._handle_source_stream_read_error(error, interrupted=True)
 
 
 def _git(repo: Path, *args: str) -> str:
