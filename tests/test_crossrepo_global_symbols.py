@@ -148,6 +148,7 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
     db = str(tmp_path / "location.sqlite")
     store = b.GlobalSymbolStore(db)
     repository_path = "third_party/SDL iOS Application/boost/route.hpp"
+    include_provenance = "boost/route.hpp"
     symbol_key = b.ip.canonical_symbol_identity(
         qname="boost::route",
         kind="FUNCTION_DECL",
@@ -175,7 +176,7 @@ def test_store_accepts_explicit_repo_file_location_identity(tmp_path: Path) -> N
                 symbol_key=symbol_key,
                 symbol_kind="FUNCTION_DECL",
                 provider="boost",
-                include_provenance=repository_path,
+                include_provenance=include_provenance,
             )
         ]
     )
@@ -234,7 +235,7 @@ def test_store_rejects_padded_repo_file_location_identity(
                         symbol_key=symbol_key,
                         symbol_kind="FUNCTION_DECL",
                         provider="boost",
-                        include_provenance=repository_path,
+                        include_provenance="boost/route.hpp",
                     )
                 ]
             )
