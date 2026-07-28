@@ -285,6 +285,68 @@ def test_unknown_external_without_usr_or_signature_fails_closed(
             )
 
 
+def test_unknown_external_graph_reference_is_omitted_with_receipt(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    cursor = _fallback_cursor(Path("/usr/local/include/openssl/kdf.h"))
+    omissions: ip.ExternalReferenceOmissions = {}
+
+    with pytest.raises(ip.SymbolIdentityError, match="stable provider identity"):
+        ip.symbol_reference_for_cursor(
+            cursor,
+            project_dir=str(project_dir),
+            project_id="aws/s2n-tls",
+            fallback_file="src/kdf.c",
+        )
+
+    assert (
+        ip._optional_symbol_reference_for_cursor(
+            cursor,
+            relation="call",
+            omissions=omissions,
+            project_dir=str(project_dir),
+            project_id="aws/s2n-tls",
+            fallback_file="src/kdf.c",
+        )
+        is None
+    )
+    summary = ip._external_reference_omission_summary(omissions)
+    assert summary["schema"] == "cppmega.external_reference_omissions_v1"
+    assert summary["status"] == "complete"
+    assert summary["reason"] == "unknown_external_provider"
+    assert summary["observation_count"] == 1
+    assert summary["unique_reference_count"] == 1
+    assert summary["location_count"] == 1
+    location = summary["locations"][0]
+    assert location["relation"] == "call"
+    assert location["symbol_kind"] == "FUNCTION_DECL"
+    assert location["observed_path"] == "/usr/local/include/openssl/kdf.h"
+    assert location["observations"] == 1
+    assert location["unique_qname_count"] == 1
+    assert location["qname_examples"] == ["api::route"]
+    assert location["qname_examples_truncated"] is False
+
+
+def test_optional_external_reference_does_not_swallow_other_identity_errors(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "repo"
+    project_dir.mkdir()
+    cursor = _fallback_cursor(project_dir / "route.hpp")
+
+    with pytest.raises(ip.SymbolIdentityError):
+        ip._optional_symbol_reference_for_cursor(
+            cursor,
+            relation="call",
+            omissions={},
+            project_dir=str(project_dir),
+            project_id="not-a-canonical-project",
+            fallback_file="route.hpp",
+        )
+
+
 def test_provider_location_identity_is_checkout_independent(tmp_path: Path) -> None:
     project_dir = tmp_path / "repo"
     project_dir.mkdir()
