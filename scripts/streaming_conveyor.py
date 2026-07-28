@@ -13,7 +13,8 @@ Per repo, in ONE pass over the ``.git``-preserving tar stream:
     -> CODE pipeline (streaming_reindex.process_one_repo):
          index_project.py --enriched [C/C++ + build files]
            -> clang_enriched_to_parquet (tokenize @65536, materialize)
-           -> route_by_fit (--target-lengths-code, default 1024,2048,4096)
+           -> route_by_fit (--target-lengths-code,
+              default 1024,2048,4096,8192,16384)
            -> pack_enriched_rows per bucket
            -> outputs/reindexed/<L>/<repo>.parquet   (recompressed zstd-max)
        The SHARED --dedup-db is threaded in (function-level tokenized-hash exact
@@ -111,7 +112,7 @@ DEFAULT_DEDUP_DB = MLX_ROOT / "outputs" / "dedup_seen.sqlite"
 DEFAULT_PR_STORE = MLX_ROOT / "outputs" / "pr_ingest" / "prs.sqlite"
 DEFAULT_REPO_LIST = MLX_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
-DEFAULT_TARGET_LENGTHS_CODE = (1024, 2048, 4096)
+DEFAULT_TARGET_LENGTHS_CODE = (1024, 2048, 4096, 8192, 16384)
 DEFAULT_TARGET_LENGTHS_COMMITS = (1024, 2048, 4096, 8192, 16384)
 DEFAULT_TARGET_LENGTHS_CI = (1024, 2048, 4096, 8192, 16384)
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
@@ -3116,6 +3117,7 @@ def run_code_half(
     index_stall_timeout_s: int | None = None,
     recompressor: BackgroundRecompressor | None = None,
     revision_guard: CodeRevisionGuard | None = None,
+    source_quarantine_manifest: Path | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -3138,6 +3140,7 @@ def run_code_half(
                 index_stall_timeout_s,
                 project_id=project_id,
                 promote_dedup_on_success=False,
+                source_quarantine_manifest=source_quarantine_manifest,
             )
         except RepoFailure as exc:
             _raise_if_revision_subprocess_failure(exc)
@@ -3320,6 +3323,7 @@ def run_code_half_adaptive(
     runner: CodeRunner | None = None,
     recompressor: BackgroundRecompressor | None = None,
     revision_guard: CodeRevisionGuard | None = None,
+    source_quarantine_manifest: Path | None = None,
 ) -> dict:
     """Run the code half, retrying index_project peaks/stalls with one parser.
 
@@ -3348,7 +3352,11 @@ def run_code_half_adaptive(
             recompressor,
         )
         if active_runner is run_code_half:
-            return active_runner(*args, revision_guard=revision_guard)
+            return active_runner(
+                *args,
+                revision_guard=revision_guard,
+                source_quarantine_manifest=source_quarantine_manifest,
+            )
         return active_runner(*args)
 
     try:
@@ -4238,6 +4246,7 @@ def process_one_repo(
     retain_partial_work: bool = False,
     revision_guard: CodeRevisionGuard | None = None,
     pr_scan_id: str | None = None,
+    source_quarantine_manifest: Path | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -4352,6 +4361,9 @@ def process_one_repo(
                             code_index_stall_timeout_s,
                             recompressor=code_recompressor,
                             revision_guard=revision_guard,
+                            source_quarantine_manifest=(
+                                source_quarantine_manifest
+                            ),
                         )
                         if cinfo.get("skipped"):
                             with manifest_lock:
@@ -4507,8 +4519,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--target-lengths-code", default="1024,2048,4096",
-                   help="Route-by-fit ladder for CODE (default 1024,2048,4096).")
+    default_code_lengths = ",".join(
+        str(length) for length in DEFAULT_TARGET_LENGTHS_CODE
+    )
+    p.add_argument(
+        "--target-lengths-code",
+        default=default_code_lengths,
+        help=f"Route-by-fit ladder for CODE (default {default_code_lengths}).",
+    )
     p.add_argument("--target-lengths-commits", default="1024,2048,4096,8192,16384",
                    help="Route-by-fit ladder for COMMITS "
                         "(default 1024,2048,4096,8192,16384).")
@@ -4646,6 +4664,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Explicit repo_list.json for resolving PR-store keys. Required for "
              "commits/both/all together with --pr-completion-receipt.",
+    )
+    p.add_argument(
+        "--source-quarantine-manifest",
+        default=str(sr.DEFAULT_SOURCE_QUARANTINE_MANIFEST),
+        help="Exact path+size+SHA manifest for verified non-C++ files stored "
+             "under C/C++ suffixes. Passed to every CODE indexer; "
+             f"default {sr.DEFAULT_SOURCE_QUARANTINE_MANIFEST}.",
     )
     p.add_argument(
         "--pr-completion-receipt",
@@ -4939,6 +4964,19 @@ def main(argv: list[str]) -> int:
     )
     source_cache_dir = Path(args.source_cache_dir) if args.source_cache_dir else None
     source_dir_roots = [Path(p) for p in args.source_dir_root]
+    source_quarantine_manifest = (
+        Path(args.source_quarantine_manifest).expanduser().resolve()
+        if args.source_quarantine_manifest
+        else None
+    )
+    if (
+        source_quarantine_manifest is not None
+        and not source_quarantine_manifest.is_file()
+    ):
+        raise SystemExit(
+            "--source-quarantine-manifest not found: "
+            f"{source_quarantine_manifest}"
+        )
     if args.source_cache_only and source_cache_dir is None:
         raise SystemExit("--source-cache-only requires --source-cache-dir")
     if args.source_cache_populate_only and source_cache_dir is None:
@@ -5375,6 +5413,7 @@ def main(argv: list[str]) -> int:
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
                     pr_scan_id=pr_scan_id,
+                    source_quarantine_manifest=source_quarantine_manifest,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -5484,6 +5523,7 @@ def main(argv: list[str]) -> int:
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
                     pr_scan_id=pr_scan_id,
+                    source_quarantine_manifest=source_quarantine_manifest,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
