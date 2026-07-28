@@ -141,6 +141,7 @@ def _training_implementation() -> dict[str, Any]:
 
 
 def _artifact_records(root: Path) -> list[dict[str, object]]:
+    excluded = {root / "manifest.json", root / "restore_receipt.json"}
     return [
         {
             "path": path.relative_to(root).as_posix(),
@@ -148,7 +149,7 @@ def _artifact_records(root: Path) -> list[dict[str, object]]:
             "sha256": _sha256(path),
         }
         for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name not in {"manifest.json", "restore_receipt.json"}
+        if path.is_file() and path not in excluded
     ]
 
 
@@ -157,6 +158,192 @@ def _artifact_set_sha256(records: list[dict[str, object]]) -> str:
     return hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _write_source_composition_provenance(root: Path) -> dict[str, object]:
+    provenance = root / "provenance" / "source_composition"
+    provenance.mkdir(parents=True, exist_ok=True)
+
+    def write(name: str, payload: object) -> dict[str, object]:
+        path = provenance / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, bytes):
+            path.write_bytes(payload)
+        else:
+            _write_json(path, payload)
+        return {
+            "path": path.relative_to(root).as_posix(),
+            "size_bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+
+    plan = write(
+        "plan.json",
+        {
+            "schema": "cppmega_source_conveyor_composition_plan_v1",
+            "runs": [{"run_id": "full"}],
+            "dedup_receipt": "/fixture/global_dedup_receipt.json",
+        },
+    )
+    verifier = write("verify_global_dedup_store.py", b"# fixture verifier\n")
+    dedup_payload = {
+        "schema": "cppmega_global_dedup_store_receipt_v1",
+        "status": "verified",
+        "created_at": "2026-07-28T00:00:00Z",
+        "database": {
+            "path": "/fixture/dedup.sqlite",
+            "size_bytes": 1,
+            "sha256": "1" * 64,
+        },
+        "checkpoint": {
+            "mode": "TRUNCATE",
+            "busy": 0,
+            "log_frames": 0,
+            "checkpointed_frames": 0,
+            "wal_size_bytes": 0,
+        },
+        "integrity_check": "ok",
+        "sqlite_schema_sha256": "2" * 64,
+        "logical_hash_algorithm": "cppmega_sqlite_rows_lenprefixed_v1",
+        "logical_sha256": "3" * 64,
+        "tables": {
+            name: {
+                "rows": (0 if name.endswith("_stage") or name == "dedup_stages" else 1),
+                "logical_sha256": hashlib.sha256(b"").hexdigest(),
+            }
+            for name in (
+                "exact",
+                "lsh",
+                "minhash",
+                "dedup_meta",
+                "chunk_claims",
+                "dedup_stages",
+                "exact_stage",
+                "minhash_stage",
+                "lsh_stage",
+                "chunk_claims_stage",
+            )
+        },
+        "policy": {
+            "exact": "sha1_token_ids_v1",
+            "chunk": "tokenized_chunk_claims_v1",
+            "near": {
+                "enabled": True,
+                "threshold": 0.7,
+                "num_perm": 256,
+                "shingle_k": 5,
+            },
+        },
+        "verifier": {
+            "repository_identity": "cppmega",
+            "script": "scripts/data/verify_global_dedup_store.py",
+            "script_sha256": verifier["sha256"],
+        },
+    }
+    dedup = write("global_dedup_receipt.json", dedup_payload)
+    inputs = {
+        "archive_sha256_receipt": write(
+            "runs/full/archive_sha256_receipt.json", {"fixture": "archive"}
+        ),
+        "archive_inventory_receipt": write(
+            "runs/full/archive_inventory.json", {"fixture": "inventory"}
+        ),
+        "repo_list": write("runs/full/repo_list.json", {"fixture": "repos"}),
+        "source_quarantine_manifest": write(
+            "runs/full/source_quarantine_manifest.json",
+            {"fixture": "quarantine"},
+        ),
+        "tokenizer": write("runs/full/tokenizer.json", {"fixture": "tokenizer"}),
+    }
+    run_artifacts = {
+        "launch": write("runs/full/launch.json", {"fixture": "launch"}),
+        "exit": write("runs/full/exit.json", {"fixture": "exit"}),
+        "manifest": write("runs/full/manifest.json", {"fixture": "manifest"}),
+        "archive_sha256_receipt": inputs["archive_sha256_receipt"],
+        "archive_inventory": inputs["archive_inventory_receipt"],
+        "repo_list": inputs["repo_list"],
+        "source_quarantine_manifest": inputs["source_quarantine_manifest"],
+        "tokenizer": inputs["tokenizer"],
+    }
+    producer = {
+        "cppmega": {"commit": "a" * 40, "tree_sha256": "b" * 64},
+        "clang_indexer": {
+            "source_sha256": "c" * 64,
+            "dependency_closure_sha256": "d" * 64,
+        },
+    }
+    portable_dedup = dict(dedup_payload)
+    portable_database = dict(dedup_payload["database"])
+    portable_database.pop("path")
+    portable_dedup["database"] = portable_database
+    portable_dedup["receipt_sha256"] = dedup["sha256"]
+    repository_set_sha256 = _canonical_sha256(["repo"])
+    run_receipt = {
+        "run_id": "full",
+        "launch": {
+            "schema": "cppmega.canonical_source_launch_v1",
+            "sha256": run_artifacts["launch"]["sha256"],
+        },
+        "exit": {
+            "schema": "cppmega.canonical_source_exit_v1",
+            "sha256": run_artifacts["exit"]["sha256"],
+            "exit_code": 0,
+        },
+        "manifest": {
+            "sha256": run_artifacts["manifest"]["sha256"],
+            "done_units": 2,
+            "failed_units": 0,
+            "done_unit_set_sha256": "4" * 64,
+            "failed_unit_set_sha256": "5" * 64,
+        },
+        "streams": "both",
+        "selected_repositories": [],
+        "terminal_repositories": ["repo"],
+        "terminal_repository_set_sha256": repository_set_sha256,
+        "input_artifacts": {
+            name: descriptor["sha256"] for name, descriptor in inputs.items()
+        },
+        "code_revision": producer,
+        "allowlist_counts": {f"code/{_BUCKET}": 1, f"commits/{_BUCKET}": 1},
+    }
+    receipt_payload = {
+        "schema": "cppmega_source_conveyor_composition_v1",
+        "status": "complete",
+        "plan_sha256": plan["sha256"],
+        "buckets": [_BUCKET],
+        "archive": {
+            "repository_count": 1,
+            "repository_names_sha256": repository_set_sha256,
+            "input_binding_sha256": "8" * 64,
+            "archive_identity_sha256": "9" * 64,
+        },
+        "dedup": portable_dedup,
+        "runs": [run_receipt],
+        "source_producers": [producer],
+        "source_producer_set_sha256": _canonical_sha256([producer]),
+        "coverage": {
+            "expected_repositories": 1,
+            "code_success_repositories": 1,
+            "commit_success_repositories": 1,
+            "failed_repositories_observed": 0,
+            "failed_units_observed": 0,
+            "unresolved_failed_units": 0,
+            "repository_set_sha256": repository_set_sha256,
+            "allowlist_counts": {
+                f"code/{_BUCKET}": 1,
+                f"commits/{_BUCKET}": 1,
+            },
+        },
+    }
+    receipt = write("receipt.json", receipt_payload)
+    return {
+        "schema": receipt_payload["schema"],
+        "receipt": {key: receipt[key] for key in ("path", "sha256")},
+        "plan": {key: plan[key] for key in ("path", "sha256")},
+        "dedup_receipt": {key: dedup[key] for key in ("path", "sha256")},
+        "dedup_verifier": {key: verifier[key] for key in ("path", "sha256")},
+        "runs": [{"run_id": "full", "artifacts": run_artifacts}],
+    }
 
 
 def _write_mmididx(prefix: Path, tokens: np.ndarray) -> None:
@@ -540,11 +727,12 @@ def _build_bundle(
         }
         for path in sorted(tokenizer_root.iterdir())
     ]
+    source_composition = _write_source_composition_provenance(root)
     artifacts = _artifact_records(root)
     artifact_set_sha256 = _artifact_set_sha256(artifacts)
     bundle_id = f"fixture-bundle-{artifact_set_sha256[:16]}"
     manifest = {
-        "schema": "cppmega_megatron_bundle_v2",
+        "schema": "cppmega_megatron_bundle_v3",
         "bundle_id": bundle_id,
         "implementation": _producer_implementation(),
         "tokenizer_contract": "megacpp-vocab-65536",
@@ -572,6 +760,7 @@ def _build_bundle(
             },
         },
         "training_contract": "objective_materialized",
+        "known_limitations": [],
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": {str(_BUCKET): objective_descriptor},
@@ -581,6 +770,7 @@ def _build_bundle(
             "manifest": source_manifest_path.relative_to(root).as_posix(),
             "repaired_manifest": repaired_manifest_path.relative_to(root).as_posix(),
             "local_snapshot_retained": False,
+            "source_composition": source_composition,
         },
         "buckets": [_BUCKET],
         "bucket_results": [
@@ -673,6 +863,22 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert dataset.metadata.storage_bucket == _STORAGE_BUCKET
     assert dataset.metadata.training_contract == "objective_materialized"
     assert dataset.metadata.source_snapshot_artifact_set_sha256
+    source_composition = json.loads(
+        (fixture.root / "manifest.json").read_text(encoding="utf-8")
+    )["source_snapshot"]["source_composition"]
+    source_receipt = fixture.root / source_composition["receipt"]["path"]
+    dedup_receipt = fixture.root / source_composition["dedup_receipt"]["path"]
+    source_payload = json.loads(source_receipt.read_text(encoding="utf-8"))
+    dedup_payload = json.loads(dedup_receipt.read_text(encoding="utf-8"))
+    assert dataset.metadata.source_composition_receipt_sha256 == _sha256(source_receipt)
+    assert (
+        dataset.metadata.source_producer_set_sha256
+        == source_payload["source_producer_set_sha256"]
+    )
+    assert dataset.metadata.global_dedup_receipt_sha256 == _sha256(dedup_receipt)
+    assert (
+        dataset.metadata.global_dedup_logical_sha256 == dedup_payload["logical_sha256"]
+    )
     assert dataset.metadata.objective_contract_sha256
     assert dataset.metadata.objective_artifact_set_sha256
     assert dataset.metadata.tokenizer_contract_sha256 == TOKENIZER_CONTRACT_SHA256
@@ -690,13 +896,99 @@ def test_legacy_objective_artifact_shape_requires_regeneration() -> None:
         )
 
 
-def test_v1_bundle_schema_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "legacy_schema",
+    ["cppmega_megatron_bundle_v1", "cppmega_megatron_bundle_v2"],
+)
+def test_legacy_bundle_schema_is_rejected(
+    tmp_path: Path,
+    legacy_schema: str,
+) -> None:
     fixture = _build_bundle(tmp_path)
     manifest_path = fixture.root / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["schema"] = "cppmega_megatron_bundle_v1"
+    manifest["schema"] = legacy_schema
 
     with pytest.raises(ValueError, match="unsupported production bundle schema"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
+def test_bundle_without_source_composition_is_rejected(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    del manifest["source_snapshot"]["source_composition"]
+
+    with pytest.raises(ValueError, match="source_snapshot.source_composition"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
+def test_incomplete_source_composition_coverage_is_rejected(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    descriptor = manifest["source_snapshot"]["source_composition"]
+    receipt_path = fixture.root / descriptor["receipt"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["coverage"]["code_success_repositories"] = 0
+    _write_json(receipt_path, receipt)
+    descriptor["receipt"]["sha256"] = _sha256(receipt_path)
+
+    with pytest.raises(ValueError, match="full repository coverage"):
+        production_bundle._validate_source_composition(
+            fixture.root,
+            manifest,
+            {str(record["path"]): record for record in manifest["artifacts"]},
+        )
+
+
+def test_weakened_source_composition_near_dedup_is_rejected(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    descriptor = manifest["source_snapshot"]["source_composition"]
+    dedup_path = fixture.root / descriptor["dedup_receipt"]["path"]
+    dedup = json.loads(dedup_path.read_text(encoding="utf-8"))
+    dedup["policy"]["near"]["enabled"] = False
+    _write_json(dedup_path, dedup)
+    descriptor["dedup_receipt"]["sha256"] = _sha256(dedup_path)
+
+    receipt_path = fixture.root / descriptor["receipt"]["path"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    portable_dedup = dict(dedup)
+    portable_database = dict(dedup["database"])
+    portable_database.pop("path")
+    portable_dedup["database"] = portable_database
+    portable_dedup["receipt_sha256"] = _sha256(dedup_path)
+    receipt["dedup"] = portable_dedup
+    _write_json(receipt_path, receipt)
+    descriptor["receipt"]["sha256"] = _sha256(receipt_path)
+
+    with pytest.raises(ValueError, match=r"exact\+near policy drifted"):
+        production_bundle._validate_source_composition(
+            fixture.root,
+            manifest,
+            {str(record["path"]): record for record in manifest["artifacts"]},
+        )
+
+
+def test_nonempty_bundle_known_limitations_are_rejected(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["known_limitations"] = ["source coverage incomplete"]
+
+    with pytest.raises(ValueError, match="known_limitations must be empty"):
         production_bundle._validate_logical_manifest(
             fixture.root,
             manifest,

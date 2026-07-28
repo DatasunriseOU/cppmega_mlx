@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
 
 
-_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v2"
+_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v3"
 _BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 _PREFIX_TOKENIZER_CONTRACT = "megacpp"
 _EXPECTED_VOCAB_SIZE = 65536
@@ -98,6 +98,46 @@ _CASE5_SCHEMA = "case5_domain_routes_v1"
 _SOURCE_IDENTITY_REGISTRY_SCHEMA = "cppmega_source_identity_registry_v1"
 _RESTORE_RECEIPT_SCHEMA = "cppmega_megatron_restore_receipt_v1"
 _RESTORE_BINDING_SCHEMA = "cppmega_case6_receipt_binding_v2"
+_SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
+_GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
+_SOURCE_FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
+_SOURCE_FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
+_SOURCE_TARGETED_LAUNCH_SCHEMA = (
+    "cppmega.canonical_source_targeted_retry_launch_v1"
+)
+_SOURCE_TARGETED_EXIT_SCHEMA = (
+    "cppmega.canonical_source_targeted_retry_exit_v1"
+)
+_SOURCE_EXIT_SCHEMA_BY_LAUNCH = {
+    _SOURCE_FULL_LAUNCH_SCHEMA: _SOURCE_FULL_EXIT_SCHEMA,
+    _SOURCE_TARGETED_LAUNCH_SCHEMA: _SOURCE_TARGETED_EXIT_SCHEMA,
+}
+_GLOBAL_DEDUP_TABLES = frozenset(
+    {
+        "exact",
+        "lsh",
+        "minhash",
+        "dedup_meta",
+        "chunk_claims",
+        "dedup_stages",
+        "exact_stage",
+        "minhash_stage",
+        "lsh_stage",
+        "chunk_claims_stage",
+    }
+)
+_SOURCE_COMPOSITION_RUN_ARTIFACTS = frozenset(
+    {
+        "launch",
+        "exit",
+        "manifest",
+        "archive_sha256_receipt",
+        "archive_inventory",
+        "repo_list",
+        "source_quarantine_manifest",
+        "tokenizer",
+    }
+)
 _NO_CHECKPOINT_SHA256 = hashlib.sha256(b"cppmega:no-checkpoint:v1").hexdigest()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -179,6 +219,10 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
     source_snapshot_artifact_set_sha256: str = ""
     source_manifest_sha256: str = ""
     repaired_source_manifest_sha256: str = ""
+    source_composition_receipt_sha256: str = ""
+    source_producer_set_sha256: str = ""
+    global_dedup_receipt_sha256: str = ""
+    global_dedup_logical_sha256: str = ""
     objective_contract_sha256: str = ""
     objective_contract_file_sha256: str = ""
     objective_artifact_set_sha256: str = ""
@@ -210,6 +254,10 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             "source_snapshot_artifact_set_sha256",
             "source_manifest_sha256",
             "repaired_source_manifest_sha256",
+            "source_composition_receipt_sha256",
+            "source_producer_set_sha256",
+            "global_dedup_receipt_sha256",
+            "global_dedup_logical_sha256",
             "objective_contract_sha256",
             "objective_contract_file_sha256",
             "objective_artifact_set_sha256",
@@ -240,6 +288,12 @@ class ProductionMegatronDatasetMetadata(TokenDatasetMetadata):
             ),
             "source_manifest_sha256": self.source_manifest_sha256,
             "repaired_source_manifest_sha256": (self.repaired_source_manifest_sha256),
+            "source_composition_receipt_sha256": (
+                self.source_composition_receipt_sha256
+            ),
+            "source_producer_set_sha256": self.source_producer_set_sha256,
+            "global_dedup_receipt_sha256": self.global_dedup_receipt_sha256,
+            "global_dedup_logical_sha256": self.global_dedup_logical_sha256,
             "objective_contract_sha256": self.objective_contract_sha256,
             "objective_contract_file_sha256": self.objective_contract_file_sha256,
             "objective_artifact_set_sha256": self.objective_artifact_set_sha256,
@@ -274,6 +328,14 @@ class _RestoreValidation:
 
 
 @dataclass(frozen=True)
+class _SourceCompositionValidation:
+    receipt_sha256: str
+    producer_set_sha256: str
+    dedup_receipt_sha256: str
+    dedup_logical_sha256: str
+
+
+@dataclass(frozen=True)
 class _ValidatedBundle:
     manifest: dict[str, Any]
     artifacts: dict[str, dict[str, object]]
@@ -282,6 +344,7 @@ class _ValidatedBundle:
     tokenizer_artifact_set_sha256: str
     source_manifest_sha256: str
     repaired_source_manifest_sha256: str
+    source_composition: _SourceCompositionValidation
     objectives: dict[int, _ObjectiveValidation]
     prefixes: dict[int, _PrefixValidation]
     restore: _RestoreValidation
@@ -367,6 +430,18 @@ def open_production_megatron_bundle(
         ),
         source_manifest_sha256=validated.source_manifest_sha256,
         repaired_source_manifest_sha256=validated.repaired_source_manifest_sha256,
+        source_composition_receipt_sha256=(
+            validated.source_composition.receipt_sha256
+        ),
+        source_producer_set_sha256=(
+            validated.source_composition.producer_set_sha256
+        ),
+        global_dedup_receipt_sha256=(
+            validated.source_composition.dedup_receipt_sha256
+        ),
+        global_dedup_logical_sha256=(
+            validated.source_composition.dedup_logical_sha256
+        ),
         objective_contract_sha256=str(selected_objective.descriptor["contract_sha256"]),
         objective_contract_file_sha256=str(
             selected_objective.descriptor["contract_file_sha256"]
@@ -436,6 +511,9 @@ def _validate_bundle(
 
     tokenizer_digest = _validate_tokenizer(root, manifest, artifacts)
     _validate_data_contracts(root, manifest, artifacts)
+    source_composition = _validate_source_composition(
+        root, manifest, artifacts
+    )
     source_sha, repaired_sha, repaired_by_bucket = _validate_source_manifests(
         root, manifest, artifacts
     )
@@ -472,6 +550,7 @@ def _validate_bundle(
         tokenizer_artifact_set_sha256=tokenizer_digest,
         source_manifest_sha256=source_sha,
         repaired_source_manifest_sha256=repaired_sha,
+        source_composition=source_composition,
         objectives=objectives,
         prefixes=prefixes,
         restore=restore,
@@ -493,6 +572,8 @@ def _validate_logical_manifest(
         raise ValueError(
             "production bundle must use training_contract='objective_materialized'"
         )
+    if manifest.get("known_limitations") != []:
+        raise ValueError("complete production bundle known_limitations must be empty")
     _validate_implementation_binding(
         manifest.get("implementation"),
         where="production bundle",
@@ -566,7 +647,612 @@ def _validate_logical_manifest(
         raise ValueError("bundle artifact_set_sha256 does not match artifact list")
     if not expected_bundle_id.endswith(artifact_set_sha256[:16]):
         raise ValueError("expected bundle_id is not bound to the artifact set")
+    _validate_source_composition_descriptor(manifest, artifacts)
     return artifacts
+
+
+def _validate_source_composition_descriptor(
+    manifest: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, object]],
+) -> None:
+    source_snapshot = _require_mapping(
+        manifest.get("source_snapshot"), where="source_snapshot"
+    )
+    descriptor = _require_mapping(
+        source_snapshot.get("source_composition"),
+        where="source_snapshot.source_composition",
+    )
+    expected_fields = {
+        "schema",
+        "receipt",
+        "plan",
+        "dedup_receipt",
+        "dedup_verifier",
+        "runs",
+    }
+    if (
+        set(descriptor) != expected_fields
+        or descriptor.get("schema") != _SOURCE_COMPOSITION_SCHEMA
+    ):
+        raise ValueError("source composition descriptor fields/schema drifted")
+
+    bound_paths: set[str] = set()
+
+    def validate_artifact(
+        raw_binding: object,
+        *,
+        where: str,
+        with_size: bool,
+    ) -> None:
+        binding = _require_mapping(raw_binding, where=where)
+        required = {"path", "sha256"}
+        if with_size:
+            required.add("size_bytes")
+        if set(binding) != required:
+            raise ValueError(f"{where} artifact binding fields drifted")
+        relative = _require_relative_string(binding.get("path"), where=f"{where}.path")
+        if not relative.startswith("provenance/source_composition/"):
+            raise ValueError(f"{where} escapes source composition provenance")
+        if relative in bound_paths:
+            raise ValueError(f"duplicate source composition artifact: {relative}")
+        bound_paths.add(relative)
+        digest = _require_sha256(binding.get("sha256"), where=f"{where}.sha256")
+        artifact = _require_artifact(artifacts, relative, where=where)
+        if artifact["sha256"] != digest:
+            raise ValueError(f"{where} SHA-256 is not artifact-bound")
+        if with_size:
+            size = binding.get("size_bytes")
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or artifact["size"] != size
+            ):
+                raise ValueError(f"{where} size is not artifact-bound")
+
+    for name in ("receipt", "plan", "dedup_receipt", "dedup_verifier"):
+        validate_artifact(
+            descriptor[name],
+            where=f"source composition {name}",
+            with_size=False,
+        )
+    raw_runs = descriptor.get("runs")
+    if not isinstance(raw_runs, list) or not raw_runs:
+        raise ValueError("source composition descriptor has no runs")
+    run_ids: set[str] = set()
+    for raw_run in raw_runs:
+        run = _require_mapping(raw_run, where="source composition run")
+        if set(run) != {"run_id", "artifacts"}:
+            raise ValueError("source composition run descriptor fields drifted")
+        run_id = run.get("run_id")
+        if (
+            not isinstance(run_id, str)
+            or not _RUN_ID_RE.fullmatch(run_id)
+            or run_id in run_ids
+        ):
+            raise ValueError("source composition run_id is invalid or duplicated")
+        run_ids.add(run_id)
+        run_artifacts = _require_mapping(
+            run.get("artifacts"), where=f"source composition run {run_id} artifacts"
+        )
+        if set(run_artifacts) != _SOURCE_COMPOSITION_RUN_ARTIFACTS:
+            raise ValueError(
+                f"source composition run {run_id} artifact inventory drifted"
+            )
+        for name, binding in run_artifacts.items():
+            validate_artifact(
+                binding,
+                where=f"source composition run {run_id}/{name}",
+                with_size=True,
+            )
+    composition_artifacts = {
+        relative
+        for relative in artifacts
+        if relative.startswith("provenance/source_composition/")
+    }
+    if composition_artifacts != bound_paths:
+        raise ValueError(
+            "source composition provenance contains unbound artifacts: "
+            f"missing={sorted(bound_paths - composition_artifacts)} "
+            f"extra={sorted(composition_artifacts - bound_paths)}"
+        )
+
+
+def _validate_source_producer(
+    raw_producer: object,
+    *,
+    where: str,
+) -> Mapping[str, Any]:
+    producer = _require_mapping(raw_producer, where=where)
+    if set(producer) != {"cppmega", "clang_indexer"}:
+        raise ValueError(f"{where} component set drifted")
+    cppmega = _require_mapping(producer.get("cppmega"), where=f"{where} cppmega")
+    indexer = _require_mapping(
+        producer.get("clang_indexer"), where=f"{where} clang indexer"
+    )
+    if (
+        set(cppmega) != {"commit", "tree_sha256"}
+        or not isinstance(cppmega.get("commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", cppmega["commit"]) is None
+    ):
+        raise ValueError(f"{where} cppmega identity drifted")
+    _require_sha256(cppmega.get("tree_sha256"), where=f"{where} cppmega tree")
+    if set(indexer) != {"source_sha256", "dependency_closure_sha256"}:
+        raise ValueError(f"{where} clang indexer fields drifted")
+    _require_sha256(indexer.get("source_sha256"), where=f"{where} indexer source")
+    _require_sha256(
+        indexer.get("dependency_closure_sha256"),
+        where=f"{where} indexer dependency closure",
+    )
+    return producer
+
+
+def _validate_source_composition(
+    root: Path,
+    manifest: Mapping[str, Any],
+    _artifacts: Mapping[str, Mapping[str, object]],
+) -> _SourceCompositionValidation:
+    descriptor = _require_mapping(
+        _require_mapping(manifest.get("source_snapshot"), where="source_snapshot").get(
+            "source_composition"
+        ),
+        where="source_snapshot.source_composition",
+    )
+
+    def load_json(
+        raw_binding: object,
+        *,
+        where: str,
+        max_bytes: int,
+    ) -> tuple[bytes, dict[str, Any]]:
+        binding = _require_mapping(raw_binding, where=f"{where} binding")
+        relative = _require_relative_string(binding.get("path"), where=f"{where} path")
+        artifact = _require_artifact(_artifacts, relative, where=where)
+        if int(artifact["size"]) > max_bytes:
+            raise ValueError(f"{where} exceeds the production size limit")
+        raw, payload = _load_json_object(
+            _safe_bundle_path(root, relative, where=where),
+            where=where,
+        )
+        if len(raw) > max_bytes:
+            raise ValueError(f"{where} exceeds the production size limit")
+        if hashlib.sha256(raw).hexdigest() != binding.get("sha256"):
+            raise ValueError(f"{where} payload SHA-256 drifted")
+        return raw, payload
+
+    receipt_raw, receipt = load_json(
+        descriptor.get("receipt"),
+        where="source composition receipt",
+        max_bytes=4 * 1024 * 1024,
+    )
+    expected_receipt_fields = {
+        "schema",
+        "status",
+        "plan_sha256",
+        "buckets",
+        "archive",
+        "dedup",
+        "runs",
+        "source_producers",
+        "source_producer_set_sha256",
+        "coverage",
+    }
+    if (
+        set(receipt) != expected_receipt_fields
+        or receipt.get("schema") != _SOURCE_COMPOSITION_SCHEMA
+        or receipt.get("status") != "complete"
+        or receipt.get("buckets") != manifest.get("buckets")
+    ):
+        raise ValueError("source composition receipt contract drifted")
+    plan_binding = _require_mapping(
+        descriptor.get("plan"), where="source composition plan binding"
+    )
+    if receipt.get("plan_sha256") != plan_binding.get("sha256"):
+        raise ValueError("source composition plan binding drifted")
+
+    dedup_raw, dedup_receipt = load_json(
+        descriptor.get("dedup_receipt"),
+        where="global dedup receipt",
+        max_bytes=4 * 1024 * 1024,
+    )
+    portable_dedup = dict(dedup_receipt)
+    portable_database = _require_mapping(
+        portable_dedup.get("database"), where="global dedup database"
+    )
+    portable_database = dict(portable_database)
+    portable_database.pop("path", None)
+    portable_dedup["database"] = portable_database
+    dedup_receipt_sha256 = hashlib.sha256(dedup_raw).hexdigest()
+    portable_dedup["receipt_sha256"] = dedup_receipt_sha256
+    if receipt.get("dedup") != portable_dedup:
+        raise ValueError("source composition portable dedup binding drifted")
+    if set(dedup_receipt) != {
+        "schema",
+        "status",
+        "created_at",
+        "database",
+        "checkpoint",
+        "integrity_check",
+        "sqlite_schema_sha256",
+        "logical_hash_algorithm",
+        "logical_sha256",
+        "tables",
+        "policy",
+        "verifier",
+    }:
+        raise ValueError("global dedup receipt fields drifted")
+    database = _require_mapping(
+        dedup_receipt.get("database"), where="global dedup database"
+    )
+    database_size = database.get("size_bytes")
+    if (
+        set(database) != {"path", "size_bytes", "sha256"}
+        or not isinstance(database.get("path"), str)
+        or not database["path"]
+        or isinstance(database_size, bool)
+        or not isinstance(database_size, int)
+        or database_size < 1
+    ):
+        raise ValueError("global dedup database binding drifted")
+    _require_sha256(database.get("sha256"), where="global dedup database")
+    _require_sha256(
+        dedup_receipt.get("sqlite_schema_sha256"),
+        where="global dedup SQLite schema",
+    )
+    if (
+        dedup_receipt.get("schema") != _GLOBAL_DEDUP_RECEIPT_SCHEMA
+        or dedup_receipt.get("status") != "verified"
+        or not isinstance(dedup_receipt.get("created_at"), str)
+        or not dedup_receipt["created_at"]
+        or dedup_receipt.get("integrity_check") != "ok"
+        or dedup_receipt.get("logical_hash_algorithm")
+        != "cppmega_sqlite_rows_lenprefixed_v1"
+        or dedup_receipt.get("checkpoint")
+        != {
+            "mode": "TRUNCATE",
+            "busy": 0,
+            "log_frames": 0,
+            "checkpointed_frames": 0,
+            "wal_size_bytes": 0,
+        }
+    ):
+        raise ValueError("global dedup receipt is not a completed production snapshot")
+    dedup_logical_sha256 = _require_sha256(
+        dedup_receipt.get("logical_sha256"), where="global dedup logical SHA-256"
+    )
+    tables = _require_mapping(dedup_receipt.get("tables"), where="global dedup tables")
+    if set(tables) != _GLOBAL_DEDUP_TABLES:
+        raise ValueError("global dedup table inventory drifted")
+    for name, raw_table in tables.items():
+        table = _require_mapping(raw_table, where=f"global dedup {name}")
+        rows = table.get("rows")
+        if (
+            set(table) != {"rows", "logical_sha256"}
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows < 0
+        ):
+            raise ValueError(f"global dedup {name} receipt fields drifted")
+        _require_sha256(
+            table.get("logical_sha256"),
+            where=f"global dedup {name} logical SHA-256",
+        )
+    for name in (
+        "dedup_stages",
+        "exact_stage",
+        "minhash_stage",
+        "lsh_stage",
+        "chunk_claims_stage",
+    ):
+        table = _require_mapping(tables.get(name), where=f"global dedup {name}")
+        if table.get("rows") != 0:
+            raise ValueError(f"global dedup {name} contains unpromoted rows")
+    for name in ("exact", "lsh", "minhash", "dedup_meta", "chunk_claims"):
+        table = _require_mapping(tables.get(name), where=f"global dedup {name}")
+        rows = table.get("rows")
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
+            raise ValueError(f"global dedup production table {name} is empty")
+    policy = _require_mapping(dedup_receipt.get("policy"), where="global dedup policy")
+    if (
+        set(policy) != {"exact", "chunk", "near"}
+        or policy.get("exact") != "sha1_token_ids_v1"
+        or policy.get("chunk") != "tokenized_chunk_claims_v1"
+        or policy.get("near")
+        != {
+            "enabled": True,
+            "threshold": 0.7,
+            "num_perm": 256,
+            "shingle_k": 5,
+        }
+    ):
+        raise ValueError("global dedup production exact+near policy drifted")
+    verifier = _require_mapping(
+        dedup_receipt.get("verifier"), where="global dedup verifier"
+    )
+    verifier_binding = _require_mapping(
+        descriptor.get("dedup_verifier"),
+        where="source composition dedup verifier binding",
+    )
+    if (
+        set(verifier) != {"repository_identity", "script", "script_sha256"}
+        or verifier.get("repository_identity") != "cppmega"
+        or verifier.get("script") != "scripts/data/verify_global_dedup_store.py"
+        or verifier.get("script_sha256") != verifier_binding.get("sha256")
+    ):
+        raise ValueError("global dedup verifier artifact binding drifted")
+
+    archive = _require_mapping(receipt.get("archive"), where="source archive")
+    coverage = _require_mapping(receipt.get("coverage"), where="source coverage")
+    if set(archive) != {
+        "repository_count",
+        "repository_names_sha256",
+        "input_binding_sha256",
+        "archive_identity_sha256",
+    }:
+        raise ValueError("source composition archive binding fields drifted")
+    for name in (
+        "repository_names_sha256",
+        "input_binding_sha256",
+        "archive_identity_sha256",
+    ):
+        _require_sha256(archive.get(name), where=f"source archive {name}")
+    if set(coverage) != {
+        "expected_repositories",
+        "code_success_repositories",
+        "commit_success_repositories",
+        "failed_repositories_observed",
+        "failed_units_observed",
+        "unresolved_failed_units",
+        "repository_set_sha256",
+        "allowlist_counts",
+    }:
+        raise ValueError("source composition coverage fields drifted")
+    _require_sha256(
+        coverage.get("repository_set_sha256"),
+        where="source composition repository set",
+    )
+    for name in ("failed_repositories_observed", "failed_units_observed"):
+        value = coverage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"source composition {name} is invalid")
+    expected_repositories = coverage.get("expected_repositories")
+    if (
+        isinstance(expected_repositories, bool)
+        or not isinstance(expected_repositories, int)
+        or expected_repositories < 1
+        or archive.get("repository_count") != expected_repositories
+        or archive.get("repository_names_sha256")
+        != coverage.get("repository_set_sha256")
+        or coverage.get("code_success_repositories") != expected_repositories
+        or coverage.get("commit_success_repositories") != expected_repositories
+        or coverage.get("unresolved_failed_units") != 0
+    ):
+        raise ValueError("source composition does not prove full repository coverage")
+    allowlist_counts = _require_mapping(
+        coverage.get("allowlist_counts"), where="source composition allowlist"
+    )
+    expected_allowlist = {
+        f"{kind}/{bundle_bucket}"
+        for kind in ("code", "commits")
+        for bundle_bucket in manifest["buckets"]
+    }
+    if set(allowlist_counts) != expected_allowlist or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in allowlist_counts.values()
+    ):
+        raise ValueError("source composition allowlist coverage drifted")
+
+    source_producers = receipt.get("source_producers")
+    if not isinstance(source_producers, list) or not source_producers:
+        raise ValueError("source composition has no source producers")
+    producer_digests: set[str] = set()
+    ordered_producer_digests: list[str] = []
+    for raw_producer in source_producers:
+        producer = _validate_source_producer(
+            raw_producer,
+            where="source producer",
+        )
+        digest = _canonical_sha256(producer)
+        if digest in producer_digests:
+            raise ValueError("source composition contains a duplicate producer")
+        producer_digests.add(digest)
+        ordered_producer_digests.append(digest)
+    if ordered_producer_digests != sorted(ordered_producer_digests):
+        raise ValueError("source composition producer order drifted")
+    producer_set_sha256 = _canonical_sha256(source_producers)
+    if receipt.get("source_producer_set_sha256") != producer_set_sha256:
+        raise ValueError("source producer set SHA-256 drifted")
+
+    receipt_runs = receipt.get("runs")
+    descriptor_runs = descriptor.get("runs")
+    if (
+        not isinstance(receipt_runs, list)
+        or not isinstance(descriptor_runs, list)
+        or len(receipt_runs) != len(descriptor_runs)
+    ):
+        raise ValueError("source composition run set drifted")
+    descriptor_by_id: dict[str, Mapping[str, Any]] = {}
+    for raw_run in descriptor_runs:
+        descriptor_run = _require_mapping(raw_run, where="source run descriptor")
+        descriptor_by_id[str(descriptor_run["run_id"])] = descriptor_run
+    input_file_keys = {
+        "archive_sha256_receipt": "archive_sha256_receipt",
+        "archive_inventory": "archive_inventory_receipt",
+        "repo_list": "repo_list",
+        "source_quarantine_manifest": "source_quarantine_manifest",
+        "tokenizer": "tokenizer",
+    }
+    receipt_run_ids: set[str] = set()
+    full_code_receipts = 0
+    full_commit_receipts = 0
+    for raw_run in receipt_runs:
+        run = _require_mapping(raw_run, where="source composition receipt run")
+        if set(run) != {
+            "run_id",
+            "launch",
+            "exit",
+            "manifest",
+            "streams",
+            "selected_repositories",
+            "terminal_repositories",
+            "terminal_repository_set_sha256",
+            "input_artifacts",
+            "code_revision",
+            "allowlist_counts",
+        }:
+            raise ValueError("source composition receipt run fields drifted")
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str) or run_id not in descriptor_by_id:
+            raise ValueError("source composition receipt run is not staged")
+        if run_id in receipt_run_ids:
+            raise ValueError("source composition receipt run_id is duplicated")
+        receipt_run_ids.add(run_id)
+        staged = _require_mapping(
+            descriptor_by_id[run_id].get("artifacts"),
+            where=f"source composition run {run_id} artifacts",
+        )
+        launch = _require_mapping(run.get("launch"), where=f"{run_id} launch")
+        exit_receipt = _require_mapping(run.get("exit"), where=f"{run_id} exit")
+        run_manifest = _require_mapping(run.get("manifest"), where=f"{run_id} manifest")
+        inputs = _require_mapping(
+            run.get("input_artifacts"), where=f"{run_id} input artifacts"
+        )
+        if set(inputs) != {
+            "archive_sha256_receipt",
+            "archive_inventory_receipt",
+            "repo_list",
+            "source_quarantine_manifest",
+            "tokenizer",
+        }:
+            raise ValueError(f"source composition run {run_id} input fields drifted")
+        if set(launch) != {"schema", "sha256"}:
+            raise ValueError(f"source composition run {run_id} launch fields drifted")
+        if set(exit_receipt) != {"schema", "sha256", "exit_code"}:
+            raise ValueError(f"source composition run {run_id} exit fields drifted")
+        launch_schema = launch.get("schema")
+        if (
+            launch_schema not in _SOURCE_EXIT_SCHEMA_BY_LAUNCH
+            or exit_receipt.get("schema")
+            != _SOURCE_EXIT_SCHEMA_BY_LAUNCH[launch_schema]
+        ):
+            raise ValueError(
+                f"source composition run {run_id} supervisor schemas drifted"
+            )
+        if set(run_manifest) != {
+            "sha256",
+            "done_units",
+            "failed_units",
+            "done_unit_set_sha256",
+            "failed_unit_set_sha256",
+        }:
+            raise ValueError(f"source composition run {run_id} manifest fields drifted")
+        for name in ("done_units", "failed_units"):
+            value = run_manifest.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"source composition run {run_id} {name} is invalid")
+        for name in ("done_unit_set_sha256", "failed_unit_set_sha256"):
+            _require_sha256(
+                run_manifest.get(name),
+                where=f"source composition run {run_id} {name}",
+            )
+        if exit_receipt.get("exit_code") != 0:
+            raise ValueError(f"source composition run {run_id} did not exit cleanly")
+        if run.get("streams") not in {"code", "commits", "both"}:
+            raise ValueError(f"source composition run {run_id} streams drifted")
+        streams = str(run["streams"])
+        for name in (
+            "selected_repositories",
+            "terminal_repositories",
+        ):
+            values = run.get(name)
+            if (
+                not isinstance(values, list)
+                or any(not isinstance(value, str) or not value for value in values)
+                or values != sorted(set(values))
+            ):
+                raise ValueError(f"source composition run {run_id} {name} is invalid")
+        _require_sha256(
+            run.get("terminal_repository_set_sha256"),
+            where=f"source composition run {run_id} terminal repository set",
+        )
+        terminal_repositories = run["terminal_repositories"]
+        if run.get("terminal_repository_set_sha256") != _canonical_sha256(
+            terminal_repositories
+        ):
+            raise ValueError(
+                f"source composition run {run_id} terminal repository digest drifted"
+            )
+        selected_repositories = run["selected_repositories"]
+        if launch_schema == _SOURCE_FULL_LAUNCH_SCHEMA and selected_repositories:
+            raise ValueError(
+                f"source composition full run {run_id} selects repositories"
+            )
+        if (
+            launch_schema == _SOURCE_TARGETED_LAUNCH_SCHEMA
+            and not selected_repositories
+        ):
+            raise ValueError(
+                f"source composition targeted run {run_id} has no selection"
+            )
+        if launch_schema == _SOURCE_FULL_LAUNCH_SCHEMA:
+            if len(terminal_repositories) != expected_repositories or run.get(
+                "terminal_repository_set_sha256"
+            ) != coverage.get("repository_set_sha256"):
+                raise ValueError(
+                    f"source composition full run {run_id} archive coverage drifted"
+                )
+            if streams in {"code", "both"}:
+                full_code_receipts += 1
+            if streams in {"commits", "both"}:
+                full_commit_receipts += 1
+        run_allowlist = _require_mapping(
+            run.get("allowlist_counts"),
+            where=f"source composition run {run_id} allowlist",
+        )
+        if not set(run_allowlist).issubset(expected_allowlist) or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in run_allowlist.values()
+        ):
+            raise ValueError(f"source composition run {run_id} allowlist drifted")
+        run_producer = _validate_source_producer(
+            run.get("code_revision"),
+            where=f"source composition run {run_id} code revision",
+        )
+        if _canonical_sha256(run_producer) not in producer_digests:
+            raise ValueError(
+                f"source composition run {run_id} producer is absent from producer set"
+            )
+        expected_hashes = {
+            "launch": launch.get("sha256"),
+            "exit": exit_receipt.get("sha256"),
+            "manifest": run_manifest.get("sha256"),
+            **{
+                file_key: inputs.get(input_key)
+                for file_key, input_key in input_file_keys.items()
+            },
+        }
+        for name, expected_sha256 in expected_hashes.items():
+            _require_sha256(
+                expected_sha256, where=f"source composition run {run_id}/{name}"
+            )
+            staged_binding = _require_mapping(
+                staged.get(name), where=f"staged source run {run_id}/{name}"
+            )
+            if staged_binding.get("sha256") != expected_sha256:
+                raise ValueError(
+                    f"source composition run artifact binding drifted: {run_id}/{name}"
+                )
+    if receipt_run_ids != set(descriptor_by_id):
+        raise ValueError("source composition receipt omits a staged run")
+    if full_code_receipts < 1 or full_commit_receipts < 1:
+        raise ValueError("source composition lacks full code and commit receipts")
+
+    return _SourceCompositionValidation(
+        receipt_sha256=hashlib.sha256(receipt_raw).hexdigest(),
+        producer_set_sha256=producer_set_sha256,
+        dedup_receipt_sha256=dedup_receipt_sha256,
+        dedup_logical_sha256=dedup_logical_sha256,
+    )
 
 
 def _reject_symlinks_and_unlisted_relevant_files(
@@ -1668,7 +2354,7 @@ def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
-def _canonical_sha256(value: Mapping[str, Any]) -> str:
+def _canonical_sha256(value: object) -> str:
     encoded = json.dumps(
         value,
         sort_keys=True,
