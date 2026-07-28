@@ -598,8 +598,62 @@ def stage_train(ctx: StageContext) -> StageResult:
             if n.module is not None:
                 n.module.name = n.name
         modules = [n.module for n in graph.nodes]
-        if not all(modules):
+        if any(module is None for module in modules):
             raise RuntimeError("graph has un-instantiated nodes")
+
+        # Preserve the wire graph during training.  ``from_block_specs``
+        # materialises modules from the ordered node list, but its default
+        # edges are a linear chain.  GUI presets can contain real fan-out /
+        # fan-in residual paths, so flattening them silently drops the bypass
+        # and can turn a non-zero branch into an all-zero train graph.
+        graph_node_names = [n.name for n in graph.nodes]
+        graph_node_name_set = set(graph_node_names)
+        wire_edges = [
+            (str(edge.src), str(edge.dst))
+            for edge in (getattr(ctx.spec.graph, "edges", None) or [])
+        ]
+        graph_predecessors: dict[str, list[str]] = {
+            name: [] for name in graph_node_names
+        }
+        graph_successors: dict[str, list[str]] = {
+            name: [] for name in graph_node_names
+        }
+        for src, dst in wire_edges:
+            if src not in graph_node_name_set or dst not in graph_node_name_set:
+                raise RuntimeError(
+                    f"wire graph edge {src!r}->{dst!r} references "
+                    "an unknown node"
+                )
+            graph_predecessors[dst].append(src)
+            graph_successors[src].append(dst)
+
+        # Stable Kahn ordering: preserve canvas declaration order among
+        # independent branches while still accepting a valid non-topological
+        # wire-node list.  Cycles fail loudly before allocating train state.
+        graph_node_order = {
+            name: index for index, name in enumerate(graph_node_names)
+        }
+        graph_indegree = {
+            name: len(graph_predecessors[name])
+            for name in graph_node_names
+        }
+        graph_ready = [
+            name for name in graph_node_names
+            if graph_indegree[name] == 0
+        ]
+        graph_execution_order: list[str] = []
+        while graph_ready:
+            name = graph_ready.pop(0)
+            graph_execution_order.append(name)
+            for child in graph_successors[name]:
+                graph_indegree[child] -= 1
+                if graph_indegree[child] == 0:
+                    graph_ready.append(child)
+                    graph_ready.sort(key=graph_node_order.__getitem__)
+        if wire_edges and len(graph_execution_order) != len(graph_node_names):
+            raise RuntimeError("wire graph contains a cycle")
+        if not wire_edges:
+            graph_execution_order = list(graph_node_names)
 
         # Determine if the first module in the graph is a physical embedding table.
         # If so, we pass targets (2D token IDs) directly as the input to the model
@@ -831,16 +885,44 @@ def stage_train(ctx: StageContext) -> StageResult:
             return None
 
         def forward_layers(layer_iter, input_embeds: mx.array) -> mx.array:
+            layer_list = list(layer_iter)
+            if len(layer_list) != len(graph_node_names):
+                raise RuntimeError(
+                    "train graph/module cardinality mismatch: "
+                    f"{len(graph_node_names)} nodes, {len(layer_list)} modules"
+                )
+            layers_by_name = {
+                str(getattr(module, "name", "")): module
+                for module in layer_list
+            }
+            if set(layers_by_name) != graph_node_name_set:
+                raise RuntimeError(
+                    "train graph/module names do not match wire graph"
+                )
+
             x = input_embeds
             token_ids = _match_side_tensor(sc_token_ids_tensor, input_embeds)
             if side_channel_token_embedding is not None and token_ids is not None:
                 x = x + side_channel_token_embedding(token_ids)
+            root_input = x
             doc_ids = _match_side_tensor(sc_doc_ids_tensor, input_embeds)
             doc_mask = _doc_attention_mask(doc_ids)
 
             layer_kv_registry = {}
+            graph_outputs: dict[str, mx.array] = {}
 
-            for idx, mod in enumerate(layer_iter):
+            for idx, node_name in enumerate(graph_execution_order):
+                mod = layers_by_name[node_name]
+                if wire_edges:
+                    producers = graph_predecessors[node_name]
+                    if not producers:
+                        x = root_input
+                    elif len(producers) == 1:
+                        x = graph_outputs[producers[0]]
+                    else:
+                        x = graph_outputs[producers[0]]
+                        for producer in producers[1:]:
+                            x = x + graph_outputs[producer]
                 attn_mod = _find_attn_sharing(mod)
                 shared_k, shared_v = None, None
                 if attn_mod is not None and getattr(attn_mod, "kv_sharing", "none") == "cross_layer":
@@ -901,7 +983,32 @@ def stage_train(ctx: StageContext) -> StageResult:
                             out = patched
 
                 x = out
-            return x
+                graph_outputs[node_name] = out
+
+            if not wire_edges:
+                return x
+
+            wire_head_outputs = list(
+                getattr(getattr(ctx.spec, "loss", None),
+                        "head_outputs", None) or []
+            )
+            build_head_outputs = list(
+                getattr(spec_loss, "head_outputs", None) or []
+            )
+            for head_name in [*wire_head_outputs, *build_head_outputs]:
+                if str(head_name) in graph_outputs:
+                    return graph_outputs[str(head_name)]
+
+            terminal_nodes = [
+                name for name in graph_execution_order
+                if not graph_successors[name]
+            ]
+            if len(terminal_nodes) != 1:
+                raise RuntimeError(
+                    "wire graph needs one declared loss head; "
+                    f"terminal nodes={terminal_nodes}"
+                )
+            return graph_outputs[terminal_nodes[0]]
 
         def _ce(logits: mx.array, tgt: mx.array) -> mx.array:
             return nn.losses.cross_entropy(
@@ -1298,13 +1405,22 @@ def stage_train(ctx: StageContext) -> StageResult:
                 probe_input = mx.random.normal(
                     shape=(1, seq, hidden), key=mx.random.key(42))
         probe_layers_before = list(getattr(all_modules, "layers", all_modules))
-        _probe_brick_layers = probe_layers_before[:-mtp_k]
+        _probe_head_count = (
+            0 if (has_physical_deembedder and mtp_k == 1) else mtp_k
+        )
+        _probe_brick_layers = (
+            probe_layers_before[:-_probe_head_count]
+            if _probe_head_count > 0 else probe_layers_before
+        )
         probe_features_before = forward_layers(
             _probe_brick_layers, probe_input)
         if getattr(probe_features_before, "shape", None) == probe_input.shape:
             probe_features_before = probe_features_before + probe_input
-        probe_output_before = probe_layers_before[-mtp_k](
-            probe_features_before).reshape(-1)
+        if _probe_head_count == 0:
+            probe_output_before = probe_features_before.reshape(-1)
+        else:
+            probe_output_before = probe_layers_before[-_probe_head_count](
+                probe_features_before).reshape(-1)
         mx.eval(probe_output_before)
         probe_output_before = mx.array(probe_output_before)
 
@@ -2426,12 +2542,19 @@ def stage_train(ctx: StageContext) -> StageResult:
 
         # V4-11: re-run forward on the same fixed-seed input post-training.
         probe_layers_after = list(getattr(all_modules, "layers", all_modules))
+        _probe_brick_layers_after = (
+            probe_layers_after[:-_probe_head_count]
+            if _probe_head_count > 0 else probe_layers_after
+        )
         probe_features_after = forward_layers(
-            probe_layers_after[:-mtp_k], probe_input)
+            _probe_brick_layers_after, probe_input)
         if getattr(probe_features_after, "shape", None) == probe_input.shape:
             probe_features_after = probe_features_after + probe_input
-        probe_output_after = probe_layers_after[-mtp_k](
-            probe_features_after).reshape(-1)
+        if _probe_head_count == 0:
+            probe_output_after = probe_features_after.reshape(-1)
+        else:
+            probe_output_after = probe_layers_after[-_probe_head_count](
+                probe_features_after).reshape(-1)
         mx.eval(probe_output_after)
         diff_vec = probe_output_after - probe_output_before
         l2_diff = float(mx.linalg.norm(diff_vec).item())

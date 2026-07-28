@@ -227,7 +227,7 @@ jobs:
   # summary, posted as a build summary + uploaded as standalone artefact.
   matrix-report:
     name: Matrix report
-    needs: [preset-matrix, specialised]
+    needs: [preset-matrix, specialised, mini-train-matrix]
     runs-on: [self-hosted, Linux, X64, cppmega-mlx]
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
@@ -238,11 +238,27 @@ jobs:
         with: { python-version: "3.13" }
       - name: Build matrix report
         run: |
-          python tools/build_e2e_matrix_report.py \
-            --artifacts artifacts \
+          set +e
+          report_args=(
+            --artifacts artifacts
             --output e2e_matrix_report.md
+            --require-artifact preset-matrix-shard-1
+            --require-artifact preset-matrix-shard-2
+            --require-artifact preset-matrix-shard-3
+            --require-artifact preset-matrix-shard-4
+            --require-artifact specialised-results
+          )
+          if [[ "${{ github.event_name }}" == "schedule" ||
+                "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            report_args+=(--require-artifact mini-train-results)
+          fi
+          python tools/build_e2e_matrix_report.py "${report_args[@]}"
+          report_status=$?
+          set -e
           cat e2e_matrix_report.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$report_status"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
         with:
           name: e2e_matrix_report
           path: e2e_matrix_report.md

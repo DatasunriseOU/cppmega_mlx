@@ -218,6 +218,42 @@ def test_muon_adamw_multi_passes_routed_parameter_subtrees_to_suboptimizers() ->
     ]
 
 
+def test_muon_adamw_multi_reassembles_updates_with_shared_list_nodes() -> None:
+    # A virtual ZeRO rank owns sparse leaves from the full layer list.  Here
+    # AdamW owns layer 0 while Muon owns layers 2 and 4, reproducing the Kimi
+    # rank tree that exposed ``tree_merge`` treating empty list placeholders
+    # as colliding leaves.
+    params = tree_unflatten(
+        [
+            ("layers.0.embedding.weight", mx.arange(40).reshape(10, 4)),
+            ("layers.2.projection.weight", mx.arange(16).reshape(4, 4)),
+            ("layers.4.gate.weight", mx.arange(16).reshape(4, 4)),
+        ]
+    )
+    gradients = tree_unflatten(
+        [
+            (key, mx.ones_like(value))
+            for key, value in tree_flatten(params)
+            if isinstance(value, mx.array)
+        ]
+    )
+    optimizer = MuonAdamWMulti(_RecordingOptimizer(), _RecordingOptimizer())
+
+    updates = optimizer.apply_gradients(gradients, params)
+
+    expected = dict(tree_flatten(params))
+    actual = dict(tree_flatten(updates))
+    assert actual.keys() == expected.keys()
+    for key, expected_value in expected.items():
+        assert mx.array_equal(actual[key], expected_value).item(), key
+
+
+def test_muon_adamw_multi_keeps_empty_update_tree_shape() -> None:
+    optimizer = MuonAdamWMulti(_RecordingOptimizer(), _RecordingOptimizer())
+
+    assert optimizer.apply_gradients({}, {}) == {}
+
+
 def test_make_muon_cppmega_cuda_parity_forces_shared_lr() -> None:
     optimizer = make_muon(cppmega_cuda_parity=True)
     expected = pytest.approx(1e-4, rel=1e-4)

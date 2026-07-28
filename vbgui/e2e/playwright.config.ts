@@ -15,7 +15,12 @@ export default defineConfig({
   // flakiness without masking real failures (Playwright reports both).
   retries: 1,
   workers: process.env.CI ? 2 : 4,
-  reporter: process.env.CI ? "github" : "list",
+  reporter: process.env.CI
+    ? [
+        ["github"],
+        ["json", { outputFile: "test-results/results.json" }],
+      ]
+    : "list",
   globalSetup: "./globalSetup.ts",
   globalTeardown: "./globalTeardown.ts",
   outputDir: "./test-results",
