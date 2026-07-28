@@ -114,6 +114,32 @@ def _write_json(path: Path, payload: object) -> None:
     )
 
 
+def _producer_implementation() -> dict[str, Any]:
+    return {
+        "schema": "cppmega_implementation_binding_v1",
+        "components": {
+            "cppmega": {
+                "commit": "1" * 40,
+                "tree_sha256": "2" * 64,
+            },
+            "cppmega_mlx": {
+                "commit": "3" * 40,
+                "tree_sha256": "4" * 64,
+            },
+            "clang_indexer": {
+                "source_sha256": "5" * 64,
+                "dependency_closure_sha256": "6" * 64,
+            },
+        },
+    }
+
+
+def _training_implementation() -> dict[str, Any]:
+    implementation = _producer_implementation()
+    implementation["components"]["megatron"] = {"commit": "7" * 40}
+    return implementation
+
+
 def _artifact_records(root: Path) -> list[dict[str, object]]:
     return [
         {
@@ -518,8 +544,9 @@ def _build_bundle(
     artifact_set_sha256 = _artifact_set_sha256(artifacts)
     bundle_id = f"fixture-bundle-{artifact_set_sha256[:16]}"
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": bundle_id,
+        "implementation": _producer_implementation(),
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "token_column": "input_ids",
@@ -569,7 +596,7 @@ def _build_bundle(
     prefix_manifest_path = prefix.with_suffix(".json")
     restore_receipt = root / "restore_receipt.json"
     binding = {
-        "schema": "cppmega_case6_receipt_binding_v1",
+        "schema": "cppmega_case6_receipt_binding_v2",
         "bundle_id": bundle_id,
         "artifact_set_sha256": artifact_set_sha256,
         "prefix_manifest_sha256s": {
@@ -581,6 +608,7 @@ def _build_bundle(
         "config_sha256": hashlib.sha256(b"config").hexdigest(),
         "command_sha256": hashlib.sha256(b"command").hexdigest(),
         "run_id": "fixture-restore",
+        "implementation": _training_implementation(),
     }
     _write_json(
         restore_receipt,
@@ -659,6 +687,50 @@ def test_legacy_objective_artifact_shape_requires_regeneration() -> None:
         production_bundle._validate_objective_artifact_shape(
             {"schema": "cppmega_objective_materialization_artifact_v1"},
             bucket=_BUCKET,
+        )
+
+
+def test_v1_bundle_schema_is_rejected(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest_path = fixture.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = "cppmega_megatron_bundle_v1"
+
+    with pytest.raises(ValueError, match="unsupported production bundle schema"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
+def test_bundle_without_implementation_is_rejected(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest_path = fixture.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["implementation"]
+
+    with pytest.raises(ValueError, match="implementation binding"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
+def test_restore_implementation_must_extend_bundle_producer() -> None:
+    training = _training_implementation()
+    training["components"]["cppmega"]["commit"] = "8" * 40
+
+    with pytest.raises(
+        ValueError,
+        match="implementation does not extend the bundle producer for cppmega",
+    ):
+        production_bundle._validate_training_implementation_extension(
+            _producer_implementation(),
+            training,
         )
 
 
