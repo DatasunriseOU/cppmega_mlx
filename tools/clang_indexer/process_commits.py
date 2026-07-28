@@ -145,12 +145,6 @@ class PRDiscussionLookup:
         if scan_id is not None and self._fixed_owner_repo is None:
             raise ValueError("PR scan_id requires an explicit PR owner/repo key")
         self.scan_id = scan_id
-        # Read-only connection; create=False RAISES on a missing store (fail-loud).
-        self._conn = _pr_store_mod.connect(
-            store_path,
-            create=False,
-            readonly=True,
-        )
         self._name_to_owner_repo: dict[str, str] = {}
         if repo_list_path:
             if not os.path.exists(repo_list_path):
@@ -158,11 +152,33 @@ class PRDiscussionLookup:
                     f"--repo-list does not exist: {repo_list_path}")
             with open(repo_list_path, "r") as fh:
                 data = json.load(fh)
-            for entry in data.get("repos", []):
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} must contain a JSON object"
+                )
+            entries = data.get("repos", [])
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} field 'repos' must be a list"
+                )
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"--repo-list {repo_list_path} field 'repos[{index}]' "
+                        "must be an object"
+                    )
                 name = entry.get("bare_name") or entry.get("name")
                 owner_repo = entry.get("owner_repo")
                 if name and owner_repo:
                     self._name_to_owner_repo[name] = owner_repo
+        # Validate every control input before acquiring the read-only handle.
+        # create=False still raises on a store that disappeared after the
+        # initial existence check.
+        self._conn = _pr_store_mod.connect(
+            store_path,
+            create=False,
+            readonly=True,
+        )
         self.hits = 0
         self.misses = 0
 
