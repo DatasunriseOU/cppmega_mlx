@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 import sys
 from pathlib import Path
+from threading import Timer
 
 
 MLX_ROOT = Path(__file__).resolve().parents[1]
@@ -93,3 +94,54 @@ def test_parse_batch_results_reject_invalid_submit_window():
                 max_in_flight=0,
             )
         )
+
+
+def test_parse_batch_results_emit_heartbeat_while_batch_is_running(capsys):
+    import index_project
+
+    class DelayedExecutor:
+        def __init__(self):
+            self.future = Future()
+            self.timer = Timer(
+                0.05,
+                self.future.set_result,
+                args=[("batch-result", 1)],
+            )
+
+        def submit(self, _fn, _batch):
+            self.timer.start()
+            return self.future
+
+    executor = DelayedExecutor()
+    results = list(
+        index_project._iter_parse_batch_results(
+            executor,
+            ["slow-batch"],
+            max_in_flight=1,
+            heartbeat_interval_s=0.01,
+        )
+    )
+    executor.timer.join()
+
+    assert results == [("batch-result", 1)]
+    assert "Parse pool heartbeat:" in capsys.readouterr().err
+
+
+def test_mixed_legacy_source_uses_byte_exact_latin1_fallback():
+    import index_project
+
+    cp1252_source = b"// compiler\x92s type\n"
+    cp1252_text, cp1252_encoding = index_project._decode_source_bytes(
+        cp1252_source,
+        "cp1252.h",
+    )
+    assert cp1252_encoding == "cp1252"
+    assert cp1252_text.encode(cp1252_encoding) == cp1252_source
+
+    mixed_source = b'// "\x8d\xc5\x8f\x89\x82\xcc\x8ds: \xb1\xb2\xb3"\n'
+    mixed_text, mixed_encoding = index_project._decode_source_bytes(
+        mixed_source,
+        "mixed-shift-jis-font-table.h",
+    )
+    assert mixed_encoding == "latin-1"
+    assert mixed_text.encode(mixed_encoding) == mixed_source
