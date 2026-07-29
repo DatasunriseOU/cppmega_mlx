@@ -299,7 +299,7 @@ def test_domain_discovery_chunks_large_and_fails_loud_on_unreadable_inputs(
         discover_project_domain_files(tmp_path)
 
 
-def test_compile_commands_is_compile_db_input_not_build_domain_text(
+def test_compile_commands_is_compile_db_input_and_build_domain_text(
     tmp_path: Path,
 ) -> None:
     from tools.clang_indexer import index_project
@@ -324,9 +324,10 @@ def test_compile_commands_is_compile_db_input_not_build_domain_text(
     compile_commands.write_text(json.dumps(entries))
     assert compile_commands.stat().st_size > index_project.BUILD_FILE_SIZE_CAP
 
-    assert index_project.find_build_files(str(tmp_path)) == [
-        (str(cmake_file), "cmake")
-    ]
+    assert set(index_project.find_build_files(str(tmp_path))) == {
+        (str(cmake_file), "cmake"),
+        (str(compile_commands), "compile_commands"),
+    }
 
     compile_db = index_project.load_compile_commands(str(tmp_path))
     assert compile_db is not None

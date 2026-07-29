@@ -54,6 +54,8 @@ BUILD_DOMAINS = {
     int(DomainKind.GN),
     int(DomainKind.SCONS),
     int(DomainKind.XMAKE),
+    int(DomainKind.COMPILE_COMMANDS),
+    int(DomainKind.CONFIGURE),
 }
 
 
