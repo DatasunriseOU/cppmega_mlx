@@ -4,7 +4,9 @@
 This is the standalone PR stream companion to the commit pipeline. Commit docs
 already inject ``record['pr_discussion']`` at the head of PRE/POST/diff samples;
 this script emits the same PR discussion content as its own document stream for
-curriculum mixes that want explicit ``pr`` batches.
+curriculum mixes that want explicit ``pr`` batches. A PR is eligible only when
+the canonical cppmega primary-membership receipt binds it to an allowlisted
+primary commit document. Merely existing in the GraphQL scan is not sufficient.
 
 The output is intentionally compatible with the existing conveyor layout:
 
@@ -59,14 +61,19 @@ import streaming_reindex as sr  # noqa: E402
 from streaming_reindex_commits import route_by_fit, recompress_zstd_max  # noqa: E402
 from scripts.pr_ingest.pr_store import connect, get_by_pr  # noqa: E402
 from scripts.pr_ingest.render_discussion import render_discussion  # noqa: E402
+from cppmega_mlx.data.pr_primary_membership import (  # noqa: E402
+    PRIMARY_PR_MEMBERSHIP_TABLE,
+    load_primary_pr_membership,
+    revalidate_primary_pr_membership,
+)
 
 
 DEFAULT_STORE = REPO_ROOT / "outputs" / "pr_ingest" / "prs.sqlite"
 DEFAULT_REPO_LIST = REPO_ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "reindexed_pr"
 ZSTD_LEVELS = (1024, 2048, 4096, 8192, 16384)
-EXPORT_MANIFEST_SCHEMA = "cppmega_pr_parquet_export_manifest_v2"
-EXPORT_RECEIPT_SCHEMA = "cppmega_pr_case5_export_v1"
+EXPORT_MANIFEST_SCHEMA = "cppmega_pr_parquet_export_manifest_v3"
+EXPORT_RECEIPT_SCHEMA = "cppmega_pr_case5_export_v2"
 MATERIALIZED_ROW_RESERVED_TOKENS = 3
 
 
@@ -100,14 +107,14 @@ def _lossless_stage_materialize(
         shard_name,
         "materialize",
         [
-            sr.VENV_PYTHON,
-            sr.MATERIALIZER,
+            str(sr.VENV_PYTHON),
+            str(sr.MATERIALIZER),
             "--input-file",
-            jsonl,
+            str(jsonl),
             "--output-file",
-            tok,
+            str(tok),
             "--tokenizer-path",
-            sr.TOKENIZER_PATH,
+            str(sr.TOKENIZER_PATH),
             "--materialize-tokenized-enriched",
             "--overflow-policy",
             "split",
@@ -285,12 +292,17 @@ def _iter_pr_keys(
     offset: int,
     limit: int | None,
 ):
-    sql = "SELECT repo, pr_number FROM prs WHERE scan_id=?"
+    sql = (
+        "SELECT p.repo, p.pr_number FROM prs AS p "
+        f"JOIN {PRIMARY_PR_MEMBERSHIP_TABLE} AS m "
+        "ON m.repo=p.repo AND m.pr_number=p.pr_number "
+        "WHERE p.scan_id=?"
+    )
     params: list[object] = [scan_id]
     if repo:
-        sql += " AND repo=?"
+        sql += " AND p.repo=?"
         params.append(repo)
-    sql += " ORDER BY repo, pr_number LIMIT ? OFFSET ?"
+    sql += " ORDER BY p.repo, p.pr_number LIMIT ? OFFSET ?"
     params.append(-1 if limit is None else int(limit))
     params.append(int(offset))
     yield from conn.execute(sql, params)
@@ -304,12 +316,17 @@ def _count_pr_keys(
     offset: int,
     limit: int | None,
 ) -> int:
-    sql = "SELECT COUNT(*) AS n FROM (SELECT 1 FROM prs WHERE scan_id=?"
+    sql = (
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM prs AS p "
+        f"JOIN {PRIMARY_PR_MEMBERSHIP_TABLE} AS m "
+        "ON m.repo=p.repo AND m.pr_number=p.pr_number "
+        "WHERE p.scan_id=?"
+    )
     params: list[object] = [scan_id]
     if repo:
-        sql += " AND repo=?"
+        sql += " AND p.repo=?"
         params.append(repo)
-    sql += " ORDER BY repo, pr_number LIMIT ? OFFSET ?)"
+    sql += " ORDER BY p.repo, p.pr_number LIMIT ? OFFSET ?)"
     params.append(-1 if limit is None else int(limit))
     params.append(int(offset))
     return int(conn.execute(sql, params).fetchone()["n"])
@@ -433,16 +450,26 @@ def _shard_name(repo: str | None, scan_id: str, offset: int) -> str:
 def _manifest_input(
     args: argparse.Namespace,
     binding: dict[str, object],
+    primary_membership: dict[str, object],
+    primary_membership_input: dict[str, object],
     lengths: tuple[int, ...],
 ) -> dict[str, object]:
     return {
         "pr_completion": binding,
+        "primary_membership": primary_membership,
+        "primary_membership_input": primary_membership_input,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "pr_completion_receipt": str(
             Path(args.pr_completion_receipt).resolve()
         ),
         "pr_store": str(Path(args.store).resolve()),
         "repo_list": str(Path(args.repo_list).resolve()),
+        "primary_membership_receipt": str(
+            Path(args.primary_membership_receipt).resolve()
+        ),
+        "primary_membership_root": str(
+            Path(args.primary_membership_root).resolve()
+        ),
         "repo": args.repo,
         "start_offset": int(args.offset),
         "target_lengths": list(lengths),
@@ -515,6 +542,8 @@ def _publish_complete_receipt(
     manifest_path: Path,
     manifest: dict,
     binding: dict[str, object],
+    primary_membership: dict[str, object],
+    primary_membership_input: dict[str, object],
     scan_id: str,
     target_lengths: tuple[int, ...],
     selected_pr_count: int,
@@ -565,7 +594,12 @@ def _publish_complete_receipt(
             "PR export document conservation failed: "
             f"rendered={rendered_docs} selected={selected_pr_count}"
         )
-    observed_buckets = {int(item["bucket"]) for item in artifacts}
+    observed_buckets: set[int] = set()
+    for item in artifacts:
+        raw_bucket = item.get("bucket")
+        if isinstance(raw_bucket, bool) or not isinstance(raw_bucket, int):
+            raise RuntimeError("PR export artifact bucket is malformed")
+        observed_buckets.add(raw_bucket)
     if observed_buckets != set(target_lengths):
         raise RuntimeError(
             "PR export did not publish every requested CASE5 bucket: "
@@ -579,6 +613,8 @@ def _publish_complete_receipt(
         "source": "pr",
         "scan_id": scan_id,
         "pr_completion": binding,
+        "primary_membership": primary_membership,
+        "primary_membership_input": primary_membership_input,
         "exporter_script_sha256": _sha256_file(Path(__file__).resolve()),
         "target_lengths": list(target_lengths),
         "selected_pr_count": selected_pr_count,
@@ -590,6 +626,8 @@ def _publish_complete_receipt(
         "artifacts": artifacts,
         "validation": {
             "exact_scan_membership": True,
+            "exact_primary_commit_membership": True,
+            "portable_primary_membership_verified": True,
             "input_revalidated_after_export": True,
             "document_conservation": True,
             "all_requested_buckets_present": True,
@@ -614,6 +652,9 @@ def export_pr_parquet(
     *,
     completion_binding: dict[str, object] | None = None,
     revalidate_at_finish: bool = True,
+    primary_membership: dict[str, object] | None = None,
+    primary_membership_input: dict[str, object] | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
     store = Path(args.store)
     if not store.exists():
@@ -631,8 +672,27 @@ def export_pr_parquet(
 
     pipeline = _load_pipeline()
     sr, route_by_fit, _recompress_zstd_max = pipeline
-    conn = connect(str(store), create=False, readonly=True)
+    owns_connection = connection is None
+    conn = (
+        connect(str(store), create=False, readonly=True)
+        if connection is None
+        else connection
+    )
     try:
+        if primary_membership is None:
+            (
+                primary_membership,
+                primary_membership_input,
+            ) = load_primary_pr_membership(
+                conn,
+                receipt_path=Path(args.primary_membership_receipt),
+                input_root=Path(args.primary_membership_root),
+                scan_id=scan_id,
+            )
+        elif primary_membership_input is None:
+            raise ValueError(
+                "provided primary membership requires its input binding"
+            )
         shard_name = _shard_name(args.repo, scan_id, int(args.offset))
         with tempfile.TemporaryDirectory(prefix="pr_parquet_export_") as tmp:
             work = Path(tmp)
@@ -671,11 +731,16 @@ def export_pr_parquet(
                     pipeline=pipeline,
                 )
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
+    assert primary_membership is not None
+    assert primary_membership_input is not None
     result = {
         "source": "pr",
         "store": str(store),
         "pr_completion": binding,
+        "primary_membership": primary_membership,
+        "primary_membership_input": primary_membership_input,
         "scan_id": scan_id,
         "output_root": str(output_root),
         "shard": shard_name,
@@ -685,6 +750,13 @@ def export_pr_parquet(
     }
     if revalidate_at_finish:
         _revalidate_pr_completion(args, binding)
+        revalidate_primary_pr_membership(
+            expected_membership=primary_membership,
+            expected_input_binding=primary_membership_input,
+            receipt_path=Path(args.primary_membership_receipt),
+            input_root=Path(args.primary_membership_root),
+            scan_id=scan_id,
+        )
     return result
 
 
@@ -699,26 +771,60 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
         raise ValueError("--target-lengths produced no lengths")
     binding = _load_pr_completion(args)
     scan_id = str(binding["scan_id"])
-    manifest_path = (
-        Path(args.manifest)
-        if args.manifest
-        else Path(args.output_root) / "_done.json"
-    )
-    expected_input = _manifest_input(args, binding, lengths)
-    manifest = _load_manifest(
-        manifest_path,
-        expected_input=expected_input,
-    )
+    conn = connect(str(store), create=False, readonly=True)
+    primary_membership: dict[str, object] | None = None
+    primary_membership_input: dict[str, object] | None = None
+    try:
+        (
+            primary_membership,
+            primary_membership_input,
+        ) = load_primary_pr_membership(
+            conn,
+            receipt_path=Path(args.primary_membership_receipt),
+            input_root=Path(args.primary_membership_root),
+            scan_id=scan_id,
+        )
+        expected_input = _manifest_input(
+            args,
+            binding,
+            primary_membership,
+            primary_membership_input,
+            lengths,
+        )
+        manifest_path = (
+            Path(args.manifest)
+            if args.manifest
+            else Path(args.output_root) / "_done.json"
+        )
+        manifest = _load_manifest(
+            manifest_path,
+            expected_input=expected_input,
+        )
+        batch_size = int(args.batch_size)
+        if batch_size <= 0:
+            raise ValueError("--batch-size must be > 0")
+    except Exception:
+        conn.close()
+        raise
     resume = not args.no_resume
-    batch_size = int(args.batch_size)
-    if batch_size <= 0:
-        raise ValueError("--batch-size must be > 0")
 
     sr, _route_by_fit, _recompress_zstd_max = _load_pipeline()
     complete = False
     result: dict[str, object]
-    conn = connect(str(store), create=False, readonly=True)
     try:
+        raw_primary_selected = primary_membership.get("selected_pr_count")
+        raw_stored_count = binding.get("stored_pr_count")
+        if (
+            isinstance(raw_primary_selected, bool)
+            or not isinstance(raw_primary_selected, int)
+            or raw_primary_selected < 1
+            or isinstance(raw_stored_count, bool)
+            or not isinstance(raw_stored_count, int)
+            or raw_stored_count < 1
+        ):
+            raise RuntimeError(
+                "primary membership or PR completion count is malformed"
+            )
         selected_pr_count = _count_pr_keys(
             conn,
             repo=args.repo,
@@ -729,12 +835,17 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
         global_selection = args.repo is None and int(args.offset) == 0
         if (
             global_selection
-            and selected_pr_count != int(binding["stored_pr_count"])
+            and selected_pr_count
+            != raw_primary_selected
         ):
             raise RuntimeError(
-                "verified PR scan selection count differs from its completion "
+                "verified primary PR selection count differs from its membership "
                 f"receipt: selected={selected_pr_count} "
-                f"receipt={binding['stored_pr_count']}"
+                f"receipt={primary_membership['selected_pr_count']}"
+            )
+        if raw_stored_count < raw_primary_selected:
+            raise RuntimeError(
+                "primary PR membership exceeds the verified PR scan"
             )
         offset = int(args.offset)
         max_shards = args.max_shards
@@ -770,6 +881,9 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
                         shard_args,
                         completion_binding=binding,
                         revalidate_at_finish=False,
+                        primary_membership=primary_membership,
+                        primary_membership_input=primary_membership_input,
+                        connection=conn,
                     )
                 except Exception as exc:
                     manifest.setdefault("failed", {})[done_key] = {
@@ -803,6 +917,8 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
             "source": "pr",
             "store": str(store),
             "pr_completion": binding,
+            "primary_membership": primary_membership,
+            "primary_membership_input": primary_membership_input,
             "scan_id": scan_id,
             "output_root": str(Path(args.output_root)),
             "manifest": str(manifest_path),
@@ -819,6 +935,19 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
     finally:
         conn.close()
         _revalidate_pr_completion(args, binding)
+        if (
+            primary_membership is not None
+            and primary_membership_input is not None
+        ):
+            revalidate_primary_pr_membership(
+                expected_membership=primary_membership,
+                expected_input_binding=primary_membership_input,
+                receipt_path=Path(args.primary_membership_receipt),
+                input_root=Path(args.primary_membership_root),
+                scan_id=scan_id,
+            )
+    assert primary_membership is not None
+    assert primary_membership_input is not None
     if complete:
         manifest["completed_pr_count"] = selected_pr_count
         if global_selection:
@@ -829,6 +958,8 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
                 manifest_path=manifest_path,
                 manifest=manifest,
                 binding=binding,
+                primary_membership=primary_membership,
+                primary_membership_input=primary_membership_input,
                 scan_id=scan_id,
                 target_lengths=lengths,
                 selected_pr_count=selected_pr_count,
@@ -852,6 +983,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Verified cppmega_pr_completion_v2 receipt binding the exact scan.",
     )
     p.add_argument("--repo-list", default=str(DEFAULT_REPO_LIST))
+    p.add_argument(
+        "--primary-membership-receipt",
+        required=True,
+        help=(
+            "Canonical cppmega primary_pr_membership_receipt.json derived from "
+            "the exact primary commit composition."
+        ),
+    )
+    p.add_argument(
+        "--primary-membership-root",
+        required=True,
+        help=(
+            "Directory containing the canonical membership receipt and its "
+            "ZSTD primary_pr_membership.parquet artifact."
+        ),
+    )
     p.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     p.add_argument("--target-lengths", default=",".join(str(x) for x in ZSTD_LEVELS))
     p.add_argument("--repo", default=None, help="Optional owner/repo filter.")
