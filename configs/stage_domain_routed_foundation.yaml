@@ -13,6 +13,8 @@ requirements:
     - token_domain_ids
     - token_role_ids
     - token_confidence_ids
+    - token_source_doc_ids
+    - token_source_identity_ids
     - token_structure_ids
     - token_dep_levels
   require_graph_sidecars:
@@ -93,10 +95,13 @@ domains:
     - gn
     - scons
     - xmake
+    - compile_commands
+    - configure
   shell_kinds:
     - sh
     - bash
     - zsh
     - tcsh
+    - ksh
   diagnostics:
     raw_without_edges_allowed_only_with_parse_confidence_raw: true
