@@ -357,12 +357,14 @@ def _write_ci_production_provenance(
     staged_ledgers = provenance / "ci_export"
     staged_ledgers.mkdir(parents=True, exist_ok=True)
     ledger_names = {
-        "representative_ledger": "representative_ledger.jsonl",
-        "fragment_ledger": "fragment_ledger.jsonl",
-        "dropped_graph_edges": "dropped_graph_edges.jsonl",
-        "representative_metadata": "representative_metadata.jsonl",
-        "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
-        "source_binding_projection": "source_binding_projection.jsonl",
+        "representative_ledger": "representative_ledger.parquet",
+        "fragment_ledger": "fragment_ledger.parquet",
+        "dropped_graph_edges": "dropped_graph_edges.parquet",
+        "representative_metadata": "representative_metadata.parquet",
+        "excluded_opaque_artifacts": "excluded_opaque_artifacts.parquet",
+        "excluded_training_scope": "excluded_training_scope.parquet",
+        "source_binding_projection": "source_binding_projection.parquet",
+        "occurrence_metadata": "occurrence_metadata.parquet",
     }
     artifacts: list[dict[str, object]] = [
         {
@@ -429,7 +431,7 @@ def _write_ci_production_provenance(
         },
     }
     payload = {
-        "schema": "cppmega_ci_content_store_case5_export_v3",
+        "schema": "cppmega_ci_content_store_case5_export_v4",
         "status": "complete",
         "completion_mode": "inventory-exhaustive",
         "production_complete": True,
@@ -468,6 +470,7 @@ def _write_ci_production_provenance(
             "overflow_rows": 0,
             "parquet_shard_max_rows": 512,
             "parquet_layout": "bucket-first-split-in-filename-v1",
+            "parquet_compression": {"codec": "zstd", "level": 9},
         },
         "eligibility": {
             "target_exact_unique_payload_tokens": 20_000_000_000,
@@ -504,6 +507,7 @@ def _write_ci_production_provenance(
             "zero_overflow": True,
             "payload_conserved": True,
             "payload_identity_and_order_verified": True,
+            "all_case5_parquet_zstd": True,
             "post_normalize_pack_sidecars_and_edges_verified": True,
         },
         "acquisition_provenance": acquisition,
@@ -1110,6 +1114,36 @@ def test_ci_ingress_rejects_legacy_fetch_state(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="input store/fetch contract drifted"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_rejects_legacy_export_schema(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture,
+        lambda payload: payload.update(
+            {"schema": "cppmega_ci_content_store_case5_export_v3"}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="inventory-exhaustive CI export v4"):
+        production_bundle._validate_ci_production_acquisition(
+            fixture.root, manifest, artifacts
+        )
+
+
+def test_ci_ingress_rejects_non_zstd_case5_contract(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest, artifacts = _rewrite_ci_manifest_for_validation(
+        fixture,
+        lambda payload: payload["case5_contract"].update(
+            {"parquet_compression": {"codec": "none", "level": 0}}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="CASE5 bucket contract drifted"):
         production_bundle._validate_ci_production_acquisition(
             fixture.root, manifest, artifacts
         )

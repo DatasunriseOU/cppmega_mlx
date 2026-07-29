@@ -108,18 +108,20 @@ _SOURCE_TARGETED_LAUNCH_SCHEMA = (
 _SOURCE_TARGETED_EXIT_SCHEMA = (
     "cppmega.canonical_source_targeted_retry_exit_v1"
 )
-_CI_PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
+_CI_PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v4"
 _CI_FETCH_STATE_SCHEMA = "cppmega_ci_stream_fetch_v4"
 _CI_PRODUCTION_MERGE_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
 _CI_COMPLETION_MODE = "inventory-exhaustive"
 _CI_MIN_EXACT_UNIQUE_PAYLOAD_TOKENS = 20_000_000_000
 _CI_PROVENANCE_LEDGER_NAMES = {
-    "representative_ledger": "representative_ledger.jsonl",
-    "fragment_ledger": "fragment_ledger.jsonl",
-    "dropped_graph_edges": "dropped_graph_edges.jsonl",
-    "representative_metadata": "representative_metadata.jsonl",
-    "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
-    "source_binding_projection": "source_binding_projection.jsonl",
+    "representative_ledger": "representative_ledger.parquet",
+    "fragment_ledger": "fragment_ledger.parquet",
+    "dropped_graph_edges": "dropped_graph_edges.parquet",
+    "representative_metadata": "representative_metadata.parquet",
+    "excluded_opaque_artifacts": "excluded_opaque_artifacts.parquet",
+    "excluded_training_scope": "excluded_training_scope.parquet",
+    "source_binding_projection": "source_binding_projection.parquet",
+    "occurrence_metadata": "occurrence_metadata.parquet",
 }
 _SOURCE_EXIT_SCHEMA_BY_LAUNCH = {
     _SOURCE_FULL_LAUNCH_SCHEMA: _SOURCE_FULL_EXIT_SCHEMA,
@@ -1575,7 +1577,7 @@ def _validate_ci_production_acquisition(
         or ci_manifest.get("production_complete") is not True
     ):
         raise ValueError(
-            "production bundle requires an inventory-exhaustive CI export v3"
+            "production bundle requires an inventory-exhaustive CI export v4"
         )
     _require_sha256(
         ci_manifest.get("exporter_script_sha256"),
@@ -1591,6 +1593,7 @@ def _validate_ci_production_acquisition(
         "zero_overflow",
         "payload_conserved",
         "payload_identity_and_order_verified",
+        "all_case5_parquet_zstd",
         "post_normalize_pack_sidecars_and_edges_verified",
     )
     if any(validation.get(name) is not True for name in required_validation):
@@ -1605,6 +1608,7 @@ def _validate_ci_production_acquisition(
         or case5.get("overflow_rows") != 0
         or case5.get("parquet_shard_max_rows") != 512
         or case5.get("parquet_layout") != "bucket-first-split-in-filename-v1"
+        or case5.get("parquet_compression") != {"codec": "zstd", "level": 9}
     ):
         raise ValueError("CI CASE5 bucket contract drifted")
 
