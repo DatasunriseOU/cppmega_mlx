@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+
+from cppmega_mlx.data.pr_primary_membership import (
+    PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME,
+    PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA,
+    PRIMARY_PR_MEMBERSHIP_POLICY,
+    PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME,
+    PRIMARY_PR_MEMBERSHIP_SCHEMA,
+)
 
 from cppmega_mlx.data.symbol_identity import (
     SYMBOL_IDENTITIES_COLUMN,
@@ -18,6 +29,110 @@ MLX_ROOT = Path(__file__).resolve().parents[1]
 PR_INGEST = MLX_ROOT / "scripts" / "pr_ingest"
 if str(PR_INGEST) not in sys.path:
     sys.path.insert(0, str(PR_INGEST))
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_primary_membership(
+    root: Path,
+    *,
+    scan_id: str,
+    keys: list[tuple[str, int]],
+) -> Path:
+    root.mkdir(parents=True)
+    keys = sorted(keys)
+    digest = hashlib.sha256()
+    for repo, pr_number in keys:
+        encoded = f"{repo}\0{pr_number}".encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    membership_sha256 = digest.hexdigest()
+    schema = pa.schema(
+        [
+            pa.field("repo", pa.string(), nullable=False),
+            pa.field("pr_number", pa.int64(), nullable=False),
+        ],
+        metadata={
+            b"cppmega.primary_pr_membership_schema": (
+                PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA.encode("ascii")
+            ),
+            b"cppmega.primary_pr_membership_policy": (
+                PRIMARY_PR_MEMBERSHIP_POLICY.encode("ascii")
+            ),
+            b"cppmega.primary_pr_membership_scan_id": scan_id.encode("ascii"),
+            b"cppmega.primary_pr_membership_sha256": (
+                membership_sha256.encode("ascii")
+            ),
+        },
+    )
+    artifact = root / PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"repo": repo, "pr_number": pr_number}
+                for repo, pr_number in keys
+            ],
+            schema=schema,
+        ),
+        artifact,
+        compression="zstd",
+    )
+    count = len(keys)
+    membership = {
+        "schema": PRIMARY_PR_MEMBERSHIP_SCHEMA,
+        "policy": PRIMARY_PR_MEMBERSHIP_POLICY,
+        "scan_id": scan_id,
+        "commit_artifacts": {
+            "schema": "cppmega_primary_commit_artifact_binding_v1",
+            "source_composition_sha256": "2" * 64,
+            "source_composition_plan_sha256": "3" * 64,
+            "buckets": [1024],
+            "files": 1,
+            "rows": count,
+            "byte_size": 1,
+            "artifact_set_sha256": "4" * 64,
+            "by_bucket": {
+                "1024": {
+                    "files": 1,
+                    "rows": count,
+                    "byte_size": 1,
+                }
+            },
+        },
+        "rows": count,
+        "source_docs": count,
+        "source_docs_with_pr_number": count,
+        "source_docs_with_pr_discussion": count,
+        "ignored_unverified_pr_number_source_docs": 0,
+        "source_docs_with_commit_sha": count,
+        "selected_pr_count": count,
+        "sha_only_matched_source_docs": 0,
+        "unmatched_commit_sha_source_docs": 0,
+        "selected_membership_sha256": membership_sha256,
+        "validation": {
+            "source_composition_complete": True,
+            "exact_allowlisted_commit_artifacts": True,
+            "exact_source_doc_shapes": True,
+            "exact_scan_membership": True,
+            "direct_pr_sha_conflicts": 0,
+        },
+        "artifact": {
+            "schema": PRIMARY_PR_MEMBERSHIP_ARTIFACT_SCHEMA,
+            "path": PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME,
+            "rows": count,
+            "byte_size": artifact.stat().st_size,
+            "sha256": _sha256(artifact),
+            "membership_sha256": membership_sha256,
+        },
+    }
+    receipt = root / PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME
+    receipt.write_text(
+        json.dumps(membership, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return receipt
 
 
 def _record(pr_number: int, *, repo: str = "owner/repo", body: str = "body") -> dict:
@@ -44,7 +159,8 @@ def _verified_pr_inputs(
     records: list[dict],
     *,
     stale_records: list[dict] | None = None,
-) -> tuple[Path, Path, Path, str]:
+    primary_pr_numbers: set[int] | None = None,
+) -> tuple[Path, Path, Path, str, Path, Path]:
     import pr_store
     from scripts.pr_ingest.graphql_pr_stream import (
         GRAPHQL_MANIFEST_SCHEMA,
@@ -136,16 +252,44 @@ def _verified_pr_inputs(
         store_path=store,
         output_path=receipt,
     )
-    return store, repo_list, receipt, scan_id
+    membership_root = tmp_path / "primary_membership"
+    membership_receipt = _write_primary_membership(
+        membership_root,
+        scan_id=scan_id,
+        keys=[
+            (str(record["repo"]), int(record["pr_number"]))
+            for record in records
+            if (
+                primary_pr_numbers is None
+                or int(record["pr_number"]) in primary_pr_numbers
+            )
+        ],
+    )
+    return (
+        store,
+        repo_list,
+        receipt,
+        scan_id,
+        membership_root,
+        membership_receipt,
+    )
 
 
 def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
     import export_pr_parquet
 
-    store, repo_list, receipt, scan_id = _verified_pr_inputs(
+    (
+        store,
+        repo_list,
+        receipt,
+        scan_id,
+        membership_root,
+        membership_receipt,
+    ) = _verified_pr_inputs(
         tmp_path,
         [_record(1), _record(2)],
         stale_records=[_record(3, repo="stale/repo")],
+        primary_pr_numbers={1},
     )
 
     out = tmp_path / "out"
@@ -154,6 +298,8 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        primary_membership_receipt=str(membership_receipt),
+        primary_membership_root=str(membership_root),
         output_root=str(out),
         target_lengths="1024",
         repo=None,
@@ -169,9 +315,9 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
 
     result = export_pr_parquet.export_pr_parquet_batches(args)
 
-    assert result["n_shards"] == 2
-    assert result["next_offset"] == 2
-    assert result["selected_pr_count"] == 2
+    assert result["n_shards"] == 1
+    assert result["next_offset"] == 1
+    assert result["selected_pr_count"] == 1
     assert result["scan_id"] == scan_id
     shard = (
         out
@@ -194,13 +340,24 @@ def test_pr_export_all_batches_writes_manifest_and_shard(tmp_path):
         (out / "export_receipt.json").read_text(encoding="utf-8")
     )
     assert receipt_blob["schema"] == export_pr_parquet.EXPORT_RECEIPT_SCHEMA
-    assert receipt_blob["selected_pr_count"] == 2
+    assert receipt_blob["selected_pr_count"] == 1
+    assert receipt_blob["primary_membership"]["selected_pr_count"] == 1
+    assert receipt_blob["validation"][
+        "portable_primary_membership_verified"
+    ] is True
 
 
 def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
     import export_pr_parquet
 
-    store, repo_list, receipt, _scan_id = _verified_pr_inputs(
+    (
+        store,
+        repo_list,
+        receipt,
+        _scan_id,
+        membership_root,
+        membership_receipt,
+    ) = _verified_pr_inputs(
         tmp_path / "inputs",
         [_record(1), _record(2)],
     )
@@ -210,6 +367,8 @@ def test_pr_export_partial_runs_cannot_publish_global_receipt(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        primary_membership_receipt=str(membership_receipt),
+        primary_membership_root=str(membership_root),
         output_root=str(subset_out),
         target_lengths="1024",
         repo=None,
@@ -259,7 +418,14 @@ def test_pr_export_losslessly_splits_large_discussion(tmp_path):
         f"review item {index}: preserve diagnostic and parser state"
         for index in range(5_000)
     )
-    store, repo_list, receipt, _scan_id = _verified_pr_inputs(
+    (
+        store,
+        repo_list,
+        receipt,
+        _scan_id,
+        membership_root,
+        membership_receipt,
+    ) = _verified_pr_inputs(
         tmp_path,
         [_record(99, body=body)],
     )
@@ -267,6 +433,8 @@ def test_pr_export_losslessly_splits_large_discussion(tmp_path):
         store=str(store),
         pr_completion_receipt=str(receipt),
         repo_list=str(repo_list),
+        primary_membership_receipt=str(membership_receipt),
+        primary_membership_root=str(membership_root),
         output_root=str(tmp_path / "out"),
         target_lengths="1024,2048,4096,8192,16384",
         repo=None,
@@ -285,3 +453,80 @@ def test_pr_export_losslessly_splits_large_discussion(tmp_path):
     assert result["materialize_stats"]["split_input_docs"] == 1
     assert result["materialize_stats"]["dropped_input_docs"] == 0
     assert sum(item["rows"] for item in result["lengths"].values()) > 1
+
+
+def test_pr_export_rejects_non_zstd_primary_membership(tmp_path):
+    import export_pr_parquet
+
+    (
+        store,
+        repo_list,
+        receipt,
+        _scan_id,
+        membership_root,
+        membership_receipt,
+    ) = _verified_pr_inputs(tmp_path, [_record(1)])
+    artifact = membership_root / PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME
+    table = pq.read_table(artifact)
+    pq.write_table(table, artifact, compression="snappy")
+    args = argparse.Namespace(
+        store=str(store),
+        pr_completion_receipt=str(receipt),
+        repo_list=str(repo_list),
+        primary_membership_receipt=str(membership_receipt),
+        primary_membership_root=str(membership_root),
+        output_root=str(tmp_path / "out"),
+        target_lengths="1024",
+        repo=None,
+        offset=0,
+        limit=1,
+        all=False,
+        batch_size=1,
+        max_shards=None,
+        manifest=None,
+        no_resume=False,
+        memory_limit_gb=4.0,
+    )
+
+    with pytest.raises(RuntimeError, match="must use ZSTD"):
+        export_pr_parquet.export_pr_parquet(args)
+
+
+def test_pr_export_rejects_membership_key_outside_verified_scan(tmp_path):
+    import export_pr_parquet
+
+    (
+        store,
+        repo_list,
+        receipt,
+        scan_id,
+        _membership_root,
+        _membership_receipt,
+    ) = _verified_pr_inputs(tmp_path, [_record(1)])
+    bad_root = tmp_path / "bad_membership"
+    bad_receipt = _write_primary_membership(
+        bad_root,
+        scan_id=scan_id,
+        keys=[("owner/repo", 999)],
+    )
+    args = argparse.Namespace(
+        store=str(store),
+        pr_completion_receipt=str(receipt),
+        repo_list=str(repo_list),
+        primary_membership_receipt=str(bad_receipt),
+        primary_membership_root=str(bad_root),
+        output_root=str(tmp_path / "out"),
+        target_lengths="1024",
+        repo=None,
+        offset=0,
+        limit=1,
+        all=False,
+        batch_size=1,
+        max_shards=None,
+        manifest=None,
+        no_resume=False,
+        memory_limit_gb=4.0,
+    )
+
+    with pytest.raises(RuntimeError, match="absent from the exact verified scan"):
+        export_pr_parquet.export_pr_parquet(args)

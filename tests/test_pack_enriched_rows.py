@@ -66,6 +66,7 @@ from scripts.nanochat_data.pack_enriched_rows import (
     PACKED_ROW_MACRO_ROUTES_METADATA_KEY,
     PACKED_ROW_MACRO_ROUTES_VERSION,
     PACK_ID_COLUMN,
+    SOURCE_COMMIT_HASHES_COLUMN,
     SOURCE_DOC_INDICES_COLUMN,
     SOURCE_HAS_PR_DISCUSSIONS_COLUMN,
     SOURCE_HEADER_FRAGMENT_KINDS_COLUMN,
@@ -345,6 +346,7 @@ def test_pack_documents_preserves_pr_discussion_source_metadata() -> None:
 
     assert overflow == []
     row = rows[0]
+    assert row[SOURCE_COMMIT_HASHES_COLUMN] == ["abc123", "def456"]
     assert row[SOURCE_PR_NUMBERS_COLUMN] == [42, None]
     assert row[SOURCE_HAS_PR_DISCUSSIONS_COLUMN] == [True, False]
     assert row[SOURCE_PR_DISCUSSION_CHARS_COLUMN] == [17, 0]
