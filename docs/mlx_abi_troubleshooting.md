@@ -95,10 +95,10 @@ For an intentionally modified local TileLang/TVM checkout:
 
     ./scripts/run_mlx_path_c.py --allow-dirty-source-stack --verify-only
 
-Without `run_mlx_path_c.py`, the dedicated environment remains ordinary wheel
-mode: `mlx==0.32.0`, `mlx-metal==0.32.0`, and the locked TileLang fork. The
-launcher overlays only the TileLang/TVM/TVM-FFI source stack; it never adds the
-workspace MLX checkout to `PYTHONPATH`.
+Without `run_mlx_path_c.py`, the dedicated environment remains ordinary
+installed-package mode: `mlx==0.32.0`, `mlx-metal==0.32.0`, and the locked
+TileLang fork. The launcher overlays only the TileLang/TVM/TVM-FFI source
+stack; it never adds the workspace MLX checkout to `PYTHONPATH`.
 
 ## Fix recipes (in order of preference)
 
