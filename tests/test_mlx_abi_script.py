@@ -6,7 +6,6 @@ from pathlib import Path
 import runpy
 import subprocess
 import sys
-import types
 
 import pytest
 
@@ -27,20 +26,39 @@ def _load_env_contract() -> dict[str, object]:
 
 
 def test_abi_script_loads_repository_contract_without_ambient_shadowing(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    fake = types.ModuleType("scripts.mlx_env_contract")
-    fake.build_mlx_wheel_environment = lambda *_args, **_kwargs: {
-        "CPPMEGA_MLX_ENV_MODE": "wrong"
-    }
-    monkeypatch.setitem(sys.modules, "scripts.mlx_env_contract", fake)
-
-    namespace = runpy.run_path(str(ROOT / "scripts" / "check_mlx_abi.py"))
-
-    loaded = namespace["_load_environment_contract"]()
-    assert getattr(loaded, "__file__", "").endswith(
-        "/scripts/mlx_env_contract.py"
+    shadow_scripts = tmp_path / "scripts"
+    shadow_scripts.mkdir()
+    (shadow_scripts / "__init__.py").write_text("")
+    (shadow_scripts / "mlx_env_contract.py").write_text(
+        "def build_mlx_wheel_environment(*args, **kwargs):\n"
+        "    return {'CPPMEGA_MLX_ENV_MODE': 'wrong'}\n"
     )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(tmp_path)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy, sys; "
+                "ns = runpy.run_path(sys.argv[1]); "
+                "print(ns['_load_environment_contract']().__file__)"
+            ),
+            str(ROOT / "scripts" / "check_mlx_abi.py"),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert Path(probe.stdout.strip()).resolve() == (
+        ROOT / "scripts" / "mlx_env_contract.py"
+    ).resolve()
 
 
 def _fake_path_c_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -359,6 +377,47 @@ def test_legacy_repair_refuses_shared_checkout_environment() -> None:
         {
             "CPPMEGA_MLX_PYTHON": str(shared_python),
             "CPPMEGA_MLX_ENV_ROOT": str(ROOT / ".venv"),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(script), "--apply"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "inside git checkout" in result.stderr
+
+
+def test_legacy_repair_refuses_symlinked_checkout_environment(
+    tmp_path: Path,
+) -> None:
+    """A checkout ``.venv`` reached through a symlink must still trip the
+    git-checkout guard: resolving the symlink walks parents *outside* the
+    checkout, so a resolved-path-only check is bypassed (regression: the
+    guard used to follow the realpath only)."""
+    import venv
+
+    script = ROOT / "scripts" / "fix_mlx_abi.sh"
+    shared_env = tmp_path / "shared-env"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(shared_env)
+    shared_python = shared_env / "bin" / "python"
+    if not shared_python.exists():
+        pytest.skip("cannot materialise a standalone venv for the symlink probe")
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    (checkout / ".venv").symlink_to(shared_env)
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CPPMEGA_MLX_PYTHON": str(checkout / ".venv" / "bin" / "python"),
+            "CPPMEGA_MLX_ENV_ROOT": str(checkout / ".venv"),
         }
     )
     result = subprocess.run(

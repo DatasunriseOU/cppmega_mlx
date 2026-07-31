@@ -60,15 +60,25 @@ if [[ ! -f "$ENV_PREFIX/pyvenv.cfg" ]]; then
   exit 2
 fi
 
-if ! GIT_ROOT="$("$PYTHON_BIN" - "$ENV_PREFIX" <<'PY'
+if ! GIT_ROOT="$("$PYTHON_BIN" - "$ENV_PREFIX" "$EXPECTED_LEXICAL" <<'PY'
 from pathlib import Path
+import os
 import sys
 
-path = Path(sys.argv[1]).resolve()
-for candidate in (path, *path.parents):
-    if (candidate / ".git").exists():
-        print(candidate)
-        break
+# Check both the resolved and the lexical spelling of each candidate:
+# when the selected env is reached through a symlink (e.g. a checkout
+# .venv that points at a shared env outside the repo), the resolved
+# walk alone sees no .git and the guard would be bypassed.
+seen = set()
+for arg in sys.argv[1:]:
+    for path in (Path(arg).resolve(), Path(os.path.abspath(arg))):
+        if path in seen:
+            continue
+        seen.add(path)
+        for candidate in (path, *path.parents):
+            if (candidate / ".git").exists():
+                print(candidate)
+                sys.exit(0)
 PY
 )"; then
   echo "ERROR: cannot inspect whether the selected environment is inside a Git checkout" >&2
