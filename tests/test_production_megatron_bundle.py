@@ -1262,6 +1262,20 @@ def test_bundle_without_source_composition_is_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_v4_bundle_without_primary_source_routes_is_rejected(tmp_path: Path) -> None:
+    fixture = _build_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    manifest["schema"] = "cppmega_megatron_bundle_v4"
+
+    with pytest.raises(ValueError, match="source_snapshot.source_routes"):
+        production_bundle._validate_logical_manifest(
+            fixture.root,
+            manifest,
+            expected_bundle_id=fixture.bundle_id,
+            bucket=_BUCKET,
+        )
+
+
 def test_incomplete_source_composition_coverage_is_rejected(
     tmp_path: Path,
 ) -> None:

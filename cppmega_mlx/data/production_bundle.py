@@ -37,7 +37,8 @@ if TYPE_CHECKING:
     from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
 
 
-_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v3"
+_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v4"
+_LEGACY_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v3"
 _BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 _PREFIX_TOKENIZER_CONTRACT = "megacpp"
 _EXPECTED_VOCAB_SIZE = 65536
@@ -99,6 +100,9 @@ _SOURCE_IDENTITY_REGISTRY_SCHEMA = "cppmega_source_identity_registry_v1"
 _RESTORE_RECEIPT_SCHEMA = "cppmega_megatron_restore_receipt_v1"
 _RESTORE_BINDING_SCHEMA = "cppmega_case6_receipt_binding_v2"
 _SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
+_SOURCE_ROUTE_SET_SCHEMA = "cppmega_packed_source_primary_routes_v1"
+_SOURCE_ROUTE_SCHEMA = "cppmega_packed_source_route_v2"
+_SOURCE_ROUTE_POLICY = "primary-only-code-and-commit-snapshot"
 _GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
 _SOURCE_FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _SOURCE_FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
@@ -567,6 +571,8 @@ def _validate_bundle(
     source_sha, repaired_sha, repaired_by_bucket = _validate_source_manifests(
         root, manifest, artifacts
     )
+    if manifest.get("schema") == _BUNDLE_SCHEMA:
+        _validate_source_routes(root, manifest, artifacts)
     ci = _validate_ci_production_acquisition(root, manifest, artifacts)
     buckets = [int(value) for value in manifest["buckets"]]
     objectives = _validate_objectives(
@@ -616,7 +622,7 @@ def _validate_logical_manifest(
     expected_bundle_id: str,
     bucket: int,
 ) -> dict[str, dict[str, object]]:
-    if manifest.get("schema") != _BUNDLE_SCHEMA:
+    if manifest.get("schema") not in {_LEGACY_BUNDLE_SCHEMA, _BUNDLE_SCHEMA}:
         raise ValueError(
             f"unsupported production bundle schema: {manifest.get('schema')!r}"
         )
@@ -700,6 +706,8 @@ def _validate_logical_manifest(
     if not expected_bundle_id.endswith(artifact_set_sha256[:16]):
         raise ValueError("expected bundle_id is not bound to the artifact set")
     _validate_source_composition_descriptor(manifest, artifacts)
+    if manifest.get("schema") == _BUNDLE_SCHEMA:
+        _validate_source_routes_descriptor(manifest, artifacts)
     return artifacts
 
 
@@ -808,6 +816,94 @@ def _validate_source_composition_descriptor(
             f"missing={sorted(bound_paths - composition_artifacts)} "
             f"extra={sorted(composition_artifacts - bound_paths)}"
         )
+
+
+def _validate_source_routes_descriptor(
+    manifest: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, object]],
+) -> None:
+    source_snapshot = _require_mapping(
+        manifest.get("source_snapshot"), where="source_snapshot"
+    )
+    descriptor = _require_mapping(
+        source_snapshot.get("source_routes"),
+        where="source_snapshot.source_routes",
+    )
+    if (
+        set(descriptor) != {"schema", "policy", "routes"}
+        or descriptor.get("schema") != _SOURCE_ROUTE_SET_SCHEMA
+        or descriptor.get("policy") != _SOURCE_ROUTE_POLICY
+    ):
+        raise ValueError("source route descriptor fields/schema drifted")
+    routes = _require_mapping(descriptor.get("routes"), where="source routes")
+    if set(routes) != {"code", "commits"}:
+        raise ValueError("source route descriptor must bind code and commits")
+    expected_fields = {
+        "path",
+        "sha256",
+        "route_schema",
+        "input_inventory_sha256",
+        "output_inventory_sha256",
+        "primary",
+    }
+    bound_paths: set[str] = set()
+    for kind, raw_binding in routes.items():
+        binding = _require_mapping(raw_binding, where=f"{kind} source route")
+        if (
+            set(binding) != expected_fields
+            or binding.get("route_schema") != _SOURCE_ROUTE_SCHEMA
+        ):
+            raise ValueError(f"{kind} source route binding fields drifted")
+        relative = _require_relative_string(
+            binding.get("path"), where=f"{kind} source route path"
+        )
+        if not relative.startswith("provenance/source_routes/"):
+            raise ValueError(f"{kind} source route escapes route provenance")
+        if relative in bound_paths:
+            raise ValueError("source route receipt path is duplicated")
+        bound_paths.add(relative)
+        digest = _require_sha256(
+            binding.get("sha256"), where=f"{kind} source route sha256"
+        )
+        artifact = _require_artifact(
+            artifacts, relative, where=f"{kind} source route"
+        )
+        if artifact["sha256"] != digest:
+            raise ValueError(f"{kind} source route receipt is not artifact-bound")
+        _require_sha256(
+            binding.get("input_inventory_sha256"),
+            where=f"{kind} source route input inventory",
+        )
+        _require_sha256(
+            binding.get("output_inventory_sha256"),
+            where=f"{kind} source route output inventory",
+        )
+        primary = _require_mapping(
+            binding.get("primary"), where=f"{kind} source route primary totals"
+        )
+        if set(primary) != {
+            "rows",
+            "valid_tokens",
+            "trained_tokens",
+            "documents",
+            "capacity_tokens",
+        }:
+            raise ValueError(f"{kind} source route primary totals fields drifted")
+        for name, value in primary.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{kind} source route primary {name} is invalid")
+        if any(
+            primary[name] < 1
+            for name in ("rows", "valid_tokens", "trained_tokens", "documents")
+        ):
+            raise ValueError(f"{kind} source route primary corpus is empty")
+    route_artifacts = {
+        relative
+        for relative in artifacts
+        if relative.startswith("provenance/source_routes/")
+    }
+    if route_artifacts != bound_paths:
+        raise ValueError("source route provenance contains unbound artifacts")
 
 
 def _validate_source_producer(
@@ -1305,6 +1401,247 @@ def _validate_source_composition(
         dedup_receipt_sha256=dedup_receipt_sha256,
         dedup_logical_sha256=dedup_logical_sha256,
     )
+
+
+def _validate_source_routes(
+    root: Path,
+    manifest: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, object]],
+) -> None:
+    source_snapshot = _require_mapping(
+        manifest.get("source_snapshot"), where="source_snapshot"
+    )
+    descriptor = _require_mapping(
+        source_snapshot.get("source_routes"),
+        where="source_snapshot.source_routes",
+    )
+    staged_routes = _require_mapping(
+        descriptor.get("routes"), where="source routes"
+    )
+    source_relative = _require_relative_string(
+        source_snapshot.get("manifest"), where="source manifest"
+    )
+    _, source_manifest = _load_json_object(
+        _safe_bundle_path(root, source_relative, where="source manifest"),
+        where="source manifest",
+    )
+    route_bindings = _require_mapping(
+        source_manifest.get("source_routes"),
+        where="source manifest source routes",
+    )
+    source_files = source_manifest.get("files")
+    if set(route_bindings) != {"code", "commits"} or not isinstance(
+        source_files, list
+    ):
+        raise ValueError("source manifest lacks code and commit route bindings")
+
+    count_keys = (
+        "rows",
+        "valid_tokens",
+        "trained_tokens",
+        "documents",
+        "capacity_tokens",
+    )
+    implementation_fields = {
+        "router_sha256",
+        "packer_sha256",
+        "packed_schema_sha256",
+        "enriched_schema_sha256",
+        "symbol_identity_schema_sha256",
+    }
+    buckets = set(int(value) for value in manifest["buckets"])
+    for kind in ("code", "commits"):
+        staged = _require_mapping(
+            staged_routes.get(kind), where=f"{kind} source route"
+        )
+        relative = _require_relative_string(
+            staged.get("path"), where=f"{kind} source route receipt"
+        )
+        artifact = _require_artifact(
+            artifacts, relative, where=f"{kind} source route receipt"
+        )
+        receipt_raw, receipt = _load_json_object(
+            _safe_bundle_path(root, relative, where=f"{kind} source route receipt"),
+            where=f"{kind} source route receipt",
+        )
+        if (
+            hashlib.sha256(receipt_raw).hexdigest() != staged.get("sha256")
+            or artifact["sha256"] != staged.get("sha256")
+            or receipt.get("schema") != _SOURCE_ROUTE_SCHEMA
+            or receipt.get("status") != "complete"
+            or receipt.get("unresolved_count") != 0
+            or receipt.get("input_inventory_sha256")
+            != staged.get("input_inventory_sha256")
+            or receipt.get("output_inventory_sha256")
+            != staged.get("output_inventory_sha256")
+        ):
+            raise ValueError(f"{kind} source route receipt contract drifted")
+        implementation = _require_mapping(
+            receipt.get("implementation"),
+            where=f"{kind} source route implementation",
+        )
+        if set(implementation) != implementation_fields:
+            raise ValueError(f"{kind} source route implementation fields drifted")
+        for name, digest in implementation.items():
+            _require_sha256(digest, where=f"{kind} source route {name}")
+        input_receipt = _require_mapping(
+            receipt.get("input_receipt"),
+            where=f"{kind} source route input receipt",
+        )
+        if set(input_receipt) != {
+            "path",
+            "sha256",
+            "source_inventory_sha256",
+        }:
+            raise ValueError(f"{kind} source route input receipt fields drifted")
+        _require_sha256(
+            input_receipt.get("sha256"),
+            where=f"{kind} source route input receipt sha256",
+        )
+        if (
+            input_receipt.get("source_inventory_sha256")
+            != staged.get("input_inventory_sha256")
+        ):
+            raise ValueError(f"{kind} source route input inventory drifted")
+
+        binding = _require_mapping(
+            route_bindings.get(kind),
+            where=f"source manifest {kind} route binding",
+        )
+        if (
+            binding.get("schema") != _SOURCE_ROUTE_SCHEMA
+            or binding.get("kind") != kind
+            or binding.get("receipt_sha256") != staged.get("sha256")
+            or binding.get("input_inventory_sha256")
+            != staged.get("input_inventory_sha256")
+            or binding.get("output_inventory_sha256")
+            != staged.get("output_inventory_sha256")
+            or binding.get("implementation") != implementation
+            or binding.get("totals") != receipt.get("totals")
+        ):
+            raise ValueError(f"source manifest {kind} route binding drifted")
+
+        raw_files = receipt.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise ValueError(f"{kind} source route has no file receipts")
+        totals = {
+            "source": {key: 0 for key in count_keys},
+            "primary": {key: 0 for key in count_keys},
+            "aux_python": {key: 0 for key in count_keys},
+            "excluded_non_primary": {key: 0 for key in count_keys},
+        }
+        output_inventory: list[dict[str, str]] = []
+        primary_files: dict[str, dict[str, object]] = {}
+        output_root = Path(str(receipt.get("output_root")))
+        if not output_root.is_absolute():
+            raise ValueError(f"{kind} source route output root is not absolute")
+        for raw_file in raw_files:
+            file_receipt = _require_mapping(
+                raw_file, where=f"{kind} source route file"
+            )
+            source = _require_mapping(
+                file_receipt.get("input"), where=f"{kind} source route input"
+            )
+            routes = _require_mapping(
+                file_receipt.get("routes"), where=f"{kind} source route outputs"
+            )
+            if (
+                file_receipt.get("schema") != _SOURCE_ROUTE_SCHEMA
+                or file_receipt.get("status") != "complete"
+                or file_receipt.get("unresolved_count") != 0
+                or file_receipt.get("implementation") != implementation
+                or set(routes)
+                != {"primary", "aux_python", "excluded_non_primary"}
+            ):
+                raise ValueError(f"{kind} source route file contract drifted")
+            source_path = _require_relative_string(
+                source.get("path"), where=f"{kind} source route input path"
+            )
+            source_parts = PurePosixPath(source_path).parts
+            if (
+                len(source_parts) != 2
+                or not source_parts[0].isdecimal()
+                or int(source_parts[0]) not in buckets
+                or not source_parts[1].endswith(".parquet")
+            ):
+                raise ValueError(f"{kind} source route input path is not canonical")
+            for route_name, counts in (("source", source), *routes.items()):
+                for key in count_keys:
+                    value = counts.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise ValueError(
+                            f"{kind} source route {route_name}.{key} is invalid"
+                        )
+                    totals[route_name][key] += value
+            for key in ("valid_tokens", "trained_tokens", "documents"):
+                if source[key] != sum(routes[name][key] for name in routes):
+                    raise ValueError(
+                        f"{kind} source route does not conserve {key}: {source_path}"
+                    )
+            for route_name in (
+                "primary",
+                "aux_python",
+                "excluded_non_primary",
+            ):
+                route = routes[route_name]
+                route_path = route.get("path")
+                if route_path != f"{route_name}/{source_path}":
+                    raise ValueError(f"{kind} source route output path drifted")
+                digest = _require_sha256(
+                    route.get("sha256"),
+                    where=f"{kind} {route_name} artifact sha256",
+                )
+                output_inventory.append(
+                    {
+                        "route": route_name,
+                        "path": str(route_path),
+                        "sha256": digest,
+                    }
+                )
+            primary = routes["primary"]
+            primary_source = str(
+                (output_root / str(primary["path"])).resolve()
+            )
+            if primary_source in primary_files:
+                raise ValueError(f"{kind} source route primary path is duplicated")
+            primary_files[primary_source] = {
+                "size": primary.get("size"),
+                "sha256": primary.get("sha256"),
+                "rows": primary.get("rows"),
+            }
+        if (
+            receipt.get("totals") != totals
+            or staged.get("primary") != totals["primary"]
+            or receipt.get("output_inventory_sha256")
+            != _canonical_sha256(output_inventory)
+        ):
+            raise ValueError(f"{kind} source route aggregate binding drifted")
+
+        snapshot_files: dict[str, Mapping[str, Any]] = {}
+        for raw_record in source_files:
+            record = _require_mapping(
+                raw_record, where="source snapshot file"
+            )
+            if record.get("kind") != kind:
+                continue
+            source_path = record.get("source")
+            if not isinstance(source_path, str) or source_path in snapshot_files:
+                raise ValueError(f"{kind} source snapshot path is invalid")
+            snapshot_files[source_path] = record
+        if set(snapshot_files) != set(primary_files):
+            raise ValueError(
+                f"{kind} source snapshot is not exactly the primary route"
+            )
+        for source_path, expected in primary_files.items():
+            actual = snapshot_files[source_path]
+            if any(actual.get(name) != value for name, value in expected.items()):
+                raise ValueError(
+                    f"{kind} source snapshot differs from route: {source_path}"
+                )
 
 
 def _reject_symlinks_and_unlisted_relevant_files(
