@@ -333,7 +333,7 @@ def _trailing_nul_bytes(
     expected_size: int,
     codec: str,
 ) -> int:
-    width = 2 if codec in {"utf-16-le", "utf-16-be"} else 1
+    width = 4 if codec.startswith("utf-32") else 2 if codec.startswith("utf-16") else 1
     if expected_size < width:
         return 0
     stream.seek(-width, os.SEEK_END)
@@ -347,7 +347,45 @@ def _validate_domain_stream(
     expected_size: int,
 ) -> _ValidatedDomainText:
     stream.seek(0)
-    marker = stream.read(3)
+    marker = stream.read(4)
+    if marker.startswith(codecs.BOM_UTF32_LE):
+        trailing_nul_bytes = _trailing_nul_bytes(
+            stream,
+            expected_size=expected_size,
+            codec="utf-32-le",
+        )
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="utf-32-le",
+                source_encoding="utf-32-le",
+                bom=codecs.BOM_UTF32_LE,
+                reject_raw_nul=False,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-32LE domain input {path}: {exc}") from exc
+    if marker.startswith(codecs.BOM_UTF32_BE):
+        trailing_nul_bytes = _trailing_nul_bytes(
+            stream,
+            expected_size=expected_size,
+            codec="utf-32-be",
+        )
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="utf-32-be",
+                source_encoding="utf-32-be",
+                bom=codecs.BOM_UTF32_BE,
+                reject_raw_nul=False,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-32BE domain input {path}: {exc}") from exc
     if marker.startswith(codecs.BOM_UTF16_LE):
         trailing_nul_bytes = _trailing_nul_bytes(
             stream,
@@ -502,6 +540,7 @@ def _is_domain_text_integrity_error(exc: ValueError) -> bool:
         or message.startswith("decoded domain input contains NUL character")
         or message.startswith("invalid UTF-8")
         or message.startswith("invalid UTF-16")
+        or message.startswith("invalid UTF-32")
         or message.startswith("invalid windows-1252")
     )
 
@@ -712,15 +751,16 @@ def _decodable_prefix_at_or_before(
         return _utf8_boundary_at_or_before(data, cut)
     if codec == "cp1252":
         return cut
-    if codec not in {"utf-16-le", "utf-16-be"}:
+    if codec not in {"utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"}:
         raise ValueError(f"unsupported domain source codec {codec!r}")
-    cut -= cut % 2
+    step = 4 if codec.startswith("utf-32") else 2
+    cut -= cut % step
     while cut > 0:
         try:
             bytes(data[:cut]).decode(codec, errors="strict")
             return cut
         except UnicodeDecodeError:
-            cut -= 2
+            cut -= step
     raise UnicodeDecodeError(
         codec,
         bytes(data[: min(len(data), 4)]),
@@ -739,7 +779,13 @@ def decode_domain_prefix(
     """Decode a bounded discovery prefix without consuming an incomplete tail."""
 
     path_obj = Path(path)
-    if raw.startswith(codecs.BOM_UTF16_LE):
+    if raw.startswith(codecs.BOM_UTF32_LE):
+        codec = "utf-32-le"
+        payload = bytearray(raw[len(codecs.BOM_UTF32_LE) :])
+    elif raw.startswith(codecs.BOM_UTF32_BE):
+        codec = "utf-32-be"
+        payload = bytearray(raw[len(codecs.BOM_UTF32_BE) :])
+    elif raw.startswith(codecs.BOM_UTF16_LE):
         codec = "utf-16-le"
         payload = bytearray(raw[len(codecs.BOM_UTF16_LE) :])
     elif raw.startswith(codecs.BOM_UTF16_BE):
@@ -769,8 +815,9 @@ def decode_domain_prefix(
                     f"invalid UTF-8 or Windows-1252 domain input {path_obj}: "
                     f"utf-8={utf8_exc}; windows-1252={cp1252_exc}"
                 ) from cp1252_exc
-    if allow_trailing_nul and payload.endswith(b"\0\0"):
-        del payload[-2:]
+    trailing_width = 4 if codec.startswith("utf-32") else 2
+    if allow_trailing_nul and payload.endswith(b"\0" * trailing_width):
+        del payload[-trailing_width:]
     if not payload:
         return ""
     cut = _decodable_prefix_at_or_before(
@@ -869,7 +916,7 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
-    UTF-8, BOM-marked UTF-16, and strict Windows-1252 are decoded without
+    UTF-8, BOM-marked UTF-16/32, and strict Windows-1252 are decoded without
     replacement. SQL prefers statement boundaries; build, shell, and diagnostic
     text prefers line boundaries. Every emitted chunk has an explicit hard byte
     cap and exact byte/character provenance into the original encoded file.

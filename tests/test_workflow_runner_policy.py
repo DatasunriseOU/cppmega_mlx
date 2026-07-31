@@ -284,12 +284,12 @@ def test_path_c_extra_binds_exact_tilelang_stack_and_compatible_z3() -> None:
     assert "cython>=3.0,<4" in path_c
     assert (
         "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git"
-        "@334266afd448ae06e7893119a0ebb72d7fe1e776; "
+        "@334266afd448ae06e7893119a0ebb72d7fe1e776 ; "
         f"{marker}"
     ) in path_c
     assert (
         "apache-tvm-ffi @ git+https://github.com/DatasunriseOU/tvm-ffi.git"
-        "@521efeb30bfd9e4946b248b3d76e6391028233a3; "
+        "@521efeb30bfd9e4946b248b3d76e6391028233a3 ; "
         f"{marker}"
     ) in path_c
     assert "z3-solver>=4.15,<4.15.5" in config["project"]["dependencies"]
