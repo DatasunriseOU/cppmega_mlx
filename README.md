@@ -27,7 +27,7 @@ Current status:
 
 The `_tilelang/` kernel directory is being migrated from hand-written Apple
 Metal-only TileLang into the unified fused-kernel compiler maintained at
-`DatasunriseOU/tilelang` (branch `poc-integrations-review`). The new pipeline
+`DatasunriseOU/tilelang` (pinned by the `path-c` project extra). The new pipeline
 ingests Triton TTIR / torch.fx / cute-dsl / raw CUDA, normalises into TileLang
 TIR, fuses register/shared-resident across former source boundaries, and
 lowers to a single CUDA / HIP / Apple Metal SIMDgroup kernel. See
@@ -184,7 +184,7 @@ Quality: 7 fix-rounds + 5 review-waves with grok+meta cross-LLM
 corroboration. Bench receipts at `bench/tilelang_ports/*.json` (gate
 threshold `paired_ratio ≤ 1.0`; auto-routing falls back to Path B for
 non-profitable shapes). See the upstream
-[TileLang README](https://github.com/DatasunriseOU/tilelang/blob/z3-final/README.md)
+[TileLang README](https://github.com/DatasunriseOU/tilelang/blob/main/README.md)
 for the full pass index and design notes.
 
 ## Wave-7/8 — empirical test results & remaining bugs (2026-05-07)
@@ -205,8 +205,8 @@ matrix at
 | #02 torch.compile | GREEN | **3/4 e2e cases work** after wave-7 #4 redo (`-> List[Tensor]`) |
 | #03 PtrAnalysis | GREEN | 8/8 tests pass on Metal |
 | #04 TritonStructured | GREEN | 2/2 vendor-drift pass |
-| #05 fp8_amax | wave-3 ok | **Broken**: closure cells invisible to `get_type_hints` (wave-8 fix queued) |
-| #06 dsa_splitk wave-5 | "~2× speedup" | Claim cannot fire on production shapes (AH≥8); budget gate too tight; `denom` IR leak fixed wave-8 |
+| #05 fp8_amax | wave-3 ok | **Fixed**: wave-8 #1 `_expose_to_globals` for `get_type_hints`; Metal `atomic_max` replaced by two-stage partial-max + device `Tensor.amax`; Metal fp8 encode via `metal_quant` uint8 boundary (fork has no float→fp8 cast) |
+| #06 dsa_splitk wave-5 | "~2× speedup" | Budget selection fixed with tiled Q-cache for production shapes; the original speedup claim still needs a current matched benchmark receipt |
 | #07 TMA fallback | GREEN | Wave-7 #3 `tilelang.Allocate` dispatcher landed |
 | #08 extern_intrinsic | GREEN | factories ok |
 | #09 autograd | GREEN | 12/12 `test_autograd_compose.py` pass |
@@ -220,12 +220,32 @@ matrix at
 
 **Wave-8 backlog (queued, agent-rate-limited)**:
 
-1. fp8_amax `get_type_hints(__closure__)` fix — inject closure cells into `_kernel.__globals__` before `@T.prim_func`
-2. dsa_splitk budget gate — tiled Q-cache for `AH≥8` production shapes
-3. ATEN_DISPATCH `_scaled_dot_product_flash_attention_for_cpu` wiring (FA TileLang kernel exists at `_kernels/flash_attention.py`)
-4. reduce_prod `vectorize_loop.cc` / `storage_rewrite.cc` mul-kind handling
-5. `scripts/check_mlx_abi.sh` to catch `mlx`/`mlx-metal` drift before kernel
-   tests (run it against the isolated env; the checkout `.venv` is shared)
+1. ~~fp8_amax `get_type_hints(__closure__)` fix~~ — DONE (`_expose_to_globals`
+   injects closure values into module `__globals__` before `@T.prim_func`;
+   Metal runtime additionally needed the two-stage partial-max amax and the
+   `metal_quant` uint8 encode boundary, both landed in `fp8_amax.py`)
+2. ~~dsa_splitk budget gate~~ — **landed**: `_can_use_q_cache_v5_tiled`
+   picks the largest `BLOCK_SQ ∈ {64, 32, 16, 8}` that fits the
+   per-target Q-cache budget (Metal capped at 32 rows), wired into the
+   stage-2 wrapper and the wave-5 bench; coverage in
+   `tests/test_dsa_splitk_tilelang.py`
+   (`test_wave9_tiled_block_sq_choice_for_production_shapes`,
+   `test_metal_dsa_q_cache_caps_row_reduction_tile_at_32`)
+3. ATEN_DISPATCH `_scaled_dot_product_flash_attention_for_cpu` wiring —
+   **open feature, not started**: the FA TileLang kernel lives in the
+   tilelang checkout (`poc/torch_dynamo/_kernels/flash_attention.py`),
+   not in this repo; no `torch.library`/ATEN registration exists here
+4. reduce_prod `vectorize_loop.cc` / `storage_rewrite.cc` mul-kind
+   handling — **open upstream bug** in the tilelang TVM fork
+   (`tilelang/3rdparty/tvm/src/tirx/transform/`); the triton_frontend
+   gates the native `reduce_prod` path behind per-backend validation
+   (`poc/triton_frontend/op_mapping.py::_USE_LOGEXP_PROD`), the xfail
+   lives in the tilelang repo harness — nothing to fix in this repo
+5. ~~`scripts/check_mlx_abi.sh`~~ — **landed**: `scripts/check_mlx_abi.sh`
+   + `scripts/check_mlx_abi.py` + `tests/test_mlx_abi_script.py`;
+   verified `--json` against the isolated env
+   (`/Volumes/external/sources/.venvs/cppmega.mlx`): `evaluation.ok=True`
+   (installed_wheel mode, mlx-metal 0.32.0 contract)
 
 NVFP4 on MLX research is committed at
 [`tilelang/docs/research/nvfp4_mlx_metal.md`](https://github.com/DatasunriseOU/tilelang/blob/main/docs/research/nvfp4_mlx_metal.md):

@@ -1,5 +1,14 @@
 # cppmega.mlx → unified TileLang pipeline migration plan
 
+> **Status: superseded (2026-07-31).** This plan targeted a PoC checkout at
+> `/private/tmp/tl_poc_review` (branch `poc-integrations-review`) that no
+> longer exists. The actual migration proceeded through the
+> `DatasunriseOU/tilelang` fork and the dispatcher in
+> `cppmega_mlx/nn/_tilelang/_engine_dispatch.py`. Parts of Phases 1–3 have
+> landed, but their original checklists are not complete: raw Path B and
+> `_msl_transform.py` still ship, and strict cross-path parity remains open.
+> This file is kept for historical context; do not execute it as written.
+
 This plan migrates the kernels under `cppmega_mlx/nn/_tilelang/` from
 hand-written Apple-Metal-only TileLang into the new unified fused-kernel
 compiler at `/private/tmp/tl_poc_review/poc/{triton_frontend,torch_dynamo,

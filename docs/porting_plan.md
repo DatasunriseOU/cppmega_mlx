@@ -2,6 +2,13 @@
 
 Date: 2026-04-30
 
+Revision: 2026-07-31 — local execution packages are now mlx==0.32.0 /
+mlx-metal==0.32.0 (see docs/mlx_abi_troubleshooting.md; the 0.31.x pins
+quoted in the body below are the original 2026-04-30 snapshot). The repo now
+also includes the cppmega_v4 / Visual Builder stack and ~7900 tests. The
+dated body below is otherwise unchanged historical context, not the current
+fail-closed runtime contract.
+
 This plan tracks the MLX-native Apple Silicon port. It is not a CUDA/Megatron
 runtime clone and it is not a performance claim. The current repo proves local
 correctness and smoke-training plumbing for small MLX models; it does not prove

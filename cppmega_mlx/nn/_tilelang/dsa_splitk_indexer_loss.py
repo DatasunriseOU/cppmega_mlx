@@ -919,9 +919,9 @@ def _can_use_q_cache_v5_tiled(
     wave-5 full Q-cache fit the per-target shared-memory budget, or
     ``None`` if even the smallest tile is over budget.
 
-    Examples (Metal, fp16, 16 KB budget):
+    Examples (Metal, fp16, 16 KB budget; BLOCK_SQ is additionally capped
+    at ``_METAL_DSA_MAX_REDUCTION_BLOCK_SQ`` = 32 on Metal):
 
-        AH=4,  AD=64  -> 64   (4 * 64 * 64 * 2 = 32 KB ... wait, 16 KB)
         AH=4,  AD=64  -> 32   (4 * 32 * 64 * 2 = 16 KB exactly, fits)
         AH=8,  AD=64  -> 16   (8 * 16 * 64 * 2 = 16 KB exactly)
         AH=128, AD=64 -> None (128 * 8 * 64 * 2 = 128 KB even at smallest)
