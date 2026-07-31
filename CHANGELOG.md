@@ -2,6 +2,15 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## Canonical live training-data inventory (2026-07-31)
+
+- Mirrored the physically audited inventory generator, pinned input config,
+  LaunchAgent, regression test, and operator documentation from `cppmega`.
+- The durable current snapshot and append-only semantic changelog live under
+  `/Volumes/external/sources/cppmega.mlx/outputs/training_data_status/`.
+- Release-ready, staged, and legacy data are reported separately; overlapping
+  stores are never added into a fictional global token total.
+
 ## V7-D-block: TileLang→Metal kernel epic closure (2026-05-23 14:30 GMT+2)
 
 D-block (TileLang→Metal kernels, 8 subtickets + Path B adapter + epic

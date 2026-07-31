@@ -10,6 +10,8 @@ proven behind pure-MLX fallbacks.
 
 Current status:
 
+- canonical training-data inventory and release gates:
+  [`docs/status/training_data_inventory.md`](./docs/status/training_data_inventory.md)
 - compiled/eager tiny MLX pretraining step with fixed-key side-channel batches
 - NPZ fixed-shape token dataset and tiny train smoke
 - optional local-only GB10 Parquet sample smoke path under ignored
