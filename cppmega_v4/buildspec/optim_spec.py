@@ -38,8 +38,26 @@ class OptimKind(str, Enum):
 
 # Sign-based Lion updates scale ONLY by the sign of momentum, so a large
 # learning rate quickly blows up to NaN. Chen et al. 2023 recommend
-# 3-10x smaller LR than AdamW; we issue a UserWarning above this ceiling.
+# 3-10x smaller LR than AdamW; the lion()/lion8bit() factories issue a
+# UserWarning when an explicitly chosen lr exceeds this ceiling.
 LION_LR_WARN_CEILING: Final[float] = 5e-4
+
+
+def _warn_if_lr_above_ceiling(kind: OptimKind, lr: float) -> None:
+    """Emit the Chen et al. LR warning for an explicitly chosen Lion lr.
+
+    Called from the ``lion()`` / ``lion8bit()`` factories only — not from
+    ``OptimSpec.__post_init__`` — so reconstructing a spec from a wire
+    payload (e.g. the UI's generic default lr) does not re-fire it."""
+    if lr > LION_LR_WARN_CEILING:
+        warnings.warn(
+            f"{kind.value} group 'all' lr={lr:.2e} "
+            f"exceeds recommended ceiling {LION_LR_WARN_CEILING:.0e}; "
+            "sign-based updates ignore gradient magnitude and "
+            "diverge to NaN at high LR (Chen et al. 2023).",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 _VALID_MATCHER_PREFIXES: Final[frozenset[str]] = frozenset({"regex:"})
@@ -172,15 +190,6 @@ class OptimSpec:
                         f"{self.kind.value.upper()} group must declare betas; "
                         f"group {g.matcher!r} is missing them"
                     )
-                if g.lr > LION_LR_WARN_CEILING:
-                    warnings.warn(
-                        f"{self.kind.value} group {g.matcher!r} lr={g.lr:.2e} "
-                        f"exceeds recommended ceiling {LION_LR_WARN_CEILING:.0e}; "
-                        "sign-based updates ignore gradient magnitude and "
-                        "diverge to NaN at high LR (Chen et al. 2023).",
-                        UserWarning,
-                        stacklevel=3,
-                    )
         elif self.kind is OptimKind.ADAM_8BIT:
             for g in self.groups:
                 if g.betas is None:
@@ -298,6 +307,7 @@ def lion(
 
     Raises UserWarning if lr > 5e-4 (typically NaN territory).
     """
+    _warn_if_lr_above_ceiling(OptimKind.LION, lr)
     return OptimSpec(
         kind=OptimKind.LION,
         groups=(
@@ -319,7 +329,11 @@ def lion8bit(
     :func:`lion` but with int8 momentum + per-block fp32 absmax (block
     size 256). Use when memory-constrained beyond Lion's already-halved
     state. Runtime selects :class:`Lion8bit` over :class:`LionFP32Moments`
-    via the ``kind`` field."""
+    via the ``kind`` field.
+
+    Raises UserWarning if lr > 5e-4 (typically NaN territory).
+    """
+    _warn_if_lr_above_ceiling(OptimKind.LION_8BIT, lr)
     return OptimSpec(
         kind=OptimKind.LION_8BIT,
         groups=(
