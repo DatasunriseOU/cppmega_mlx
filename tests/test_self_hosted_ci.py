@@ -253,6 +253,8 @@ def test_direct_cli_blocks_an_unreachable_required_host(tmp_path: Path) -> None:
 
 
 def test_both_lane_manifests_run_the_orchestration_regressions() -> None:
+    assert "tests/test_commit_primary_scope.py" in ci.MACOS_TESTS
+    assert "tests/test_commit_primary_scope.py" in ci.LINUX_TESTS
     assert "tests/test_self_hosted_ci.py" in ci.MACOS_TESTS
     assert "tests/test_self_hosted_ci.py" in ci.LINUX_TESTS
     assert "tests/test_workflow_runner_policy.py" in ci.MACOS_TESTS

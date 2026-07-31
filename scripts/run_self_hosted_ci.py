@@ -41,6 +41,7 @@ MACOS_TESTS = (
     "tests/test_case5_domain_ingestion.py",
     "tests/test_case6_sidecar_manifest_contract.py",
     "tests/test_clang_usr_identity.py",
+    "tests/test_commit_primary_scope.py",
     "tests/test_convert_megatron_dense500m_torchdist_to_mlx.py",
     "tests/test_cpp_jsonl_generation_compile_eval.py",
     "tests/test_data_package_imports.py",
@@ -86,6 +87,7 @@ MACOS_TESTS = (
 LINUX_TESTS = (
     "tests/test_audit_sidecar_parquet.py",
     "tests/test_case6_sidecar_manifest_contract.py",
+    "tests/test_commit_primary_scope.py",
     "tests/test_data_package_imports.py",
     "tests/test_domain_sidecar_parquet.py",
     "tests/test_graphql_pr_stream.py",
