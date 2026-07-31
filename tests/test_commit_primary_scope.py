@@ -7,6 +7,9 @@ from pathlib import Path
 
 from cppmega_mlx.data.commit_scope import classify_primary_commit_path
 from scripts.nanochat_data.extract_git_history import (
+    get_commit_diffs,
+    get_commit_file_changes,
+    get_commit_list,
     get_commit_cpp_files,
     should_skip_path,
 )
@@ -102,6 +105,121 @@ def test_extractor_membership_uses_primary_native_scope(tmp_path: Path) -> None:
     }
 
 
+def test_extractor_keeps_added_deleted_renamed_large_and_shebang_changes(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Scope Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "scope@example.invalid"],
+        check=True,
+    )
+    (repo / "deleted.cpp").write_text(
+        "int removed_value() { return 123456; }\n" * 3,
+        encoding="utf-8",
+    )
+    (repo / "old_name.cpp").write_text(
+        "int renamed_value() { return 123456; }\n" * 3,
+        encoding="utf-8",
+    )
+    (repo / "large.cpp").write_text(
+        "".join(
+            f"int before_{index:04d}() {{ return {index}; }}\n"
+            for index in range(2_500)
+        ),
+        encoding="utf-8",
+    )
+    (repo / "run_checks").write_text(
+        "#!/bin/sh\nset -eu\ncmake -S . -B build\ncmake --build build\nctest --test-dir build\n",
+        encoding="utf-8",
+    )
+    (repo / "README").write_text(
+        "This extensionless prose file is deliberately outside the primary corpus.\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+    initial_hash = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    (repo / "deleted.cpp").unlink()
+    subprocess.run(
+        ["git", "-C", str(repo), "mv", "old_name.cpp", "renamed.cpp"],
+        check=True,
+    )
+    (repo / "renamed.cpp").write_text(
+        "int renamed_value() { return 123456; }\n" * 2
+        + "int renamed_value() { return 654321; }\n",
+        encoding="utf-8",
+    )
+    (repo / "large.cpp").write_text(
+        "".join(
+            f"int after_{index:04d}() {{ return {index + 1}; }}\n"
+            for index in range(2_500)
+        ),
+        encoding="utf-8",
+    )
+    (repo / "run_checks").write_text(
+        "#!/bin/sh\nset -eux\ncmake -S . -B build\ncmake --build build --parallel\n"
+        "ctest --test-dir build --output-on-failure\n",
+        encoding="utf-8",
+    )
+    (repo / "schema.sql").write_text(
+        "CREATE TABLE build_receipts (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n",
+        encoding="utf-8",
+    )
+    (repo / "README").write_text(
+        "This changed extensionless prose file remains outside the primary corpus.\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "exercise all file statuses"],
+        check=True,
+    )
+    commit_hash = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    changes = get_commit_file_changes(str(repo), commit_hash) or []
+    assert {change["status"] for change in changes} >= {"A", "D", "M", "R"}
+    diffs = get_commit_diffs(str(repo), commit_hash) or []
+    by_path = {item["filepath"]: item for item in diffs}
+    assert set(by_path) == {
+        "deleted.cpp",
+        "large.cpp",
+        "renamed.cpp",
+        "run_checks",
+        "schema.sql",
+    }
+    assert by_path["schema.sql"]["change_status"] == "A"
+    assert by_path["schema.sql"]["old_content"] == ""
+    assert by_path["deleted.cpp"]["change_status"] == "D"
+    assert by_path["deleted.cpp"]["new_content"] == ""
+    assert by_path["renamed.cpp"]["change_status"] == "R"
+    assert by_path["renamed.cpp"]["old_filepath"] == "old_name.cpp"
+    assert by_path["run_checks"]["new_content"].startswith("#!/bin/sh")
+    assert len(by_path["large.cpp"]["diff"]) > 50_000
+    assert commit_hash in get_commit_list(str(repo))
+    root_diffs = get_commit_diffs(str(repo), initial_hash) or []
+    assert root_diffs
+    assert all(item["change_status"] == "A" for item in root_diffs)
+    assert all(item["old_content"] == "" for item in root_diffs)
+    assert "README" not in {item["filepath"] for item in root_diffs}
+
+
 def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> None:
     from tools.clang_indexer.process_commits import process_record
 
@@ -156,6 +274,78 @@ def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> Non
     assert any(document["change_mask_post"])
 
 
+def test_added_and_deleted_sql_commits_keep_directional_sidecars(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer.process_commits import process_record
+
+    sql = (
+        "CREATE TABLE build_receipts (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
+        "CREATE INDEX build_receipts_status_idx ON build_receipts(status);\n"
+    )
+    added = process_record(
+        {
+            "repo": "tests/commit-domain",
+            "filepath": "schema.sql",
+            "old_filepath": "",
+            "change_status": "A",
+            "commit_hash": "c" * 40,
+            "old_content": "",
+            "new_content": sql,
+            "diff": (
+                "diff --git a/schema.sql b/schema.sql\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/schema.sql\n"
+                "@@ -0,0 +1,2 @@\n"
+                f"+{sql.splitlines()[0]}\n"
+                f"+{sql.splitlines()[1]}\n"
+            ),
+        },
+        None,
+        str(tmp_path),
+        4096,
+        200_000,
+        "both",
+        5,
+    )
+    deleted = process_record(
+        {
+            "repo": "tests/commit-domain",
+            "filepath": "schema.sql",
+            "old_filepath": "schema.sql",
+            "change_status": "D",
+            "commit_hash": "d" * 40,
+            "old_content": sql,
+            "new_content": "",
+            "diff": (
+                "diff --git a/schema.sql b/schema.sql\n"
+                "deleted file mode 100644\n"
+                "--- a/schema.sql\n"
+                "+++ /dev/null\n"
+                "@@ -1,2 +0,0 @@\n"
+                f"-{sql.splitlines()[0]}\n"
+                f"-{sql.splitlines()[1]}\n"
+            ),
+        },
+        None,
+        str(tmp_path),
+        4096,
+        200_000,
+        "both",
+        5,
+    )
+
+    assert len(added) == 1
+    assert added[0]["text"] == sql
+    assert any(added[0]["change_mask_post"])
+    assert not any(added[0]["change_mask_pre"])
+    assert len(deleted) == 1
+    assert deleted[0]["text"] == sql
+    assert any(deleted[0]["change_mask_pre"])
+    assert not any(deleted[0]["change_mask_post"])
+
+
 def test_short_domain_commit_uses_the_shared_fifty_char_gate(tmp_path: Path) -> None:
     from tools.clang_indexer.process_commits import process_record
 
@@ -192,31 +382,31 @@ def test_short_domain_commit_uses_the_shared_fifty_char_gate(tmp_path: Path) -> 
     assert documents[0]["text"] == new_content
 
 
-def test_domain_commit_dedup_keeps_distinct_incremental_changes(
+def test_domain_commit_dedup_keeps_distinct_changes_with_same_post_state(
     tmp_path: Path,
 ) -> None:
     from cppmega_mlx.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
     from tools.clang_indexer.dedup_store import DedupStore
     from tools.clang_indexer.process_commits import process_jsonl_file
 
-    states = [
+    old_states = [
         (
             "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL);\n"
             "CREATE INDEX builds_status_idx ON builds(status);\n"
         ),
         (
             "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
-            "platform TEXT NOT NULL);\n"
-            "CREATE INDEX builds_status_idx ON builds(status);\n"
-        ),
-        (
-            "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
-            "platform TEXT NOT NULL, runner TEXT NOT NULL);\n"
+            "runner TEXT);\n"
             "CREATE INDEX builds_status_idx ON builds(status);\n"
         ),
     ]
+    new_content = (
+        "CREATE TABLE builds (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+        "platform TEXT NOT NULL);\n"
+        "CREATE INDEX builds_status_idx ON builds(status);\n"
+    )
     records = []
-    for index, (old_content, new_content) in enumerate(zip(states, states[1:])):
+    for index, old_content in enumerate(old_states):
         diff = (
             "diff --git a/schema.sql b/schema.sql\n"
             "--- a/schema.sql\n"
