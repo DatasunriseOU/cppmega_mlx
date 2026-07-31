@@ -67,22 +67,10 @@ wheels = [
 
 [[package]]
 name = "apache-tvm-ffi"
-version = "0.1.7"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.13.post5"
+source = { git = "https://github.com/DatasunriseOU/tvm-ffi.git?rev=521efeb30bfd9e4946b248b3d76e6391028233a3#521efeb30bfd9e4946b248b3d76e6391028233a3" }
 dependencies = [
     { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3d/07/6fbc8fbef1d04bd290f2dcdb3091ae784ac526b62649ec52993a41c65f72/apache_tvm_ffi-0.1.7.tar.gz", hash = "sha256:737cd4a067d6c6c7ad7dd909a0708eb3dc28540299039ea636f8ff5766b122be", size = 2397940, upload-time = "2025-12-28T09:13:25.52Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/e7/33ece51ba1670fa77a1897745720b9c8bdac854acb0e09d45e64340948f4/apache_tvm_ffi-0.1.7-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:20a8847f4609f1fe61015b7547bced99eba38072ed422799fc7bd15371d6d83c", size = 1818328, upload-time = "2025-12-28T09:12:32.784Z" },
-    { url = "https://files.pythonhosted.org/packages/48/53/423788fb9b26460b3d7ceb8588d172dfe7ae4abcc335931fcbf08a859904/apache_tvm_ffi-0.1.7-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9b05155b4b60ebd3642213d0489b6ef24aff17b268960dbb5f106a39899bb8b1", size = 2047974, upload-time = "2025-12-28T09:12:36.296Z" },
-    { url = "https://files.pythonhosted.org/packages/dd/bb/fa5042076bf6e7daaf9774389f99149c1851434fc0d8e4cb34aa0c4a3810/apache_tvm_ffi-0.1.7-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5769cadc42e70522e2a523f1dfe24f48dbe3bf384e63f95df251f9d572ffcf23", size = 2030760, upload-time = "2025-12-28T09:12:39.813Z" },
-    { url = "https://files.pythonhosted.org/packages/26/4e/43a41ac023a5989803952d527dfea6e63da71fe223f6e010d4ec71ca0526/apache_tvm_ffi-0.1.7-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:12950ca9f9f4f4436869afe17845a6bfc85cbcd8a15dfa2b16095f7e6f49d06f", size = 1790152, upload-time = "2025-12-28T09:12:43.975Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/11/b69df7685d75144fd9f57e5155cdf4ff91d6617a9f8b89b1415204863da0/apache_tvm_ffi-0.1.7-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:258a4aecc16e963def8ba0ab07f585147c7e7f586156b9496bfdf34af229443d", size = 2024240, upload-time = "2025-12-28T09:12:47.337Z" },
-    { url = "https://files.pythonhosted.org/packages/a5/4d/d21874eda6e3ea59c5a84aa010b24b84617e3b286ad759ac5eadccb1a88c/apache_tvm_ffi-0.1.7-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fbbf87df625930bafbd979c2c510d5bd989e9171098e5bb65320d0e7336d0095", size = 2003196, upload-time = "2025-12-28T09:12:50.891Z" },
-    { url = "https://files.pythonhosted.org/packages/92/c3/aa4b950032251c24b9db7d725b86d7d683b62d9919f8a32f478c28951dc3/apache_tvm_ffi-0.1.7-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:dc4a02e0252599d0c4eb2d2fa91b7756f0446b3bc42479b05c140e9d336b9b8b", size = 1820520, upload-time = "2025-12-28T09:12:54.29Z" },
-    { url = "https://files.pythonhosted.org/packages/b6/0f/ca4f7b4836e1e03386b6e486a0ba88812644723a96965a01e2072f551f2e/apache_tvm_ffi-0.1.7-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:835bd391c6f3388e84e36f0ea2347761992241a3953be6ebb319bf1c2ac855d8", size = 2032237, upload-time = "2025-12-28T09:12:58.113Z" },
-    { url = "https://files.pythonhosted.org/packages/5a/5f/1f57863c2c68389d1453fe147d89da22910a0e4f645a8be29cc8f461850f/apache_tvm_ffi-0.1.7-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e135b70c7be8627661c5ec4a466e17e1aba260ffd7c6bccfe231c9ea975875e7", size = 2013039, upload-time = "2025-12-28T09:13:01.37Z" },
 ]
 
 [[package]]
@@ -207,7 +195,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anywidget", marker = "extra == 'widget'", specifier = ">=0.9" },
-    { name = "apache-tvm-ffi", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'path-c') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'path-c')", specifier = ">=0.1.2,<0.1.8" },
+    { name = "apache-tvm-ffi", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'path-c') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'path-c')", git = "https://github.com/DatasunriseOU/tvm-ffi.git?rev=521efeb30bfd9e4946b248b3d76e6391028233a3" },
     { name = "cloudpickle", marker = "extra == 'path-c'", specifier = ">=3.1" },
     { name = "cython", marker = "extra == 'path-c'", specifier = ">=3.0,<4" },
     { name = "einops", marker = "extra == 'path-c'", specifier = ">=0.8" },
@@ -225,7 +213,7 @@ requires-dist = [
     { name = "python-multipart", marker = "extra == 'gui'", specifier = ">=0.0.20" },
     { name = "safetensors", specifier = ">=0.7" },
     { name = "starlette", marker = "extra == 'gui'", specifier = ">=1.3.1" },
-    { name = "tilelang", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'path-c') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'path-c')", specifier = "==0.1.9" },
+    { name = "tilelang", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'path-c') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'path-c')", git = "https://github.com/DatasunriseOU/tilelang.git?rev=334266afd448ae06e7893119a0ebb72d7fe1e776" },
     { name = "tokenizers", specifier = ">=0.22" },
     { name = "torch", marker = "extra == 'path-c'", specifier = "==2.13.0" },
     { name = "traitlets", marker = "extra == 'widget'", specifier = ">=5.0" },
@@ -2131,7 +2119,7 @@ wheels = [
 [[package]]
 name = "tilelang"
 version = "0.1.9"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/DatasunriseOU/tilelang.git?rev=334266afd448ae06e7893119a0ebb72d7fe1e776#334266afd448ae06e7893119a0ebb72d7fe1e776" }
 dependencies = [
     { name = "apache-tvm-ffi", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "cloudpickle", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
@@ -2144,11 +2132,6 @@ dependencies = [
     { name = "tqdm", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "z3-solver", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/56/70/5051f65821baa30a3d61fc48f8ba10c776490315e8c90f82559b92089756/tilelang-0.1.9.tar.gz", hash = "sha256:287f727c913bb648fcf6c1968809ba3390e55eeed257a5c6bb9a80bc05966af4", size = 93395292, upload-time = "2026-04-22T09:19:11.988Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/90/db/4dd76da8c8585c605639a21bc098d504e317fe324a72f01ce3c7370250b4/tilelang-0.1.9-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:00ed594fdeb229c5505b9ffa895c3c5daeb28641c78f783fa1f724cf1e08cecd", size = 36599020, upload-time = "2026-04-22T09:14:39.366Z" },
-    { url = "https://files.pythonhosted.org/packages/f7/8a/1cbeee79d62abaa02441c2d00621554e41aa62dbf3b94a4feb3867184b01/tilelang-0.1.9-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4bbccfe9035aed775ffafb6dc25a5994504b24e2c5d95d0f39643edfafa7bf12", size = 45419374, upload-time = "2026-04-22T09:15:56.014Z" },
 ]
 
 [[package]]

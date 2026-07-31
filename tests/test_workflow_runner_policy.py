@@ -273,22 +273,23 @@ def test_package_discovery_is_limited_to_owned_python_trees() -> None:
     ).read_text(encoding="utf-8")
 
 
-def test_path_c_extra_declares_tilelang_and_compatible_z3() -> None:
+def test_path_c_extra_binds_exact_tilelang_stack_and_compatible_z3() -> None:
     config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     path_c = config["project"]["optional-dependencies"]["path-c"]
+    marker = (
+        "(platform_system == 'Darwin' and platform_machine == 'arm64') or "
+        "(platform_system == 'Linux' and platform_machine == 'x86_64')"
+    )
     assert "cython>=3.0,<4" in path_c
-    assert any(requirement.startswith("tilelang==0.1.9") for requirement in path_c)
-    assert any(
-        requirement.startswith("tilelang==0.1.9")
-        and "platform_system == 'Linux'" in requirement
-        and "platform_machine == 'x86_64'" in requirement
-        for requirement in path_c
-    )
-    assert any(
-        requirement.startswith("apache-tvm-ffi>=0.1.2")
-        and "platform_system == 'Linux'" in requirement
-        and "platform_machine == 'x86_64'" in requirement
-        for requirement in path_c
-    )
+    assert (
+        "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git"
+        "@334266afd448ae06e7893119a0ebb72d7fe1e776; "
+        f"{marker}"
+    ) in path_c
+    assert (
+        "apache-tvm-ffi @ git+https://github.com/DatasunriseOU/tvm-ffi.git"
+        "@521efeb30bfd9e4946b248b3d76e6391028233a3; "
+        f"{marker}"
+    ) in path_c
     assert "z3-solver>=4.15,<4.15.5" in config["project"]["dependencies"]
