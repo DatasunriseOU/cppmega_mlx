@@ -18,6 +18,33 @@
       "classification": "deliberate_compiler_crash_fixture",
       "detected_format": "clang_debug_crash_pragma",
       "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "microsoft/DirectXShaderCompiler",
+      "relative_path": "tools/clang/test/Parser/crash-report.c",
+      "size_bytes": 271,
+      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
+    },
+    {
+      "project_id": "eclipse-threadx/threadx",
+      "relative_path": "ports_module/cortex_a7/ac5/example_build/module_code.c",
+      "size_bytes": 61551,
+      "sha256": "2d49edeeb4233af4972ac4f9cec96b171d92ffad0738eaf3b4dcd536a05e9294",
+      "classification": "generated_binary_blob",
+      "detected_format": "mixed_utf8_utf16le_c_array",
+      "reason": "Generated UTF-16LE C byte array embedding a ThreadX module ELF, prefixed by a UTF-8 license block"
+    },
+    {
+      "project_id": "xemu-project/xemu",
+      "relative_path": "roms/edk2/CryptoPkg/Library/OpensslLib/openssl/pyca-cryptography/vectors/cryptography_vectors/x509/PKITS_data/certpairs/PoliciesP1234subsubCAP123P12CertreversecrossCertificatePair.cp",
+      "size_bytes": 955,
+      "sha256": "8734808c3859f30101cb1934bf7d71d153430dd85ae357d41c1641fc7a8addfe",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "asn1_der_x509_certificate_pair",
+      "reason": "DER X.509 CertificatePair test vector stored under a .cp suffix"
     }
   ]
 }
