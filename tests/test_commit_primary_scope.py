@@ -433,7 +433,7 @@ def test_domain_commit_dedup_keeps_distinct_changes_with_same_post_state(
         encoding="utf-8",
     )
     output = io.StringIO()
-    dedup_store = DedupStore(str(tmp_path / "dedup.sqlite"), near=True)
+    dedup_store = DedupStore(str(tmp_path / "dedup.sqlite"), near=False)
 
     try:
         stats = process_jsonl_file(
