@@ -36,7 +36,9 @@ _SUPPORTED_CLASSIFICATION_FORMATS = {
         "deliberate_compiler_crash_fixture",
         "clang_debug_crash_pragma",
     ),
+    ("generated_binary_blob", "mixed_utf8_utf16le_c_array"),
     ("mislabeled_non_cpp", "xml_utf16le"),
+    ("mislabeled_non_cpp", "asn1_der_x509_certificate_pair"),
 }
 
 
@@ -152,6 +154,31 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _der_tlv_bounds(payload: bytes, offset: int) -> tuple[int, int, int]:
+    if offset + 2 > len(payload):
+        raise ValueError("truncated DER tag or length")
+    tag = payload[offset]
+    first_length = payload[offset + 1]
+    if first_length < 0x80:
+        content_start = offset + 2
+        length = first_length
+    else:
+        length_bytes = first_length & 0x7F
+        if length_bytes == 0 or length_bytes > 4 or offset + 2 + length_bytes > len(payload):
+            raise ValueError("invalid DER long-form length")
+        encoded_length = payload[offset + 2 : offset + 2 + length_bytes]
+        if encoded_length[0] == 0:
+            raise ValueError("non-minimal DER length")
+        length = int.from_bytes(encoded_length, "big")
+        if length < 0x80:
+            raise ValueError("non-minimal DER long-form length")
+        content_start = offset + 2 + length_bytes
+    content_end = content_start + length
+    if content_end > len(payload):
+        raise ValueError("DER value exceeds input")
+    return tag, content_start, content_end
+
+
 def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
     if entry.detected_format == "xml_utf16le":
         with path.open("rb") as source:
@@ -203,6 +230,92 @@ def _verify_detected_format(path: Path, entry: SourceQuarantineEntry) -> None:
                 f"{entry.relative_path}: declared clang_debug_crash_pragma "
                 "but the deliberate crash signature is absent or ambiguous"
             )
+        return
+
+    if entry.detected_format == "mixed_utf8_utf16le_c_array":
+        payload = path.read_bytes()
+        marker = "/* \n\n   Input ELF file:".encode("utf-16le")
+        boundary = payload.find(marker)
+        if boundary <= 0:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                "but the UTF-16LE generated-array header is absent"
+            )
+        try:
+            prefix = payload[:boundary].decode("utf-8")
+            generated = payload[boundary:].decode("utf-16le")
+        except UnicodeDecodeError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                f"but an encoded section is invalid: {exc}"
+            ) from exc
+        required_prefix = (
+            "Eclipse ThreadX contributors",
+            "SPDX-License-Identifier: MIT",
+        )
+        required_generated = (
+            "Input ELF file:",
+            "Output C Array file:",
+            "__align(4096) unsigned char  module_code[] = {",
+            "/* Address",
+        )
+        byte_literals = re.findall(
+            r"(?<![0-9A-F])0x[0-9A-F]{2}(?![0-9A-F])",
+            generated,
+        )
+        if (
+            not all(marker in prefix for marker in required_prefix)
+            or not all(marker in generated for marker in required_generated)
+            or len(byte_literals) < 1024
+            or "\x00" in generated
+            or not generated.rstrip().endswith("};")
+        ):
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared mixed_utf8_utf16le_c_array "
+                "but the generated binary-array contract is incomplete"
+            )
+        return
+
+    if entry.detected_format == "asn1_der_x509_certificate_pair":
+        payload = path.read_bytes()
+        try:
+            outer_tag, outer_start, outer_end = _der_tlv_bounds(payload, 0)
+            if outer_tag != 0x30 or outer_end != len(payload):
+                raise ValueError("outer value is not one exact DER SEQUENCE")
+            wrapper_tags: set[int] = set()
+            offset = outer_start
+            while offset < outer_end:
+                wrapper_tag, wrapper_start, wrapper_end = _der_tlv_bounds(
+                    payload,
+                    offset,
+                )
+                if wrapper_tag not in {0xA0, 0xA1} or wrapper_tag in wrapper_tags:
+                    raise ValueError("invalid or duplicate CertificatePair wrapper")
+                wrapper_tags.add(wrapper_tag)
+                cert_tag, cert_start, cert_end = _der_tlv_bounds(
+                    payload,
+                    wrapper_start,
+                )
+                if cert_tag != 0x30 or cert_end != wrapper_end:
+                    raise ValueError("wrapper does not contain one certificate SEQUENCE")
+                child_offset = cert_start
+                for expected_tag in (0x30, 0x30, 0x03):
+                    child_tag, _, child_offset = _der_tlv_bounds(
+                        payload,
+                        child_offset,
+                    )
+                    if child_tag != expected_tag:
+                        raise ValueError("invalid X.509 certificate field layout")
+                if child_offset != cert_end:
+                    raise ValueError("certificate SEQUENCE has trailing fields")
+                offset = wrapper_end
+            if not wrapper_tags:
+                raise ValueError("CertificatePair is empty")
+        except ValueError as exc:
+            raise SourceQuarantineError(
+                f"{entry.relative_path}: declared asn1_der_x509_certificate_pair "
+                f"but the DER structure is invalid: {exc}"
+            ) from exc
         return
 
     raise SourceQuarantineError(
