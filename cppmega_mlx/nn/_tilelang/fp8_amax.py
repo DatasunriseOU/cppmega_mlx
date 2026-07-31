@@ -18,9 +18,15 @@ The reference Triton kernels ported here live in:
   ``cppmega_mlx/nn/_tilelang/fp8_vecmat_path_c.py``.
 
 The CUDA emission of the resulting TileLang PrimFunc is numerically equivalent
-to the Triton kernel; the Metal emission relies on ``tvm_thread_allreduce``
-plus a global ``T.atomic_max`` for the cross-block reduction (atomic_max on
-fp32 is implemented via a CAS loop on Metal, matching CUDA's atomicMax fp32).
+to the Triton kernel. On Metal the cross-block reduction CANNOT use
+``T.atomic_max``: the TileLang fork registers its ``AtomicReduceImpl`` only
+for CUDA and ROCm (``src/backend/{cuda,rocm}/op/atomic_reduce.cc``), so
+``tl.atomic_reduce`` hits an ICHECK in ``src/op/atomic_reduce.cc`` during
+``LayoutInference`` for ``"metal"`` targets. The Metal path is therefore
+two-stage: the kernel writes one partial max per block to a ``Partials``
+buffer (no atomics, each block owns exactly one slot) and an explicit Metal
+adapter reduces those device-resident partials with ``torch.Tensor.amax``.
+Numerically identical to the atomic path (max is associative/commutative).
 
 Deferred features (NOT implemented in this PoC)
 -----------------------------------------------
@@ -44,7 +50,8 @@ API surface
 -----------
 
 * :func:`fp8_amax_tilelang` -- compute per-tensor abs-max (fp32 scalar) of a
-  fp16/bf16/fp32 tensor via a TileLang block-reduce + atomic_max kernel.
+  fp16/bf16/fp32 tensor via a TileLang block-reduce and target-specific
+  cross-block reduction.
 * :func:`fp8_quantize_tilelang` -- given an inv_scale, scale + clamp + cast to
   fp8 e4m3fn via a TileLang elementwise kernel.
 * :func:`tilelang_supports` -- runtime gate the patched
@@ -409,17 +416,18 @@ def make_fp8_amax_kernel(
 
             # Single thread writes the block-local amax via atomic_max into
             # the global fp32 scalar. TileLang lowers this to atomicMax on
-            # CUDA and to a CAS loop on Metal (atomicMax on fp32 is not a
-            # native MSL primitive).
+            # CUDA; there is NO Metal lowering (the fork registers
+            # AtomicReduceImpl only for CUDA/ROCm), so Metal targets must use
+            # _make_fp8_amax_partials_kernel + device Tensor.amax instead.
             #
             # Wave-11: pre-filter NaN before atomic_max. CUDA atomicMax on
             # fp32 has undefined behaviour on NaN inputs and the Metal CAS
             # loop spins forever (NaN != NaN, so compare_exchange never
             # succeeds). ``v == v`` is False iff v is NaN; substitute 0.0
-            # (amax identity) on NaN. The wave-3 ``FloatingPointError`` raise
-            # in ``fp8_amax_tilelang`` still fires on the post-kernel scalar
-            # if the input was all-NaN, so callers still get a hard failure
-            # instead of silent zero scale.
+            # (amax identity) on NaN. Trade-off: a NaN-poisoned input now
+            # yields the finite max over the real data, so the wave-3
+            # ``FloatingPointError`` in ``fp8_pack_tilelang`` fires only for
+            # Inf inputs (Inf survives the filter: ``inf == inf``).
             if T.get_thread_binding(0) == 0:
                 amax_safe = T.if_then_else(
                     local_amax[0] == local_amax[0],
@@ -429,6 +437,93 @@ def make_fp8_amax_kernel(
                 T.atomic_max(Amax, amax_safe)
 
     return fp8_amax_reduce
+
+
+def _make_fp8_amax_partials_kernel(
+    *,
+    n_elements: int,
+    in_dtype: str = "float16",
+    block_size: int = _FP8_AMAX_BLOCK_SIZE,
+    threads: int = _FP8_AMAX_THREADS,
+) -> Any:
+    """Build the Metal two-stage amax variant: per-block partial maxima.
+
+    Identical to :func:`make_fp8_amax_kernel` except the final store: instead
+    of ``T.atomic_max`` against a global scalar (which has NO Metal lowering
+    in the TileLang fork -- ``AtomicReduceImpl`` is registered only for
+    CUDA/ROCm, see ``src/backend/{cuda,rocm}/op/atomic_reduce.cc`` and the
+    ICHECK in ``src/op/atomic_reduce.cc``), thread 0 of each block writes its
+    block-local max to ``Partials[bx]``. Every block owns exactly one slot,
+    so no atomic is needed. The Metal adapter reduces the device-resident
+    partials with ``torch.Tensor.amax`` -- max is associative/commutative so
+    the result is identical to the atomic path.
+
+    Inputs:
+        ``X``: ``(N,)`` ``in_dtype``.
+        ``Partials``: ``(ceildiv(N, BLOCK),)`` fp32, one slot per block.
+
+    The NaN pre-filter mirrors the atomic kernel so partials never carry NaN
+    into the device-side reduce.
+    """
+
+    if n_elements <= 0:
+        raise ValueError(f"n_elements must be positive; got {n_elements}")
+    if block_size <= 0 or threads <= 0:
+        raise ValueError(f"block_size/threads must be positive; got {block_size}, {threads}")
+    if block_size % threads != 0:
+        raise RuntimeError(
+            f"fp8_amax_partials: BLOCK_SIZE={block_size} not divisible by THREADS={threads} "
+            f"(N={n_elements}); see fp8_amax.py BLOCK_SIZE_TABLE invariant."
+        )
+
+    import tilelang.language as T
+
+    T = cast(Any, T)
+
+    N = n_elements
+    BLOCK = block_size
+    NB = (N + BLOCK - 1) // BLOCK
+    # Same closure-rebind contract as make_fp8_amax_kernel (wave-8 #1).
+    DTYPE = in_dtype
+
+    # Wave-8 #1: see the make_fp8_amax_kernel comment above. NB joins the
+    # shared module-globals slots; concurrent builds stay serialised under
+    # _FP8_AMAX_LOCK for the same reason as N/BLOCK/DTYPE.
+    _expose_to_globals(
+        _make_fp8_amax_partials_kernel,
+        {"N": N, "BLOCK": BLOCK, "NB": NB, "DTYPE": DTYPE},
+    )
+
+    @T.prim_func
+    def _fp8_amax_partials(
+        X: T.Tensor((N,), DTYPE),
+        Partials: T.Tensor((NB,), "float32"),
+    ):
+        with T.Kernel(NB, threads=threads) as bx:
+            X_abs = T.alloc_fragment((BLOCK,), "float32")
+            local_amax = T.alloc_fragment((1,), "float32")
+
+            for i in T.Parallel(BLOCK):
+                gi = bx * BLOCK + i
+                if gi < N:
+                    X_abs[i] = T.abs(T.cast(X[gi], "float32"))
+                else:
+                    X_abs[i] = T.cast(0, "float32")
+
+            T.reduce_max(X_abs, local_amax, dim=0, clear=True)
+
+            # No atomic hazard here (each block owns Partials[bx]) but keep
+            # the NaN -> 0.0 filter so a poisoned block cannot push NaN into
+            # the device-side reduce, matching the atomic kernel's semantics.
+            if T.get_thread_binding(0) == 0:
+                amax_safe = T.if_then_else(
+                    local_amax[0] == local_amax[0],
+                    local_amax[0],
+                    T.cast(0, "float32"),
+                )
+                Partials[bx] = amax_safe
+
+    return _fp8_amax_partials
 
 
 def make_fp8_quantize_kernel(
@@ -501,6 +596,88 @@ def make_fp8_quantize_kernel(
     return fp8_quantize_e4m3
 
 
+def make_fp8_quantize_metal_kernel(
+    *,
+    n_elements: int,
+    in_dtype: str = "float16",
+    block_size: int = _FP8_QUANT_BLOCK_SIZE,
+    threads: int = _FP8_QUANT_THREADS,
+) -> Any:
+    """Build the Metal quantize variant with explicit in-DSL fp8 encoding.
+
+    The TileLang fork's Metal codegen has NO float -> float8 cast:
+    ``CodeGenTileLangMetal::CastFromTo`` (src/target/codegen_metal.cc) only
+    special-cases fp8 *decode* (``__tvm_fp8_e4m3_to_half``) and falls through
+    to ``CodeGenC::CastFromTo`` for encode, which emits a plain C
+    ``(uchar4)v`` cast -- truncating the float instead of producing e4m3fn
+    bits (observed: quantize output all 0x00 / garbage on Metal). The fork's
+    sanctioned Metal path is the uint8-storage boundary with in-DSL encode
+    via ``tilelang.tileop.metal_quant.float_to_fp8_e4m3fn_bits``.
+
+    Same math as :func:`make_fp8_quantize_kernel`, but ``Y`` is raw
+    ``uint8`` storage and the final cast is replaced by the bit-exact
+    encode helper (which also clamps to +-448 and maps NaN to 0). The
+    dispatcher views the caller's fp8 tensor as ``uint8`` before launch, so
+    the public ``fp8_quantize_tilelang`` contract is unchanged.
+
+    Inputs:
+        ``X``: ``(N,)`` ``in_dtype``.
+        ``InvScale``: ``(1,)`` fp32 scalar.
+        ``Y``: ``(N,)`` uint8 -- fp8 e4m3fn bit patterns.
+    """
+
+    if n_elements <= 0:
+        raise ValueError(f"n_elements must be positive; got {n_elements}")
+    if block_size <= 0 or threads <= 0:
+        raise ValueError(f"block_size/threads must be positive; got {block_size}, {threads}")
+    if block_size % threads != 0:
+        raise RuntimeError(
+            f"fp8_quantize_metal: BLOCK_SIZE={block_size} not divisible by THREADS={threads} "
+            f"(N={n_elements}); see fp8_amax.py BLOCK_SIZE_TABLE invariant."
+        )
+
+    import tilelang.language as T
+    from tilelang.tileop.metal_quant import float_to_fp8_e4m3fn_bits
+
+    T = cast(Any, T)
+
+    N = n_elements
+    BLOCK = block_size
+    FP8_MAX = _FP8_E4M3_MAX
+    # Same closure-rebind contract as make_fp8_quantize_kernel (wave-8 #1);
+    # the encode helper is exposed alongside so the PrimFunc annotation /
+    # body parser can resolve it via module globals.
+    DTYPE = in_dtype
+
+    _expose_to_globals(
+        make_fp8_quantize_metal_kernel,
+        {
+            "N": N,
+            "BLOCK": BLOCK,
+            "DTYPE": DTYPE,
+            "FP8_MAX": FP8_MAX,
+            "float_to_fp8_e4m3fn_bits": float_to_fp8_e4m3fn_bits,
+        },
+    )
+
+    @T.prim_func
+    def fp8_quantize_e4m3_metal(
+        X: T.Tensor((N,), DTYPE),
+        InvScale: T.Tensor((1,), "float32"),
+        Y: T.Tensor((N,), "uint8"),
+    ):
+        with T.Kernel(T.ceildiv(N, BLOCK), threads=threads) as bx:
+            for i in T.Parallel(BLOCK):
+                gi = bx * BLOCK + i
+                if gi < N:
+                    v = T.cast(X[gi], "float32") * InvScale[0]
+                    v = T.max(v, T.cast(-FP8_MAX, "float32"))
+                    v = T.min(v, T.cast(FP8_MAX, "float32"))
+                    Y[gi] = float_to_fp8_e4m3fn_bits(v)
+
+    return fp8_quantize_e4m3_metal
+
+
 # ---------------------------------------------------------------------------
 # JIT cache + torch dispatch
 # ---------------------------------------------------------------------------
@@ -522,12 +699,40 @@ def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
     with the same ``(bucket_n, in_dtype, target)`` may both enter the
     body and stomp each other's globals before either ``@T.prim_func``
     completes.
+
+    Metal targets get the two-stage variant: the TileLang fork has no
+    Metal ``AtomicReduceImpl`` for ``T.atomic_max``, so a partials kernel
+    (one output slot per block, no atomics) is compiled and wrapped in a
+    adapter that reduces the device-resident partials with
+    ``torch.Tensor.amax``. The adapter preserves the ``kernel(flat, amax)``
+    call contract so callers do not branch on the target.
     """
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     with _FP8_AMAX_LOCK:
         block, threads = _pick_block_size(target, bucket_n)
+        if _target_family(target) == "metal":
+            prim = _make_fp8_amax_partials_kernel(
+                n_elements=bucket_n,
+                in_dtype=in_dtype,
+                block_size=block,
+                threads=threads,
+            )
+            partials_kernel = dispatch_lower(prim, target)
+            n_blocks = (bucket_n + block - 1) // block
+
+            def _metal_two_stage_amax(
+                x: torch.Tensor, amax: torch.Tensor,
+                _kernel: Any = partials_kernel, _n_blocks: int = n_blocks,
+            ) -> None:
+                partials = torch.empty(
+                    _n_blocks, dtype=torch.float32, device=x.device
+                )
+                _kernel(x, partials)
+                amax.copy_(partials.amax())
+
+            return _metal_two_stage_amax
         prim = make_fp8_amax_kernel(
             n_elements=bucket_n,
             in_dtype=in_dtype,
@@ -549,12 +754,34 @@ def _quantize_kernel_for(n_elements: int, in_dtype: str, target: str) -> Any:
     Wave-9 #6: serialised under the same ``_FP8_AMAX_LOCK`` as
     :func:`_amax_kernel_for`; both write the same module-globals slots
     (``N``, ``BLOCK``, ``DTYPE``) and so cannot run concurrently.
+
+    Metal targets get the uint8-storage variant: the fork's Metal codegen
+    has no float -> float8 cast (see :func:`make_fp8_quantize_metal_kernel`),
+    so the kernel encodes e4m3fn bits in-DSL and the returned adapter views the
+    caller's fp8 output tensor as ``uint8`` before launch. The
+    ``kernel(x, inv_scale, y)`` call contract is unchanged.
     """
 
     from cppmega_mlx.nn._tilelang._engine_dispatch import dispatch_lower
 
     with _FP8_AMAX_LOCK:
         block, threads = _pick_block_size(target, n_elements)
+        if _target_family(target) == "metal":
+            prim = make_fp8_quantize_metal_kernel(
+                n_elements=n_elements,
+                in_dtype=in_dtype,
+                block_size=block,
+                threads=threads,
+            )
+            uint8_kernel = dispatch_lower(prim, target)
+
+            def _metal_quantize(
+                x: torch.Tensor, inv_scale: torch.Tensor, y: torch.Tensor,
+                _kernel: Any = uint8_kernel,
+            ) -> None:
+                _kernel(x, inv_scale, y.view(torch.uint8))
+
+            return _metal_quantize
         prim = make_fp8_quantize_kernel(
             n_elements=n_elements,
             in_dtype=in_dtype,
@@ -597,9 +824,10 @@ def fp8_amax_tilelang(x: torch.Tensor) -> torch.Tensor:
 
     Matches the contract of the Triton ``_amax_kernel`` invocation in
     ``_triton_fp8_pack``: returns a ``(1,)`` fp32 tensor on the same device as
-    *x*, pre-initialized to zero and updated atomically by the kernel. Caller
-    is responsible for converting it to a host scalar (``.item()``) when
-    computing ``inv_scale`` for the quantize launch.
+    *x*, pre-initialized to zero and filled by the kernel (atomically on CUDA;
+    via the two-stage partial-max kernel + device ``Tensor.amax`` on Metal).
+    Caller is responsible for converting it to a host scalar (``.item()``)
+    when computing ``inv_scale`` for the quantize launch.
 
     Single TileLang source -- target string is selected from ``x.device``.
     """
@@ -726,7 +954,7 @@ def fp8_pack_tilelang(tensor: torch.Tensor, *, clamp: bool = False):
     """Drop-in TileLang replacement for ``_triton_fp8_pack``.
 
     Two kernel launches mirroring the Triton path:
-        1. :func:`fp8_amax_tilelang` -- block-reduce + atomic_max.
+        1. :func:`fp8_amax_tilelang` -- block-reduce + target-specific max.
         2. :func:`fp8_quantize_tilelang` -- scale + clamp + fp8 cast.
 
     The host-side scale computation between the two launches matches the
@@ -750,11 +978,17 @@ def fp8_pack_tilelang(tensor: torch.Tensor, *, clamp: bool = False):
 
     amax_buf = fp8_amax_tilelang(tensor)
     amax_val = amax_buf.item()
-    # NaN/Inf in input ``tensor`` propagates through ``T.abs`` -> ``T.reduce_max``
-    # -> ``T.atomic_max`` and yields a non-finite ``amax_val``. Falling through
-    # to ``inv_scale = fp8_max / amax_val`` would produce 0/NaN and silently
-    # poison every output element. Fail loudly so the caller gets a clear
-    # diagnostic instead of garbage FP8 weights downstream.
+    # Inf survives the target-specific amax reduction and yields a non-finite
+    # ``amax_val``. Falling through to ``inv_scale = fp8_max / amax_val`` would
+    # produce zero and silently poison every output element, so fail loudly.
+    #
+    # Known baseline limitation: both the CUDA atomic path and the Metal
+    # partials path map a NaN block-local maximum to zero before the final
+    # reduction. That avoids undefined CUDA atomicMax behaviour and a Metal
+    # CAS/lowering hazard, but means this scalar check cannot reject NaN input.
+    # Fixing that without a full-size temporary scan requires a separately
+    # lowered device-side poison flag; the current TileLang Metal lowering does
+    # not preserve the attempted ``value == value`` NaN flag through reduction.
     if not math.isfinite(amax_val):
         raise FloatingPointError(
             f"fp8_pack_tilelang: input contains non-finite values "
@@ -781,6 +1015,7 @@ __all__ = [
     "fp8_quantize_tilelang",
     "make_fp8_amax_kernel",
     "make_fp8_quantize_kernel",
+    "make_fp8_quantize_metal_kernel",
     "precompile_amax_kernel",
     "tilelang_supports",
     "tilelang_supports_with_reason",

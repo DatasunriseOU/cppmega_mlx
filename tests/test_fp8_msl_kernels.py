@@ -13,12 +13,17 @@ MLX reference math only. These tests exercise:
    encoding all decode without crashing.
 6. ``mx.custom_function`` VJP returns finite gradients with the expected
    shapes for the autograd-aware ``fp8_scaled_matmul`` wrapper.
+7. The TileLang FP8 amax/quantize path compiles and executes through the
+   engine on real MPS hardware with bit-exact e4m3fn parity.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -76,6 +81,56 @@ def test_checked_in_fp8_helper_receipt_reports_retired_status() -> None:
     assert receipt["kernel"] == "fp8_reference_helpers"
     assert receipt["metal_status"]["available"] is False
     assert "direct-MSL Path B is retired" in receipt["metal_status"]["reason"]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="real Apple Metal execution is required",
+)
+def test_fp8_amax_tilelang_engine_mps_matches_torch_reference() -> None:
+    from scripts.mlx_env_contract import build_path_c_environment
+
+    environment = build_path_c_environment(
+        os.environ,
+        repo_root=REPO_ROOT,
+        python=Path(sys.executable),
+        tilelang_root=REPO_ROOT.parent / "tilelang",
+    )
+    environment["CPPMEGA_MLX_TILELANG_ENGINE"] = "engine"
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import torch
+
+from cppmega_mlx.nn._tilelang._engine_dispatch import tilelang_engine_mode
+from cppmega_mlx.nn._tilelang.fp8_amax import (
+    fp8_amax_tilelang,
+    fp8_quantize_tilelang,
+)
+
+assert tilelang_engine_mode() == "engine"
+cpu = torch.linspace(-448.0, 448.0, 257, dtype=torch.float32).to(torch.float16)
+x = cpu.to("mps")
+amax = fp8_amax_tilelang(x)
+quantized = fp8_quantize_tilelang(x, 1.0)
+torch.mps.synchronize()
+expected = cpu.to(torch.float8_e4m3fn)
+assert amax.item() == cpu.abs().amax().item()
+assert torch.equal(quantized.view(torch.uint8).cpu(), expected.view(torch.uint8))
+print("fp8_mps_engine_ok")
+""",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stderr
+    assert "fp8_mps_engine_ok" in probe.stdout
 
 
 # ---------------------------------------------------------------------------
