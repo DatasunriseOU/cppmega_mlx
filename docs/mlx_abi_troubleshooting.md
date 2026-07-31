@@ -96,7 +96,7 @@ For an intentionally modified local TileLang/TVM checkout:
     ./scripts/run_mlx_path_c.py --allow-dirty-source-stack --verify-only
 
 Without `run_mlx_path_c.py`, the dedicated environment remains ordinary wheel
-mode: `mlx==0.32.0`, `mlx-metal==0.32.0`, and the locked TileLang wheel. The
+mode: `mlx==0.32.0`, `mlx-metal==0.32.0`, and the locked TileLang fork. The
 launcher overlays only the TileLang/TVM/TVM-FFI source stack; it never adds the
 workspace MLX checkout to `PYTHONPATH`.
 
@@ -113,11 +113,10 @@ sync an environment outside the checkout, then point the probe at it:
       uv sync --project . --locked --extra parquet --extra gui --extra widget \
         --extra path-c
 
-The `dev` group installs `pytest`; the `path-c` extra records the released
-TileLang wheel and its test dependencies (`torch`, `einops`,
-`apache-tvm-ffi`) in the lockfile. `scripts/run_mlx_path_c.py` selects the
-sibling source checkout explicitly and reports its origin instead of relying on
-ambient `PYTHONPATH`.
+The `dev` group installs `pytest`; the `path-c` extra locks the cppmega TileLang
+and TVM-FFI fork commits plus their test dependencies (`torch`, `einops`) in the
+lockfile. `scripts/run_mlx_path_c.py` selects the sibling source checkout
+explicitly and reports its origin instead of relying on ambient `PYTHONPATH`.
 
 ### 2. Explicit repair, only for an isolated environment
 
