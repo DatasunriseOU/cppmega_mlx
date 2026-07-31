@@ -32,6 +32,8 @@ docs/upstream/tilelang_metal_mamba3/captures/
 # Codex/agent runtime logs are local coordination artifacts.
 .codex/agent-logs/
 .claude/
+/backend.log
+/frontend.log
 
 # Large real-data samples copied from GB10 for local-only smoke tests.
 data/parquet_samples
