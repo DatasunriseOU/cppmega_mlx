@@ -160,7 +160,8 @@ class TestPrimFuncCache:
     object on repeated calls with the same ``sequence_length``."""
 
     @pytest.fixture(scope="class")
-    def model(self):
+    @classmethod
+    def model(cls):
         from cppmega_mlx.recipes.model_factory import (
             build_local_gb10_quarter_tiny_smoke_model,
         )
