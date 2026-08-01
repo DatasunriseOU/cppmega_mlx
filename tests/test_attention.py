@@ -864,3 +864,114 @@ def test_attention_train_step_has_finite_loss_and_gradients() -> None:
     assert grad_arrays
     for grad in grad_arrays:
         assert np.isfinite(np.array(grad)).all()
+
+
+def test_paged_kv_compatibility_path_matches_contiguous_baseline() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((2, 8, 16), seed=42)
+
+    # Baseline contiguous path.
+    baseline = attn(x, mask="causal")
+    mx.eval(baseline)
+
+    # Paged KV compatibility path.
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=8,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
+    manager.allocate_sequence(seq_id=2, num_tokens=8)
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+
+    out = attn(
+        x,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[8, 8],
+        paged_layer_idx=0,
+    )
+    mx.eval(out)
+
+    assert out.shape == x.shape
+    np.testing.assert_allclose(
+        np.array(baseline), np.array(out), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_paged_kv_compatibility_path_rejects_decode_offsets() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 1, 16), seed=7)
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=4,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=4)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=1)
+
+    with pytest.raises(NotImplementedError, match="prefill-only"):
+        attn(
+            x,
+            mask="causal",
+            paged_kv_manager=manager,
+            paged_block_table=table,
+            paged_seq_lengths=[4],
+            paged_layer_idx=0,
+        )
+
+
+def test_paged_kv_compatibility_path_rejects_dsa() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
+    attn = CausalSelfAttention(cfg)
+    x = _rand((1, 4, 16), seed=8)
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=4,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=4)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=1)
+
+    with pytest.raises(NotImplementedError, match="does not support DSA"):
+        attn(
+            x,
+            mask="causal",
+            paged_kv_manager=manager,
+            paged_block_table=table,
+            paged_seq_lengths=[4],
+            paged_layer_idx=0,
+        )

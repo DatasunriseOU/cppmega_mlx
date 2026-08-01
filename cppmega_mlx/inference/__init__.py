@@ -46,7 +46,9 @@ from cppmega_mlx.inference.serving import (
     SchedulerOutput,
     SequenceRequest,
     build_paged_block_table,
+    gather_paged_kv,
     require_model_integrated_paged_attention,
+    scatter_paged_kv,
 )
 from cppmega_mlx.inference.side_channels import (
     AdapterUnavailableError,
@@ -114,6 +116,8 @@ __all__ = [
     "build_fim_prompt_ids",
     "build_paged_block_table",
     "builtin_code_metadata_adapters",
+    "gather_paged_kv",
+    "scatter_paged_kv",
     "clone_contiguous_kv_cache",
     "compute_tool_use_loss_mask",
     "create_local_generation_app",
