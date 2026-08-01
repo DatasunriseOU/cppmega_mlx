@@ -527,6 +527,7 @@ def _make_target_model(
         num_kv_heads=cfg.num_kv_heads,
         head_dim=cfg.head_dim,
         attention_mode=cfg.attention_mode,
+        rope_only=True,
         structure_components=cfg.structure_components,
         structure_num_categories=cfg.structure_num_categories,
         structure_max_dep_level=cfg.structure_max_dep_level,
@@ -1441,6 +1442,7 @@ def convert_checkpoint(
         "source_contract": source_contract,
         "output": str(output),
         "config": asdict(cfg),
+        "rope_only": True,
         "dtype": "bfloat16" if bf16 else "float32",
         "validation": validation,
         "runtime_requirements": conversion_runtime_requirements(
@@ -1449,7 +1451,7 @@ def convert_checkpoint(
         ),
         "notes": [
             "Megatron AF alternating layer positions are folded into DenseCppLM blocks",
-            "position_embedding.weight is zero because source checkpoint used RoPE-only positions",
+            "target DenseCppLM uses rope_only=True; no position_embedding.weight is emitted because the source checkpoint used RoPE-only positions",
             "platform_embedding.embedding.weight is zero because source checkpoint has doc-level platform sidecars, not a learned platform table",
             "optimizer.* DCP tensors are explicitly excluded from inference conversion",
             "fixed-input logits are compared from raw DCP tensors through an independent NumPy Megatron AF/GQA forward against a fresh MLX model reloaded from emitted safetensors",

@@ -731,6 +731,9 @@ def test_convert_torch_dist_fixture_runs_raw_dcp_to_mlx_logit_parity(
     )
     assert payload["logit_parity"]["reloaded_safetensors"] == str(output.resolve())
     assert payload["logit_parity"]["max_abs_logit_error"] <= 3e-4
+    assert payload["rope_only"] is True
+    weights = dict(mx.load(str(output)))
+    assert "position_embedding.weight" not in weights
 
 
 def _parity_model() -> DenseCppLM:
@@ -1002,6 +1005,8 @@ def test_publish_receipt_records_weights_sha256_and_completion(
         "completion_marker": "model.json",
         "weights_sha256": digest,
     }
+    assert payload["rope_only"] is True
+    assert manifest["rope_only"] is True
     assert manifest["publish"]["weights_sha256"] == digest
     status = mod.published_checkpoint_status(output)
     assert status == {"complete": True, "weights_sha256": digest}

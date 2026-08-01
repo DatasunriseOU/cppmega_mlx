@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import dataclasses
 from typing import get_args
 
 import mlx.core as mx
@@ -838,3 +839,48 @@ def test_real_profile_core_is_about_500m():
     # Transformer core (everything except the n-gram hash feature table) is the
     # quoted model size and should land in the ~500M band.
     assert 480e6 < core < 520e6, f"core params {core/1e6:.1f}M outside ~500M band"
+
+
+def test_rope_only_does_not_create_position_embedding():
+    cfg = _smoke_config(rope_only=True)
+    model = DenseCppLM(cfg)
+    assert model.position_embedding is None
+    from mlx.utils import tree_flatten
+
+    param_names = {name for name, _ in tree_flatten(model.parameters())}
+    assert "position_embedding.weight" not in param_names
+
+
+def test_rope_only_forward_matches_zero_position_table():
+    """A rope_only model equals a regular model whose position table is zeroed."""
+    base_cfg = _smoke_config(ngram_hash_enabled=False)
+    rope_cfg = dataclasses.replace(base_cfg, rope_only=True)
+    regular_model = DenseCppLM(base_cfg)
+    # Zero the learned position table to make the comparison fair.
+    regular_model.position_embedding.weight = mx.zeros_like(
+        regular_model.position_embedding.weight
+    )
+    rope_model = DenseCppLM(rope_cfg)
+
+    # Copy all shared parameters from the regular model into the rope-only model
+    # so initialization order differences do not affect the comparison.
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    regular_params = dict(tree_flatten(regular_model.parameters()))
+    rope_params = dict(tree_flatten(rope_model.parameters()))
+    shared = {k: v for k, v in regular_params.items() if k in rope_params}
+    rope_model.update(tree_unflatten(list(shared.items())))
+    # The only difference must be the absent position_embedding.weight.
+    assert set(regular_params) - set(rope_params) == {"position_embedding.weight"}
+
+    b = _rand_batch(base_cfg, 2, 16, seed=42)
+    regular_logits, _ = regular_model(b["input_ids"], targets=b["targets"])
+    rope_logits, _ = rope_model(b["input_ids"], targets=b["targets"])
+    mx.eval(regular_logits, rope_logits)
+    max_abs_diff = float(mx.max(mx.abs(regular_logits - rope_logits)).item())
+    assert max_abs_diff < 1e-5, f"rope_only logits diverge by {max_abs_diff}"
+
+
+def test_rope_only_requires_rope():
+    with pytest.raises(ValueError, match="rope_only=True requires rope=True"):
+        _smoke_config(rope=False, rope_only=True)

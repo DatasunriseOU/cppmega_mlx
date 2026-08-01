@@ -103,6 +103,7 @@ class DenseCppLMConfig:
     attention_mode: DenseAttentionMode = "gqa"
     rope: bool = True
     rope_theta: float = 10000.0
+    rope_only: bool = False
     attention_sparse_topk: int = 256  # only consumed when attention_mode='dsa'
     # Graph-supervised lightning indexer knobs (attention_mode='dsa' only).
     indexer_heads: int = 4
@@ -204,6 +205,8 @@ class DenseCppLMConfig:
             )
         if self.head_dim <= 0:
             raise ValueError(f"head_dim must be positive, got {self.head_dim}")
+        if self.rope_only and not self.rope:
+            raise ValueError("rope_only=True requires rope=True")
         if self.rope and self.head_dim % 2 != 0:
             raise ValueError(
                 f"head_dim must be even when rope=True, got {self.head_dim}"
@@ -499,7 +502,9 @@ class DenseCppLM(nn.Module):
         cfg = self.config
 
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.position_embedding = nn.Embedding(cfg.max_seq_length, cfg.hidden_size)
+        self.position_embedding: nn.Embedding | None = None
+        if not cfg.rope_only:
+            self.position_embedding = nn.Embedding(cfg.max_seq_length, cfg.hidden_size)
 
         self.structure_embedding = CppMegaStructureEmbedding(
             **cfg.structure_embedding_kwargs()
@@ -579,7 +584,9 @@ class DenseCppLM(nn.Module):
             "document_ids", document_ids, batch_size, seq_length
         )
         positions = mx.arange(seq_length)[None, :]
-        hidden = self.token_embedding(input_ids) + self.position_embedding(positions)
+        hidden = self.token_embedding(input_ids)
+        if self.position_embedding is not None:
+            hidden = hidden + self.position_embedding(positions)
 
         if self.ngram_hash_embedding is not None and self.config.ngram_residual_scale:
             ngram = self.ngram_hash_embedding(
