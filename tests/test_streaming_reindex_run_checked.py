@@ -364,7 +364,7 @@ def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:
     repo_dir = cache / "repo" / "src"
     repo_dir.mkdir(parents=True)
     (cache / "repo" / streaming_reindex.SOURCE_CACHE_SENTINEL).write_text(
-        "{}\n",
+        json.dumps({"repo": "repo"}) + "\n",
         encoding="utf-8",
     )
     (repo_dir / "x.cc").write_text("int x;\n", encoding="utf-8")
@@ -390,13 +390,13 @@ def test_stream_repo_subtrees_source_cache_skips_bare_but_keeps_source_dumps(
     bare = cache / "repo.bare"
     bare.mkdir(parents=True)
     (bare / streaming_reindex.SOURCE_CACHE_SENTINEL).write_text(
-        "{}\n",
+        json.dumps({"repo": "repo.bare"}) + "\n",
         encoding="utf-8",
     )
     source_dump = cache / "windows_10_shared_source_kit"
     source_dump.mkdir()
     (source_dump / streaming_reindex.SOURCE_CACHE_SENTINEL).write_text(
-        "{}\n",
+        json.dumps({"repo": "windows_10_shared_source_kit"}) + "\n",
         encoding="utf-8",
     )
 

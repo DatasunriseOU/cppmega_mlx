@@ -13,6 +13,8 @@ All notable UI-surface changes since the V7 honest-closure pass.
   raw-name compatibility.
 - Focused verification: 79 source-contract tests, 74 conveyor/cache tests,
   7 cleanup tests, and the real SIGTERM/resume subprocess test passed.
+- Updated the two legacy source-cache fixtures to write the required logical
+  repository identity; the fail-closed sentinel validation remains unchanged.
 - The legacy `bionic`/`v8` → `nickg/nvc` identity defect remains open and is
   not hidden by this storage fix.
 
