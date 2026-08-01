@@ -1,10 +1,12 @@
 """MLX-local paged KV scheduling primitives for bounded inference serving.
 
 This module ports the scheduler-facing subset of nanochat's paged KV serving
-surface without claiming model-integrated paged attention. It owns MLX block
-pools, sequence block tables, and continuous-batch admission/preemption
-metadata. The actual model attention path must call
-``require_model_integrated_paged_attention()`` until it is wired and tested.
+surface. It owns MLX block pools, sequence block tables, and continuous-batch
+admission/preemption metadata. The model attention path can opt into the
+*paged KV compatibility path* via :func:`gather_paged_kv` and
+:func:`scatter_paged_kv`, which round-trip paged blocks through contiguous
+K/V tensors so that ``mx.fast.scaled_dot_product_attention`` can be reused
+until a native paged attention kernel is wired and tested.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal, Sequence
+import warnings
 
 import mlx.core as mx
 import numpy as np
@@ -519,10 +522,219 @@ def build_paged_block_table(
     return mx.array(table)
 
 
-def require_model_integrated_paged_attention() -> None:
-    """Fail closed until MLX model attention consumes paged KV block tables."""
+def gather_paged_kv(
+    manager: PagedKVBlockManager,
+    block_table: mx.array,
+    layer_idx: int,
+    seq_lengths: mx.array | Sequence[int],
+) -> tuple[mx.array, mx.array]:
+    """Gather contiguous K/V tensors from a paged block table.
 
-    raise NotImplementedError(PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE)
+    The returned tensors have shape ``(batch, kv_heads, max_seq_len, head_dim)``
+    and are suitable for ``mx.fast.scaled_dot_product_attention``. Positions
+    beyond each sequence's ``seq_lengths`` are zeroed so that a causal mask
+    keeps them out of the attention computation.
+
+    Args:
+        manager: paged KV block manager that owns the physical pool.
+        block_table: int32 array of shape ``(batch, max_blocks_per_seq)``.
+        layer_idx: layer whose K/V blocks should be read.
+        seq_lengths: int32 array or list of length ``batch`` with actual token
+            counts. May be shorter than ``max_blocks_per_seq * block_size``.
+
+    Returns:
+        Contiguous ``(k, v)`` tensors in MLX attention layout.
+    """
+
+    if not isinstance(manager, PagedKVBlockManager):
+        raise TypeError("manager must be a PagedKVBlockManager")
+    _validate_int("layer_idx", layer_idx)
+    if layer_idx < 0 or layer_idx >= manager.num_layers:
+        raise IndexError("layer_idx out of range")
+    if block_table.ndim != 2:
+        raise ValueError(f"block_table must be 2-D, got {block_table.ndim}")
+    batch = int(block_table.shape[0])
+    max_blocks = int(block_table.shape[1])
+    if isinstance(seq_lengths, mx.array):
+        seq_lengths_arr = seq_lengths.astype(mx.int32)
+    else:
+        seq_lengths_arr = mx.array(list(seq_lengths), dtype=mx.int32)
+    if seq_lengths_arr.shape != (batch,):
+        raise ValueError(
+            f"seq_lengths must have shape ({batch},), got {seq_lengths_arr.shape}"
+        )
+
+    k_layer = manager.k_pool[:, layer_idx, :, :, :]
+    v_layer = manager.v_pool[:, layer_idx, :, :, :]
+    gathered_k = mx.take(k_layer, block_table, axis=0)
+    gathered_v = mx.take(v_layer, block_table, axis=0)
+    gathered_k = gathered_k.reshape(
+        batch, max_blocks * manager.block_size, manager.num_kv_heads, manager.head_dim
+    )
+    gathered_v = gathered_v.reshape(
+        batch, max_blocks * manager.block_size, manager.num_kv_heads, manager.head_dim
+    )
+    gathered_k = mx.transpose(gathered_k, (0, 2, 1, 3))
+    gathered_v = mx.transpose(gathered_v, (0, 2, 1, 3))
+
+    max_seq_len = int(gathered_k.shape[2])
+    actual_max = int(mx.max(seq_lengths_arr).item())
+    if actual_max < max_seq_len:
+        pos = mx.arange(max_seq_len, dtype=mx.int32)[None, None, :, None]
+        mask = pos < seq_lengths_arr[:, None, None, None]
+        mask = mask.astype(manager.k_pool.dtype)
+        gathered_k = gathered_k * mask
+        gathered_v = gathered_v * mask
+    return gathered_k, gathered_v
+
+
+def scatter_paged_kv(
+    manager: PagedKVBlockManager,
+    block_table: mx.array,
+    layer_idx: int,
+    k: mx.array,
+    v: mx.array,
+    seq_lengths: mx.array | Sequence[int],
+) -> None:
+    """Write contiguous K/V tensors into the paged pool via a block table.
+
+    This is the write side of the paged KV compatibility path. The caller is
+    responsible for ensuring that ``block_table`` entries are unique across the
+    batch (an invariant enforced by ``PagedKVBlockManager``).
+
+    Args:
+        manager: paged KV block manager that owns the physical pool.
+        block_table: int32 array of shape ``(batch, max_blocks_per_seq)``.
+        layer_idx: layer whose K/V blocks should be written.
+        k: tensor of shape ``(batch, kv_heads, seq_len, head_dim)``.
+        v: tensor of shape ``(batch, kv_heads, seq_len, head_dim)``.
+        seq_lengths: int32 array or list of length ``batch`` with actual token
+            counts. May be shorter than ``max_blocks_per_seq * block_size``.
+    """
+
+    if not isinstance(manager, PagedKVBlockManager):
+        raise TypeError("manager must be a PagedKVBlockManager")
+    _validate_int("layer_idx", layer_idx)
+    if layer_idx < 0 or layer_idx >= manager.num_layers:
+        raise IndexError("layer_idx out of range")
+    if block_table.ndim != 2:
+        raise ValueError(f"block_table must be 2-D, got {block_table.ndim}")
+    if k.shape != v.shape:
+        raise ValueError("k and v must have the same shape")
+    if k.ndim != 4:
+        raise ValueError(f"k must be 4-D, got {k.ndim}")
+    batch = int(block_table.shape[0])
+    max_blocks = int(block_table.shape[1])
+    if k.shape[0] != batch:
+        raise ValueError(f"k batch dim {k.shape[0]} must match block_table {batch}")
+    if k.shape[1] != manager.num_kv_heads:
+        raise ValueError(
+            f"k kv_heads dim {k.shape[1]} must match manager {manager.num_kv_heads}"
+        )
+    if k.shape[3] != manager.head_dim:
+        raise ValueError(
+            f"k head_dim {k.shape[3]} must match manager {manager.head_dim}"
+        )
+    if isinstance(seq_lengths, mx.array):
+        seq_lengths_arr = seq_lengths.astype(mx.int32)
+    else:
+        seq_lengths_arr = mx.array(list(seq_lengths), dtype=mx.int32)
+    if seq_lengths_arr.shape != (batch,):
+        raise ValueError(
+            f"seq_lengths must have shape ({batch},), got {seq_lengths_arr.shape}"
+        )
+
+    max_seq_len = max_blocks * manager.block_size
+    if k.shape[2] > max_seq_len:
+        raise ValueError(
+            f"k sequence dim {k.shape[2]} exceeds block_table capacity {max_seq_len}"
+        )
+
+    k_pad = mx.transpose(_pad_or_trim_kv(k, max_seq_len), (0, 2, 1, 3))
+    v_pad = mx.transpose(_pad_or_trim_kv(v, max_seq_len), (0, 2, 1, 3))
+    k_blocks = k_pad.reshape(
+        batch, max_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim
+    )
+    v_blocks = v_pad.reshape(
+        batch, max_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim
+    )
+
+    logical_pos = mx.arange(max_blocks * manager.block_size, dtype=mx.int32).reshape(
+        max_blocks, manager.block_size
+    )
+    live_mask = logical_pos[None, :, :] < seq_lengths_arr[:, None, None]
+    live_mask = live_mask.reshape(
+        batch, max_blocks, manager.block_size, 1, 1
+    ).astype(k.dtype)
+    k_blocks = k_blocks * live_mask
+    v_blocks = v_blocks * live_mask
+
+    work_k = mx.zeros(
+        (batch, manager.num_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim),
+        dtype=k.dtype,
+    )
+    work_v = mx.zeros(
+        (batch, manager.num_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim),
+        dtype=v.dtype,
+    )
+    indices = block_table[:, :, None, None, None]
+    work_k = mx.put_along_axis(work_k, indices, k_blocks, axis=1)
+    work_v = mx.put_along_axis(work_v, indices, v_blocks, axis=1)
+
+    pooled_k = mx.sum(work_k, axis=0)
+    pooled_v = mx.sum(work_v, axis=0)
+
+    update_k = pooled_k[None, ...]
+    update_k = mx.transpose(update_k, (1, 0, 2, 3, 4))
+    update_v = pooled_v[None, ...]
+    update_v = mx.transpose(update_v, (1, 0, 2, 3, 4))
+    manager.k_pool = mx.slice_update(
+        manager.k_pool,
+        update_k,
+        mx.array([0, layer_idx, 0, 0, 0]),
+        axes=(0, 1, 2, 3, 4),
+    )
+    manager.v_pool = mx.slice_update(
+        manager.v_pool,
+        update_v,
+        mx.array([0, layer_idx, 0, 0, 0]),
+        axes=(0, 1, 2, 3, 4),
+    )
+
+
+def _pad_or_trim_kv(x: mx.array, target_len: int) -> mx.array:
+    """Pad or trim a (batch, heads, seq, dim) tensor along the sequence axis."""
+
+    seq_len = int(x.shape[2])
+    if seq_len == target_len:
+        return x
+    if seq_len > target_len:
+        return x[:, :, :target_len, :]
+    pad_shape = list(x.shape)
+    pad_shape[2] = target_len - seq_len
+    pad = mx.zeros(pad_shape, dtype=x.dtype)
+    return mx.concatenate([x, pad], axis=2)
+
+
+def require_model_integrated_paged_attention() -> None:
+    """Deprecated sentinel; the paged KV compatibility path is now available.
+
+    Callers should pass ``paged_kv_manager`` and ``paged_block_table`` to
+    :class:`CausalSelfAttention` instead. This function is kept for backward
+    compatibility and will be removed once the native paged attention kernel
+    lands.
+    """
+
+    warnings.warn(
+        (
+            "require_model_integrated_paged_attention() is deprecated. "
+            f"{PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE} "
+            "Use CausalSelfAttention(..., paged_kv_manager=..., paged_block_table=...) "
+            "for the compatibility path."
+        ),
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 
 def _resolve_block_manager_config(
@@ -606,5 +818,7 @@ __all__ = [
     "SchedulerOutput",
     "SequenceRequest",
     "build_paged_block_table",
+    "gather_paged_kv",
     "require_model_integrated_paged_attention",
+    "scatter_paged_kv",
 ]

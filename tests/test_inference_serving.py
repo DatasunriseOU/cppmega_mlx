@@ -10,7 +10,9 @@ from cppmega_mlx.inference import (
     PagedKVBlockManager,
     PagedKVBlockManagerConfig,
     build_paged_block_table,
+    gather_paged_kv,
     require_model_integrated_paged_attention,
+    scatter_paged_kv,
 )
 
 
@@ -212,13 +214,83 @@ def test_streaming_generation_is_not_paged_attention_integration() -> None:
     assert "contiguous KV inference" in inference.PAGED_ATTENTION_NOT_INTEGRATED_MESSAGE
 
 
-def test_paged_attention_model_integration_fails_closed() -> None:
-    with pytest.raises(NotImplementedError, match="not wired yet"):
+def test_paged_attention_model_integration_is_deprecated_warning() -> None:
+    with pytest.warns(DeprecationWarning, match="not wired yet"):
         require_model_integrated_paged_attention()
+
+
+def test_gather_paged_kv_returns_contiguous_masked_tensors() -> None:
+    manager = _manager(num_blocks=4, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=5)
+    manager.allocate_sequence(seq_id=2, num_tokens=1)
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+
+    # Seed distinct values into the physical pool for layer 0.
+    manager.k_pool = manager.k_pool + 1.0
+    manager.v_pool = manager.v_pool + 2.0
+
+    k, v = gather_paged_kv(manager, table, layer_idx=0, seq_lengths=[5, 1])
+
+    assert k.shape == (2, manager.num_kv_heads, 8, manager.head_dim)
+    assert v.shape == k.shape
+    # seq_id=1 occupies both blocks but only 5 tokens are live.
+    np.testing.assert_array_equal(
+        _as_numpy(mx.sum(k[0, :, :5, :], axis=(0, 2)) != 0),
+        np.ones(5, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(mx.sum(k[0, :, 5:, :], axis=(0, 2)) == 0),
+        np.ones(3, dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        _as_numpy(mx.sum(k[1, :, 1:, :], axis=(0, 2)) == 0),
+        np.ones(7, dtype=np.float32),
+    )
+
+
+def test_scatter_paged_kv_round_trip_matches_source() -> None:
+    manager = _manager(num_blocks=4, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=5)
+    manager.allocate_sequence(seq_id=2, num_tokens=1)
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+
+    batch, kv_heads, seq_len, head_dim = 2, manager.num_kv_heads, 8, manager.head_dim
+    k = mx.arange(batch * kv_heads * seq_len * head_dim, dtype=mx.float32).reshape(
+        batch, kv_heads, seq_len, head_dim
+    )
+    v = k * 10.0
+
+    scatter_paged_kv(manager, table, layer_idx=0, k=k, v=v, seq_lengths=[5, 1])
+    k_out, v_out = gather_paged_kv(manager, table, layer_idx=0, seq_lengths=[5, 1])
+
+    # First 5 positions for seq 1 and first 1 position for seq 2 must match.
+    np.testing.assert_allclose(_as_numpy(k_out[0, :, :5, :]), _as_numpy(k[0, :, :5, :]))
+    np.testing.assert_allclose(_as_numpy(k_out[1, :, :1, :]), _as_numpy(k[1, :, :1, :]))
+    np.testing.assert_allclose(_as_numpy(v_out[0, :, :5, :]), _as_numpy(v[0, :, :5, :]))
+    np.testing.assert_allclose(_as_numpy(v_out[1, :, :1, :]), _as_numpy(v[1, :, :1, :]))
+    # Padding beyond seq_lengths is zeroed.
+    np.testing.assert_array_equal(
+        _as_numpy(mx.sum(k_out[1, :, 1:, :])), 0.0
+    )
+
+
+def test_scatter_paged_kv_rejects_shape_mismatch() -> None:
+    manager = _manager(num_blocks=4, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=5)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+    k = mx.zeros((1, manager.num_kv_heads, 20, manager.head_dim))
+    v = mx.zeros((1, manager.num_kv_heads, 20, manager.head_dim))
+
+    with pytest.raises(ValueError, match="exceeds block_table capacity"):
+        scatter_paged_kv(manager, table, layer_idx=0, k=k, v=v, seq_lengths=[5])
 
 
 def test_inference_root_exports_serving_primitives() -> None:
     assert inference.PagedKVBlockManager is PagedKVBlockManager
     assert inference.ContinuousBatchScheduler is ContinuousBatchScheduler
+    assert inference.gather_paged_kv is gather_paged_kv
+    assert inference.scatter_paged_kv is scatter_paged_kv
     assert "PagedKVBlockManager" in inference.__all__
+    assert "gather_paged_kv" in inference.__all__
+    assert "scatter_paged_kv" in inference.__all__
     assert "require_model_integrated_paged_attention" in inference.__all__

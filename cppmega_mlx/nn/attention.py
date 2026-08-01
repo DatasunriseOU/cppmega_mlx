@@ -11,6 +11,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from cppmega_mlx.inference.engine import ContiguousKVCache
+from cppmega_mlx.inference.serving import (
+    PagedKVBlockManager,
+    gather_paged_kv,
+    scatter_paged_kv,
+)
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
 
@@ -1068,6 +1073,94 @@ class CausalSelfAttention(nn.Module):
             and (not isinstance(mask, str) or mask == "causal")
         )
 
+    def _apply_paged_kv_compatibility_path(
+        self,
+        hidden_states: mx.array,
+        mask: mx.array | Literal["causal"] | None,
+        *,
+        attention_bias: mx.array | None,
+        sinks: mx.array | None,
+        paged_kv_manager: PagedKVBlockManager,
+        paged_block_table: mx.array,
+        paged_seq_lengths: mx.array | Sequence[int],
+        paged_layer_idx: int,
+    ) -> mx.array:
+        """Paged KV compatibility path: scatter, gather, then dense SDPA.
+
+        This path exists so the continuous-batch scheduler can allocate and
+        preempt paged KV blocks while the model still reuses ``mx.fast.scaled_dot_product_attention``
+        on contiguous K/V tensors. RoPE offset is fixed to 0, so this path
+        currently supports prefill-length forward steps only.
+        """
+
+        if self.config.mode == "dsa":
+            raise NotImplementedError(
+                "Paged KV compatibility path does not support DSA/Sparse-MLA yet"
+            )
+        if isinstance(paged_seq_lengths, mx.array):
+            seq_lengths_arr = paged_seq_lengths.astype(mx.int32)
+        else:
+            seq_lengths_arr = mx.array(list(paged_seq_lengths), dtype=mx.int32)
+        query_length = int(hidden_states.shape[1])
+        if not mx.array(seq_lengths_arr == query_length).all().item():
+            raise NotImplementedError(
+                "Paged KV compatibility path currently requires query_length == seq_lengths "
+                "(prefill-only); decode with per-sequence RoPE offsets is not wired yet"
+            )
+
+        q, k, v = self._project_qkv(hidden_states, rope_offset=0)
+        scatter_paged_kv(
+            paged_kv_manager,
+            paged_block_table,
+            paged_layer_idx,
+            k,
+            v,
+            seq_lengths_arr,
+        )
+        k, v = gather_paged_kv(
+            paged_kv_manager,
+            paged_block_table,
+            paged_layer_idx,
+            seq_lengths_arr,
+        )
+        key_length = int(k.shape[2])
+        if mask is None or (isinstance(mask, str) and mask == "causal"):
+            mask = causal_sdpa_mask(
+                query_length,
+                sliding_window=self.config.sliding_window,
+                query_offset=0,
+                key_length=key_length,
+            )
+        mask = _merge_dense_attention_bias(
+            mask,
+            attention_bias,
+            batch_size=int(hidden_states.shape[0]),
+            num_heads=self.config.num_q_heads,
+            query_length=query_length,
+            key_length=key_length,
+            target_dtype=hidden_states.dtype,
+        )
+        sinks = _validate_attention_sinks(sinks, self.config.num_q_heads)
+        from cppmega_mlx._mlx_lm_imports import scaled_dot_product_attention
+
+        out = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            cache=None,
+            scale=(self.config.q_head_dim**-0.5) / self.rope_attention_factor,
+            mask=mask,
+            sinks=sinks,
+        )
+        out = mx.transpose(out, (0, 2, 1, 3)).reshape(
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.config.q_proj_dim,
+        )
+        from cppmega_mlx.nn._tilelang.fp8_te_linear import maybe_fp8_linear_call
+
+        return maybe_fp8_linear_call(self.out_proj, out)
+
     def __call__(
         self,
         hidden_states: mx.array,
@@ -1077,6 +1170,10 @@ class CausalSelfAttention(nn.Module):
         sinks: mx.array | None = None,
         kv_cache: ContiguousKVCache | None = None,
         layer_idx: int | None = None,
+        paged_kv_manager: PagedKVBlockManager | None = None,
+        paged_block_table: mx.array | None = None,
+        paged_seq_lengths: mx.array | Sequence[int] | None = None,
+        paged_layer_idx: int | None = None,
     ) -> mx.array:
         if hidden_states.ndim != 3:
             raise ValueError(
@@ -1095,6 +1192,43 @@ class CausalSelfAttention(nn.Module):
                 raise IndexError("layer_idx out of range")
             cache_layer_idx = layer_idx
             cache_position = kv_cache.layer_position(cache_layer_idx)
+
+        paged_requested = paged_kv_manager is not None
+        if paged_requested and kv_cache is not None:
+            raise ValueError("paged_kv_manager and kv_cache are mutually exclusive")
+        if paged_requested:
+            if paged_block_table is None:
+                raise ValueError(
+                    "paged_kv_manager requires paged_block_table"
+                )
+            if paged_seq_lengths is None:
+                raise ValueError(
+                    "paged_kv_manager requires paged_seq_lengths"
+                )
+            if paged_layer_idx is None:
+                raise ValueError(
+                    "paged_kv_manager requires paged_layer_idx"
+                )
+            if paged_block_table.ndim != 2:
+                raise ValueError(
+                    f"paged_block_table must be 2-D, got {paged_block_table.ndim}"
+                )
+            if int(paged_block_table.shape[0]) != int(hidden_states.shape[0]):
+                raise ValueError(
+                    "paged_block_table batch dim must match hidden_states batch dim"
+                )
+
+        if paged_requested:
+            return self._apply_paged_kv_compatibility_path(
+                hidden_states,
+                mask=mask,
+                attention_bias=attention_bias,
+                sinks=sinks,
+                paged_kv_manager=paged_kv_manager,
+                paged_block_table=paged_block_table,
+                paged_seq_lengths=paged_seq_lengths,
+                paged_layer_idx=paged_layer_idx,
+            )
 
         if self._use_sparse_mla_fp8_path_b_baseline(
             mask, sinks=sinks, kv_cache=kv_cache
