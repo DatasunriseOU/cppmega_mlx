@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -930,6 +931,103 @@ def test_emitted_safetensors_match_independent_grouped_gqa_source(
     assert receipt["document_boundaries"] == 1
     assert receipt["reloaded_safetensors"] == str(emitted.resolve())
     assert receipt["max_abs_logit_error"] <= 2e-5
+
+
+def _toy_conversion_cfg(mod):
+    return mod.Dense500MConversionConfig(
+        vocab_size=32,
+        hidden_size=8,
+        depth=1,
+        ffn_hidden_size=12,
+        num_query_heads=4,
+        num_kv_heads=2,
+        head_dim=2,
+        max_seq_length=6,
+        ngram_hash_heads=1,
+        ngram_hash_table_size=7,
+        ngram_hash_embed_dim=3,
+        structure_num_categories=5,
+        structure_max_dep_level=6,
+        structure_bottleneck_dim=4,
+    )
+
+
+def test_publish_receipt_records_weights_sha256_and_completion(
+    tmp_path: Path,
+) -> None:
+    mod = _load_module()
+    cfg = _toy_conversion_cfg(mod)
+    checkpoint = tmp_path / "iter_0000001"
+    _write_torch_dist_fixture(mod, cfg, checkpoint)
+    output = tmp_path / "converted" / "weights.safetensors"
+
+    manifest = mod.convert_checkpoint(checkpoint, output, cfg=cfg, bf16=False)
+
+    payload = json.loads((output.parent / "model.json").read_text(encoding="utf-8"))
+    digest = hashlib.sha256(output.read_bytes()).hexdigest()
+    assert payload["output_artifacts"] == [
+        {
+            "path": output.name,
+            "bytes": output.stat().st_size,
+            "sha256": digest,
+        }
+    ]
+    assert payload["publish"] == {
+        "complete": True,
+        "completion_marker": "model.json",
+        "weights_sha256": digest,
+    }
+    assert manifest["publish"]["weights_sha256"] == digest
+    status = mod.published_checkpoint_status(output)
+    assert status == {"complete": True, "weights_sha256": digest}
+
+
+def test_interrupted_publish_between_writes_lacks_completion_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mod = _load_module()
+    cfg = _toy_conversion_cfg(mod)
+    checkpoint = tmp_path / "iter_0000001"
+    _write_torch_dist_fixture(mod, cfg, checkpoint)
+    output = tmp_path / "converted" / "weights.safetensors"
+
+    real_replace = mod.os.replace
+
+    def crashing_replace(src, dst):
+        if Path(dst).name == "model.json":
+            raise RuntimeError("simulated crash before manifest publish")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(mod.os, "replace", crashing_replace)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        mod.convert_checkpoint(checkpoint, output, cfg=cfg, bf16=False)
+
+    assert output.is_file()
+    assert not (output.parent / "model.json").exists()
+    status = mod.published_checkpoint_status(output)
+    assert status["complete"] is False
+    assert "completion marker" in status["reason"]
+
+
+def test_published_checkpoint_status_detects_weights_sha_mismatch(
+    tmp_path: Path,
+) -> None:
+    mod = _load_module()
+    cfg = _toy_conversion_cfg(mod)
+    checkpoint = tmp_path / "iter_0000001"
+    _write_torch_dist_fixture(mod, cfg, checkpoint)
+    output = tmp_path / "converted" / "weights.safetensors"
+
+    mod.convert_checkpoint(checkpoint, output, cfg=cfg, bf16=False)
+    with output.open("r+b") as fh:
+        fh.seek(0)
+        fh.write(b"\x00")
+
+    status = mod.published_checkpoint_status(output)
+    assert status["complete"] is False
+    assert status["reason"] == "weights sha256 mismatch"
 
 
 def test_sidecar_parity_seam_detects_dropped_graph_route() -> None:

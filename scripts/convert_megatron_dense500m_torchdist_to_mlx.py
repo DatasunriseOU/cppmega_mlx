@@ -335,21 +335,36 @@ def validate_source_checkpoint_contract(
     }
 
 
+def _sha256_receipt(path: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return {
+        "path": path.name,
+        "bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def source_artifact_hashes(iter_dir: Path) -> list[dict[str, Any]]:
-    receipts: list[dict[str, Any]] = []
-    for path in sorted(item for item in iter_dir.iterdir() if item.is_file()):
-        digest = hashlib.sha256()
-        with path.open("rb") as fh:
-            for block in iter(lambda: fh.read(8 * 1024 * 1024), b""):
-                digest.update(block)
-        receipts.append(
-            {
-                "path": path.name,
-                "bytes": path.stat().st_size,
-                "sha256": digest.hexdigest(),
-            }
-        )
-    return receipts
+    return [
+        _sha256_receipt(path)
+        for path in sorted(item for item in iter_dir.iterdir() if item.is_file())
+    ]
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as fh:
+        os.fsync(fh.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def resolve_checkpoint_iter(path: Path) -> Path:
@@ -1470,13 +1485,63 @@ def convert_checkpoint(
         parity["reloaded_safetensors"] = str(output)
         parity["domain_tensors_present"] = domain_tensors_present
         manifest["logit_parity"] = parity
+        manifest["output_artifacts"] = [_sha256_receipt(staged_weights)]
+        manifest["publish"] = {
+            "complete": True,
+            "completion_marker": manifest_path.name,
+            "weights_sha256": manifest["output_artifacts"][0]["sha256"],
+        }
         staged_manifest.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        # Publish order is the crash contract: the weights are renamed into
+        # place and fsynced first; model.json records the weights SHA-256 and
+        # is renamed last, so its presence marks the pair as complete.
+        _fsync_file(staged_weights)
         os.replace(staged_weights, output)
+        _fsync_file(staged_manifest)
         os.replace(staged_manifest, manifest_path)
+        _fsync_dir(output.parent)
     return manifest
+
+
+def published_checkpoint_status(output: Path) -> dict[str, Any]:
+    """Report whether the published weights + model.json pair is complete.
+
+    model.json is published last and records the safetensors SHA-256, so a
+    crash before the manifest rename leaves weights without the completion
+    marker and is reported incomplete here.
+    """
+
+    weights_path, manifest_path = conversion_output_paths(output)
+    if not manifest_path.is_file():
+        return {
+            "complete": False,
+            "reason": f"missing completion marker {manifest_path.name}",
+        }
+    if not weights_path.is_file():
+        return {
+            "complete": False,
+            "reason": f"missing weights {weights_path.name}",
+        }
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    publish = manifest.get("publish")
+    expected = publish.get("weights_sha256") if isinstance(publish, dict) else None
+    if not expected:
+        return {
+            "complete": False,
+            "reason": "manifest lacks publish.weights_sha256",
+        }
+    actual = _sha256_receipt(weights_path)["sha256"]
+    if actual != expected:
+        return {
+            "complete": False,
+            "reason": "weights sha256 mismatch",
+            "expected_sha256": expected,
+            "actual_sha256": actual,
+        }
+    return {"complete": True, "weights_sha256": actual}
 
 
 def parse_args() -> argparse.Namespace:
