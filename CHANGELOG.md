@@ -15,8 +15,11 @@ All notable UI-surface changes since the V7 honest-closure pass.
   7 cleanup tests, and the real SIGTERM/resume subprocess test passed.
 - Updated the two legacy source-cache fixtures to write the required logical
   repository identity; the fail-closed sentinel validation remains unchanged.
-- The legacy `bionic`/`v8` → `nickg/nvc` identity defect remains open and is
-  not hidden by this storage fix.
+- Training-data status now binds conveyor progress to the 501-repository
+  archive launch receipt instead of counting the 601-row mapping superset.
+- Decoded Parquet rows prove the legacy `bionic` and `v8` archive aliases both
+  contain NVC source, so `nickg/nvc` is the correct project identity; only the
+  alias/snapshot provenance remains unresolved.
 
 ## Canonical live training-data inventory (2026-07-31)
 
