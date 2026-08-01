@@ -221,7 +221,7 @@ def test_paged_attention_model_integration_is_deprecated_warning() -> None:
 
 def test_gather_paged_kv_returns_contiguous_masked_tensors() -> None:
     manager = _manager(num_blocks=4, block_size=4)
-    manager.allocate_sequence(seq_id=1, num_tokens=5)
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
     manager.allocate_sequence(seq_id=2, num_tokens=1)
     table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
 
@@ -229,18 +229,14 @@ def test_gather_paged_kv_returns_contiguous_masked_tensors() -> None:
     manager.k_pool = manager.k_pool + 1.0
     manager.v_pool = manager.v_pool + 2.0
 
-    k, v = gather_paged_kv(manager, table, layer_idx=0, seq_lengths=[5, 1])
+    k, v = gather_paged_kv(manager, table, layer_idx=0, seq_lengths=[8, 1])
 
     assert k.shape == (2, manager.num_kv_heads, 8, manager.head_dim)
     assert v.shape == k.shape
-    # seq_id=1 occupies both blocks but only 5 tokens are live.
+    # A full first row must not disable masking for the shorter second row.
     np.testing.assert_array_equal(
-        _as_numpy(mx.sum(k[0, :, :5, :], axis=(0, 2)) != 0),
-        np.ones(5, dtype=np.float32),
-    )
-    np.testing.assert_array_equal(
-        _as_numpy(mx.sum(k[0, :, 5:, :], axis=(0, 2)) == 0),
-        np.ones(3, dtype=np.float32),
+        _as_numpy(mx.sum(k[0], axis=(0, 2)) != 0),
+        np.ones(8, dtype=np.float32),
     )
     np.testing.assert_array_equal(
         _as_numpy(mx.sum(k[1, :, 1:, :], axis=(0, 2)) == 0),
@@ -252,7 +248,10 @@ def test_scatter_paged_kv_round_trip_matches_source() -> None:
     manager = _manager(num_blocks=4, block_size=4)
     manager.allocate_sequence(seq_id=1, num_tokens=5)
     manager.allocate_sequence(seq_id=2, num_tokens=1)
+    untouched_block = manager.allocate_sequence(seq_id=3, num_tokens=1)[0]
     table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+    manager.k_pool = manager.k_pool + 7.0
+    manager.v_pool = manager.v_pool + 9.0
 
     batch, kv_heads, seq_len, head_dim = 2, manager.num_kv_heads, 8, manager.head_dim
     k = mx.arange(batch * kv_heads * seq_len * head_dim, dtype=mx.float32).reshape(
@@ -272,6 +271,24 @@ def test_scatter_paged_kv_round_trip_matches_source() -> None:
     np.testing.assert_array_equal(
         _as_numpy(mx.sum(k_out[1, :, 1:, :])), 0.0
     )
+    untouched_k, untouched_v = manager.get_block_kv(untouched_block, layer_idx=0)
+    np.testing.assert_array_equal(_as_numpy(untouched_k), 7.0)
+    np.testing.assert_array_equal(_as_numpy(untouched_v), 9.0)
+
+
+@pytest.mark.parametrize("seq_length", [-1, 9])
+def test_gather_paged_kv_rejects_out_of_capacity_length(seq_length: int) -> None:
+    manager = _manager(num_blocks=2, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+
+    with pytest.raises(ValueError, match=r"within \[0, 8\]"):
+        gather_paged_kv(
+            manager,
+            table,
+            layer_idx=0,
+            seq_lengths=[seq_length],
+        )
 
 
 def test_scatter_paged_kv_rejects_shape_mismatch() -> None:

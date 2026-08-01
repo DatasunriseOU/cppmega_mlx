@@ -522,6 +522,26 @@ def build_paged_block_table(
     return mx.array(table)
 
 
+def _paged_seq_lengths(
+    seq_lengths: mx.array | Sequence[int],
+    *,
+    batch: int,
+    capacity: int,
+) -> tuple[mx.array, list[int]]:
+    if isinstance(seq_lengths, mx.array):
+        seq_lengths_arr = seq_lengths.astype(mx.int32)
+    else:
+        seq_lengths_arr = mx.array(list(seq_lengths), dtype=mx.int32)
+    if seq_lengths_arr.shape != (batch,):
+        raise ValueError(
+            f"seq_lengths must have shape ({batch},), got {seq_lengths_arr.shape}"
+        )
+    values = [int(value) for value in np.array(seq_lengths_arr).tolist()]
+    if any(value < 0 or value > capacity for value in values):
+        raise ValueError(f"seq_lengths must be within [0, {capacity}]")
+    return seq_lengths_arr, values
+
+
 def gather_paged_kv(
     manager: PagedKVBlockManager,
     block_table: mx.array,
@@ -555,14 +575,12 @@ def gather_paged_kv(
         raise ValueError(f"block_table must be 2-D, got {block_table.ndim}")
     batch = int(block_table.shape[0])
     max_blocks = int(block_table.shape[1])
-    if isinstance(seq_lengths, mx.array):
-        seq_lengths_arr = seq_lengths.astype(mx.int32)
-    else:
-        seq_lengths_arr = mx.array(list(seq_lengths), dtype=mx.int32)
-    if seq_lengths_arr.shape != (batch,):
-        raise ValueError(
-            f"seq_lengths must have shape ({batch},), got {seq_lengths_arr.shape}"
-        )
+    max_seq_len = max_blocks * manager.block_size
+    seq_lengths_arr, _ = _paged_seq_lengths(
+        seq_lengths,
+        batch=batch,
+        capacity=max_seq_len,
+    )
 
     k_layer = manager.k_pool[:, layer_idx, :, :, :]
     v_layer = manager.v_pool[:, layer_idx, :, :, :]
@@ -577,14 +595,12 @@ def gather_paged_kv(
     gathered_k = mx.transpose(gathered_k, (0, 2, 1, 3))
     gathered_v = mx.transpose(gathered_v, (0, 2, 1, 3))
 
-    max_seq_len = int(gathered_k.shape[2])
-    actual_max = int(mx.max(seq_lengths_arr).item())
-    if actual_max < max_seq_len:
-        pos = mx.arange(max_seq_len, dtype=mx.int32)[None, None, :, None]
-        mask = pos < seq_lengths_arr[:, None, None, None]
-        mask = mask.astype(manager.k_pool.dtype)
-        gathered_k = gathered_k * mask
-        gathered_v = gathered_v * mask
+    pos = mx.arange(max_seq_len, dtype=mx.int32)[None, None, :, None]
+    mask = (pos < seq_lengths_arr[:, None, None, None]).astype(
+        manager.k_pool.dtype
+    )
+    gathered_k = gathered_k * mask
+    gathered_v = gathered_v * mask
     return gathered_k, gathered_v
 
 
@@ -635,20 +651,19 @@ def scatter_paged_kv(
         raise ValueError(
             f"k head_dim {k.shape[3]} must match manager {manager.head_dim}"
         )
-    if isinstance(seq_lengths, mx.array):
-        seq_lengths_arr = seq_lengths.astype(mx.int32)
-    else:
-        seq_lengths_arr = mx.array(list(seq_lengths), dtype=mx.int32)
-    if seq_lengths_arr.shape != (batch,):
-        raise ValueError(
-            f"seq_lengths must have shape ({batch},), got {seq_lengths_arr.shape}"
-        )
 
     max_seq_len = max_blocks * manager.block_size
+    _, seq_length_values = _paged_seq_lengths(
+        seq_lengths,
+        batch=batch,
+        capacity=max_seq_len,
+    )
     if k.shape[2] > max_seq_len:
         raise ValueError(
             f"k sequence dim {k.shape[2]} exceeds block_table capacity {max_seq_len}"
         )
+    if any(seq_length > k.shape[2] for seq_length in seq_length_values):
+        raise ValueError("seq_lengths cannot exceed the K/V sequence dimension")
 
     k_pad = mx.transpose(_pad_or_trim_kv(k, max_seq_len), (0, 2, 1, 3))
     v_pad = mx.transpose(_pad_or_trim_kv(v, max_seq_len), (0, 2, 1, 3))
@@ -659,47 +674,52 @@ def scatter_paged_kv(
         batch, max_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim
     )
 
-    logical_pos = mx.arange(max_blocks * manager.block_size, dtype=mx.int32).reshape(
-        max_blocks, manager.block_size
-    )
-    live_mask = logical_pos[None, :, :] < seq_lengths_arr[:, None, None]
-    live_mask = live_mask.reshape(
-        batch, max_blocks, manager.block_size, 1, 1
-    ).astype(k.dtype)
-    k_blocks = k_blocks * live_mask
-    v_blocks = v_blocks * live_mask
-
-    work_k = mx.zeros(
-        (batch, manager.num_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim),
-        dtype=k.dtype,
-    )
-    work_v = mx.zeros(
-        (batch, manager.num_blocks, manager.block_size, manager.num_kv_heads, manager.head_dim),
-        dtype=v.dtype,
-    )
-    indices = block_table[:, :, None, None, None]
-    work_k = mx.put_along_axis(work_k, indices, k_blocks, axis=1)
-    work_v = mx.put_along_axis(work_v, indices, v_blocks, axis=1)
-
-    pooled_k = mx.sum(work_k, axis=0)
-    pooled_v = mx.sum(work_v, axis=0)
-
-    update_k = pooled_k[None, ...]
-    update_k = mx.transpose(update_k, (1, 0, 2, 3, 4))
-    update_v = pooled_v[None, ...]
-    update_v = mx.transpose(update_v, (1, 0, 2, 3, 4))
-    manager.k_pool = mx.slice_update(
-        manager.k_pool,
-        update_k,
-        mx.array([0, layer_idx, 0, 0, 0]),
-        axes=(0, 1, 2, 3, 4),
-    )
-    manager.v_pool = mx.slice_update(
-        manager.v_pool,
-        update_v,
-        mx.array([0, layer_idx, 0, 0, 0]),
-        axes=(0, 1, 2, 3, 4),
-    )
+    # ponytail: correctness-first host loop; replace with a native paged
+    # scatter kernel when compatibility-prefill throughput matters.
+    seen_blocks: set[int] = set()
+    for batch_idx, seq_length in enumerate(seq_length_values):
+        needed_blocks = (
+            seq_length + manager.block_size - 1
+        ) // manager.block_size
+        for logical_idx in range(max_blocks):
+            block_idx = int(block_table[batch_idx, logical_idx].item())
+            if block_idx == -1:
+                if logical_idx < needed_blocks:
+                    raise ValueError(
+                        "block_table is missing a live physical block"
+                    )
+                continue
+            if block_idx < 0 or block_idx >= manager.num_blocks:
+                raise ValueError("block_table contains an invalid physical block")
+            if block_idx in seen_blocks:
+                raise ValueError("block_table contains a duplicate physical block")
+            seen_blocks.add(block_idx)
+            if logical_idx >= needed_blocks:
+                continue
+            live = min(
+                manager.block_size,
+                seq_length - logical_idx * manager.block_size,
+            )
+            k_block = k_blocks[batch_idx, logical_idx]
+            v_block = v_blocks[batch_idx, logical_idx]
+            if live < manager.block_size:
+                mask = (
+                    mx.arange(manager.block_size, dtype=mx.int32) < live
+                )[:, None, None].astype(k.dtype)
+                k_block = k_block * mask
+                v_block = v_block * mask
+            manager.k_pool = mx.slice_update(
+                manager.k_pool,
+                k_block[None, None, ...],
+                mx.array([block_idx, layer_idx, 0, 0, 0]),
+                axes=(0, 1, 2, 3, 4),
+            )
+            manager.v_pool = mx.slice_update(
+                manager.v_pool,
+                v_block[None, None, ...],
+                mx.array([block_idx, layer_idx, 0, 0, 0]),
+                axes=(0, 1, 2, 3, 4),
+            )
 
 
 def _pad_or_trim_kv(x: mx.array, target_len: int) -> mx.array:
