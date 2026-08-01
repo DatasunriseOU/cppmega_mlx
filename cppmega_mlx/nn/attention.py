@@ -1110,12 +1110,12 @@ class CausalSelfAttention(nn.Module):
         on contiguous K/V tensors. ``paged_seq_lengths`` are the per-sequence
         totals *after* this step; rows whose past length is non-zero are
         treated as decode (chunk) steps with per-sequence RoPE offsets.
+
+        ``mode='dsa'`` runs the same dense fallback as the contiguous path
+        (``_project_qkv`` + dense SDPA); the Sparse-MLA fp8 Path B/C kernels
+        are never routed through the paged compatibility path.
         """
 
-        if self.config.mode == "dsa":
-            raise NotImplementedError(
-                "Paged KV compatibility path does not support DSA/Sparse-MLA yet"
-            )
         if isinstance(paged_seq_lengths, mx.array):
             seq_lengths_arr = paged_seq_lengths.astype(mx.int32)
         else:

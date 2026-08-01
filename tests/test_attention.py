@@ -1076,7 +1076,8 @@ def test_paged_kv_compatibility_path_decode_mixed_batch() -> None:
     )
 
 
-def test_paged_kv_compatibility_path_rejects_dsa() -> None:
+def test_paged_kv_compatibility_path_dsa_dense_fallback_matches_contiguous() -> None:
+    """mode='dsa' runs the same dense fallback in paged and contiguous paths."""
     from cppmega_mlx.inference.serving import (
         PagedKVBlockManager,
         PagedKVBlockManagerConfig,
@@ -1084,7 +1085,61 @@ def test_paged_kv_compatibility_path_rejects_dsa() -> None:
 
     cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
     attn = CausalSelfAttention(cfg)
-    x = _rand((1, 4, 16), seed=8)
+    x = _rand((2, 6, 16), seed=8)
+
+    baseline = attn(x, mask="causal")
+    mx.eval(baseline)
+
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=8,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=6)
+    manager.allocate_sequence(seq_id=2, num_tokens=6)
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+
+    out = attn(
+        x,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[6, 6],
+        paged_layer_idx=0,
+    )
+    mx.eval(out)
+
+    np.testing.assert_allclose(
+        np.array(baseline), np.array(out), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_paged_kv_compatibility_path_dsa_decode_matches_contiguous_cache() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
+    attn = CausalSelfAttention(cfg)
+    prefill = _rand((1, 4, 16), seed=9)
+    decode_step = _rand((1, 1, 16), seed=10)
+
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+    ref_prefill = attn(prefill, mask="causal", kv_cache=cache, layer_idx=0)
+    ref_decode = attn(decode_step, kv_cache=cache, layer_idx=0)
+    mx.eval(ref_prefill, ref_decode)
+
     manager = PagedKVBlockManager(
         PagedKVBlockManagerConfig(
             num_blocks=4,
@@ -1095,15 +1150,30 @@ def test_paged_kv_compatibility_path_rejects_dsa() -> None:
             dtype=mx.float32,
         )
     )
-    manager.allocate_sequence(seq_id=1, num_tokens=4)
-    table = manager.block_table_for_sequences([1], max_blocks_per_seq=1)
+    manager.allocate_sequence(seq_id=1, num_tokens=5)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
 
-    with pytest.raises(NotImplementedError, match="does not support DSA"):
-        attn(
-            x,
-            mask="causal",
-            paged_kv_manager=manager,
-            paged_block_table=table,
-            paged_seq_lengths=[4],
-            paged_layer_idx=0,
-        )
+    out_prefill = attn(
+        prefill,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[4],
+        paged_layer_idx=0,
+    )
+    out_decode = attn(
+        decode_step,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[5],
+        paged_layer_idx=0,
+    )
+    mx.eval(out_prefill, out_decode)
+
+    np.testing.assert_allclose(
+        np.array(ref_prefill), np.array(out_prefill), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.array(ref_decode), np.array(out_decode), atol=1e-5, rtol=1e-5
+    )
