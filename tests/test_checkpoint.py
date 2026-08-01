@@ -26,6 +26,7 @@ from cppmega_mlx.training.checkpoint import (
     RNG_MODE_SEED,
     RNG_MODE_SNAPSHOT,
     SHARD_INDEX_NAME,
+    SHARDING_MODE_SHARDED,
     SHARDING_MODE_SINGLE_FILE,
     WEIGHTS_NAME,
     load_checkpoint,
@@ -721,6 +722,66 @@ def test_checkpoint_rng_seed_and_single_file_sharding_metadata_roundtrip(tmp_pat
         "index": None,
         "source": "cppmega_mlx.training.checkpoint",
     }
+
+
+def test_checkpoint_sharded_save_and_load_roundtrip(tmp_path) -> None:
+    config = _tiny_config()
+    model = TinyLM(config)
+    checkpoint_path = tmp_path / "sharded"
+    saved = save_checkpoint(
+        model,
+        checkpoint_path,
+        max_file_size_gb=1e-6,  # force sharding for the tiny model
+    )
+
+    assert saved["sharding"]["mode"] == checkpoint_module.SHARDING_MODE_SHARDED
+    assert saved["sharding"]["num_shards"] >= 1
+    assert saved["sharding"]["index"] == SHARD_INDEX_NAME
+    assert all(
+        name.startswith("model-") and name.endswith(".safetensors")
+        for name in saved["sharding"]["weights"]
+    )
+    index = json.loads((checkpoint_path / SHARD_INDEX_NAME).read_text())
+    assert index["metadata"]["num_shards"] == saved["sharding"]["num_shards"]
+    assert set(index["weight_map"].keys()) == set(saved["tensors"])
+
+    loaded_model = TinyLM(config)
+    loaded = load_checkpoint(loaded_model, checkpoint_path)
+    assert loaded["sharding"] == saved["sharding"]
+    _assert_tree_allclose(loaded_model.parameters(), model.parameters())
+
+
+def test_checkpoint_sharded_removes_stale_single_file(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "mixed"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    assert (checkpoint_path / WEIGHTS_NAME).exists()
+
+    save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        max_file_size_gb=1e-6,
+    )
+    assert not (checkpoint_path / WEIGHTS_NAME).exists()
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+
+def test_checkpoint_single_file_removes_stale_shards(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "mixed"
+    save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        max_file_size_gb=1e-6,
+    )
+    shard_files = list(checkpoint_path.glob("model-*-of-*.safetensors"))
+    assert shard_files
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    assert (checkpoint_path / WEIGHTS_NAME).exists()
+    assert not list(checkpoint_path.glob("model-*-of-*.safetensors"))
+    assert not (checkpoint_path / SHARD_INDEX_NAME).exists()
 
 
 def test_checkpoint_explicit_not_saved_rng_mode_overrides_default_snapshot(tmp_path) -> None:

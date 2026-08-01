@@ -27,6 +27,7 @@ RNG_MODE_NOT_SAVED = "not_saved"
 RNG_MODE_SEED = "seed"
 RNG_MODE_SNAPSHOT = "snapshot"
 SHARDING_MODE_SINGLE_FILE = "single_file"
+SHARDING_MODE_SHARDED = "sharded"
 
 _STANDALONE_RNG_KEYS = {
     "rng_state",
@@ -47,7 +48,6 @@ _SHARDING_PAYLOAD_KEYS = {
     "weight_map",
     "index_file",
     "shard_index",
-    "max_file_size_gb",
 }
 _UNSUPPORTED_DISTRIBUTED_METADATA_KEYS = {
     "context_parallel_rank",
@@ -119,6 +119,150 @@ def _checkpoint_paths(path: str | Path) -> tuple[Path, Path, Path | None]:
     if base.suffix == ".safetensors":
         return base, base.with_suffix(".json"), None
     return base / WEIGHTS_NAME, base / METADATA_NAME, base / OPTIMIZER_NAME
+
+
+def _dtype_size(dtype: mx.Dtype) -> int:
+    """Return element size in bytes for an MLX dtype."""
+
+    return int(mx.array(0, dtype=dtype).itemsize)
+
+
+def _tensor_size_bytes(tensor: mx.array) -> int:
+    """Estimate uncompressed tensor size in bytes."""
+
+    return int(tensor.size) * _dtype_size(tensor.dtype)
+
+
+def _shard_name(shard_idx: int, num_shards: int) -> str:
+    """Return a Hugging-Face-style shard filename."""
+
+    return f"model-{shard_idx:05d}-of-{num_shards:05d}.safetensors"
+
+
+def _partition_weights_by_size(
+    weights: dict[str, mx.array],
+    max_size_bytes: int,
+) -> list[dict[str, mx.array]]:
+    """Partition tensors into shards no larger than ``max_size_bytes``.
+
+    Tensors larger than the shard cap are placed alone in their own shard;
+    the caller is responsible for choosing a cap that avoids pathological
+    single-tensor shards for the target model family.
+    """
+
+    if max_size_bytes <= 0:
+        raise ValueError("max_size_bytes must be positive")
+    shards: list[dict[str, mx.array]] = []
+    current: dict[str, mx.array] = {}
+    current_size = 0
+    for name in sorted(weights):
+        tensor = weights[name]
+        tensor_size = _tensor_size_bytes(tensor)
+        if current and current_size + tensor_size > max_size_bytes:
+            shards.append(current)
+            current = {}
+            current_size = 0
+        current[name] = tensor
+        current_size += tensor_size
+        if current_size >= max_size_bytes:
+            shards.append(current)
+            current = {}
+            current_size = 0
+    if current:
+        shards.append(current)
+    if not shards:
+        shards.append({})
+    return shards
+
+
+def _save_sharded_weights(
+    weights_dir: Path,
+    shards: list[dict[str, mx.array]],
+) -> list[str]:
+    """Write shard files and return their basenames."""
+
+    num_shards = len(shards)
+    filenames: list[str] = []
+    for idx, shard in enumerate(shards, start=1):
+        filename = _shard_name(idx, num_shards)
+        filenames.append(filename)
+        path = weights_dir / filename
+        mx.save_safetensors(str(path), shard, metadata={"format": "mlx"})
+    return filenames
+
+
+def _remove_stale_sharded_weights(weights_dir: Path) -> None:
+    """Remove shard files and index left over from a previous sharded save."""
+
+    if not weights_dir.exists():
+        return
+    for child in weights_dir.iterdir():
+        if child.name == SHARD_INDEX_NAME or child.name.startswith("model-") and child.name.endswith(".safetensors"):
+            # Be conservative: only delete files that match the HF shard pattern
+            # and are accompanied by the index file, to avoid collateral damage.
+            if (weights_dir / SHARD_INDEX_NAME).exists():
+                child.unlink()
+    if (weights_dir / SHARD_INDEX_NAME).exists():
+        (weights_dir / SHARD_INDEX_NAME).unlink()
+
+
+def _load_shard_index(shard_index_path: Path) -> dict[str, Any]:
+    """Load and validate the shard index file."""
+
+    if not shard_index_path.exists():
+        raise FileNotFoundError(f"Shard index not found: {shard_index_path}")
+    index = json.loads(shard_index_path.read_text())
+    if not isinstance(index, dict):
+        raise ValueError(f"Shard index {shard_index_path} must be a JSON object")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(f"Shard index {shard_index_path}: weight_map must be an object")
+    return index
+
+
+def _load_sharded_model_state(
+    weights_dir: Path,
+    index: dict[str, Any],
+    metadata_path: Path,
+    expected_tensors: list[str] | None,
+) -> dict[str, mx.array]:
+    """Load model state from sharded safetensors files."""
+
+    weight_map = index["weight_map"]
+    shard_files = sorted(set(weight_map.values()))
+    loaded: dict[str, mx.array] = {}
+    for shard_file in shard_files:
+        shard_path = weights_dir / shard_file
+        if not shard_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint shard {shard_file} referenced by {weights_dir / SHARD_INDEX_NAME} not found"
+            )
+        shard_state = mx.load(str(shard_path))
+        if not isinstance(shard_state, dict):
+            raise TypeError(f"Shard {shard_path} must be a tensor mapping")
+        for name, tensor in shard_state.items():
+            if name not in weight_map or weight_map[name] != shard_file:
+                raise ValueError(
+                    f"Checkpoint shard {shard_path}: tensor {name!r} is not "
+                    f"mapped to this shard in {SHARD_INDEX_NAME}"
+                )
+            loaded[name] = tensor
+    if expected_tensors is not None and sorted(loaded) != sorted(expected_tensors):
+        raise ValueError(
+            f"Checkpoint metadata {metadata_path}: sharded tensors do not match "
+            f"expected tensor list; missing/extra tensors"
+        )
+    return loaded
+
+
+def _build_weight_map(shards: list[dict[str, mx.array]], filenames: list[str]) -> dict[str, str]:
+    """Return tensor-name → shard-filename mapping."""
+
+    weight_map: dict[str, str] = {}
+    for filename, shard in zip(filenames, shards, strict=True):
+        for name in shard:
+            weight_map[name] = filename
+    return weight_map
 
 
 def _jsonable(value: Any) -> Any:
@@ -597,10 +741,18 @@ def _sharding_contract(
         keys = ", ".join(payload_keys)
         raise ValueError(
             f"checkpoint metadata {metadata_path}: checkpoint sharding payloads "
-            f"are not supported yet ({keys}); only single-file checkpoints are supported"
+            f"must be generated by the saver, not passed in metadata ({keys})"
         )
 
-    allowed_keys = {"mode", "num_shards", "weights", "index", "source", "note"}
+    allowed_keys = {
+        "mode",
+        "num_shards",
+        "weights",
+        "index",
+        "max_file_size_gb",
+        "source",
+        "note",
+    }
     unknown_keys = sorted(set(raw_sharding) - allowed_keys)
     if unknown_keys:
         raise ValueError(
@@ -609,49 +761,59 @@ def _sharding_contract(
         )
 
     mode = raw_sharding.get("mode", SHARDING_MODE_SINGLE_FILE)
-    if mode != SHARDING_MODE_SINGLE_FILE:
+    if mode not in {SHARDING_MODE_SINGLE_FILE, SHARDING_MODE_SHARDED}:
         raise ValueError(
             f"checkpoint metadata {metadata_path}: unsupported sharding.mode "
-            f"{mode!r}; expected {SHARDING_MODE_SINGLE_FILE!r}"
+            f"{mode!r}; expected {SHARDING_MODE_SINGLE_FILE!r} or {SHARDING_MODE_SHARDED!r}"
         )
 
     num_shards = raw_sharding.get("num_shards", 1)
     _require_positive_int(num_shards, name="sharding.num_shards", metadata_path=metadata_path)
-    if num_shards != 1:
-        raise ValueError(
-            f"checkpoint metadata {metadata_path}: sharding.num_shards must be 1 "
-            "for single-file checkpoints"
-        )
 
     weights = raw_sharding.get("weights", [weights_name])
-    if (
-        not isinstance(weights, list)
-        or len(weights) != 1
-        or not all(isinstance(name, str) for name in weights)
-    ):
+    if not isinstance(weights, list) or not all(isinstance(name, str) for name in weights):
         raise ValueError(
-            f"checkpoint metadata {metadata_path}: sharding.weights must be a "
-            "single-item string list for single-file checkpoints"
-        )
-    if weights != [weights_name]:
-        raise ValueError(
-            f"checkpoint metadata {metadata_path}: sharding.weights must be "
-            f"{[weights_name]!r} for this checkpoint"
+            f"checkpoint metadata {metadata_path}: sharding.weights must be a string list"
         )
 
+    if mode == SHARDING_MODE_SINGLE_FILE:
+        if num_shards != 1:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: sharding.num_shards must be 1 "
+                "for single-file checkpoints"
+            )
+        if len(weights) != 1 or weights != [weights_name]:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: sharding.weights must be "
+                f"{[weights_name]!r} for single-file checkpoints"
+            )
+
     index = raw_sharding.get("index")
-    if index is not None:
+    if mode == SHARDING_MODE_SINGLE_FILE and index is not None:
         raise ValueError(
             f"checkpoint metadata {metadata_path}: sharding.index must be null "
             "for single-file checkpoints"
         )
+    if mode == SHARDING_MODE_SHARDED and index != SHARD_INDEX_NAME:
+        raise ValueError(
+            f"checkpoint metadata {metadata_path}: sharding.index must be "
+            f"{SHARD_INDEX_NAME!r} for sharded checkpoints"
+        )
 
     contract: dict[str, Any] = {
-        "mode": SHARDING_MODE_SINGLE_FILE,
-        "num_shards": 1,
-        "weights": [weights_name],
-        "index": None,
+        "mode": mode,
+        "num_shards": num_shards,
+        "weights": list(weights),
+        "index": index if mode == SHARDING_MODE_SHARDED else None,
     }
+    if "max_file_size_gb" in raw_sharding:
+        value = raw_sharding["max_file_size_gb"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(
+                f"checkpoint metadata {metadata_path}: sharding.max_file_size_gb "
+                "must be a positive number"
+            )
+        contract["max_file_size_gb"] = float(value)
     for field in ("source", "note"):
         if field in raw_sharding:
             _require_string(
@@ -996,21 +1158,33 @@ def save_checkpoint(
     optimizer: optim.Optimizer | None = None,
     training_step: Any | None = None,
     metadata: dict[str, Any] | None = None,
+    max_file_size_gb: float | None = None,
 ) -> dict[str, Any]:
-    """Save full model weights and optional optimizer state for resume."""
+    """Save full model weights and optional optimizer state for resume.
+
+    Args:
+        model: model whose parameters are saved.
+        path: directory or ``.safetensors`` file path.
+        optimizer: optional optimizer state to save.
+        training_step: optional training step object with gradient accumulator.
+        metadata: optional checkpoint metadata; sharding fields are generated
+            automatically and must not be passed.
+        max_file_size_gb: if set, shard model weights so that each shard is
+            roughly capped to this size (in GiB). Optimizer and gradient
+            accumulator states are kept in separate files and are not sharded.
+    """
 
     metadata = metadata or {}
     weights_path, metadata_path, optimizer_path = _checkpoint_paths(path)
     _reject_unsupported_checkpoint_fields(metadata, metadata_path)
+    # Fail closed if the caller passes explicit sharding metadata that the saver
+    # does not support (e.g. foreign index formats or inconsistent num_shards).
+    if "sharding" in metadata:
+        _sharding_contract(metadata, metadata_path, weights_name=weights_path.name)
     rng_contract = _rng_contract(
         metadata,
         metadata_path,
         default_snapshot=optimizer is not None or training_step is not None,
-    )
-    sharding_contract = _sharding_contract(
-        metadata,
-        metadata_path,
-        weights_name=weights_path.name,
     )
     _validate_evaluation_metadata(metadata.get("evaluation"), metadata_path)
     weights_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1018,7 +1192,62 @@ def save_checkpoint(
 
     mx.eval(model.parameters())
     weights = dict(tree_flatten(model.parameters()))
-    mx.save_safetensors(str(weights_path), weights, metadata={"format": "mlx"})
+
+    total_size_bytes = sum(_tensor_size_bytes(t) for t in weights.values())
+    max_size_bytes = (
+        int(max_file_size_gb * 1024**3)
+        if max_file_size_gb is not None
+        else None
+    )
+    if max_size_bytes is not None and max_size_bytes > 0 and total_size_bytes > max_size_bytes:
+        shards = _partition_weights_by_size(weights, max_size_bytes)
+        shard_filenames = _save_sharded_weights(weights_path.parent, shards)
+        weight_map = _build_weight_map(shards, shard_filenames)
+        index_payload = {
+            "metadata": {
+                "format": FORMAT_NAME,
+                "version": FORMAT_VERSION,
+                "num_shards": len(shard_filenames),
+                "total_size": total_size_bytes,
+            },
+            "weight_map": weight_map,
+        }
+        (weights_path.parent / SHARD_INDEX_NAME).write_text(
+            json.dumps(index_payload, indent=2, sort_keys=True) + "\n"
+        )
+        # Remove stale single-file weights if the directory previously held one.
+        if weights_path.exists():
+            weights_path.unlink()
+        sharding_contract: dict[str, Any] = {
+            "mode": SHARDING_MODE_SHARDED,
+            "num_shards": len(shard_filenames),
+            "weights": shard_filenames,
+            "index": SHARD_INDEX_NAME,
+            "max_file_size_gb": max_file_size_gb,
+        }
+    else:
+        # Remove stale sharded weights/index if the directory previously held them.
+        _remove_stale_sharded_weights(weights_path.parent)
+        mx.save_safetensors(str(weights_path), weights, metadata={"format": "mlx"})
+        sharding_contract = {
+            "mode": SHARDING_MODE_SINGLE_FILE,
+            "num_shards": 1,
+            "weights": [weights_path.name],
+            "index": None,
+        }
+
+    # Merge any user-provided sharding source/note but never user payloads.
+    user_sharding = metadata.get("sharding")
+    if isinstance(user_sharding, dict):
+        for field in ("source", "note"):
+            if field in user_sharding:
+                sharding_contract[field] = user_sharding[field]
+    # Validate the generated contract against the same rules used on load.
+    sharding_contract = _sharding_contract(
+        {"sharding": sharding_contract},
+        metadata_path,
+        weights_name=weights_path.name,
+    )
 
     optimizer_state_present = False
     optimizer_summary: dict[str, Any] | None = None
@@ -1124,28 +1353,49 @@ def load_checkpoint(
                 f"does not match expected file {weights_path.name!r}"
             )
     shard_index_path = weights_path.parent / SHARD_INDEX_NAME
-    if not weights_path.exists() and shard_index_path.exists():
-        raise ValueError(
-            f"checkpoint {path}: sharded checkpoint layout "
-            f"{SHARD_INDEX_NAME!r} is not supported; expected single file "
-            f"{weights_path.name!r}"
-        )
-    if not weights_path.exists():
-        raise FileNotFoundError(
-            f"No model weights found for checkpoint {path}: {weights_path}"
-        )
+    sharding = payload.get("sharding") if payload else None
+    is_sharded = isinstance(sharding, dict) and sharding.get("mode") == SHARDING_MODE_SHARDED
 
-    model_state = mx.load(str(weights_path))
-    if not isinstance(model_state, dict):
-        raise TypeError(f"Model checkpoint must be a tensor mapping: {weights_path}")
-    if payload:
-        _validate_tensor_file_matches_metadata(
-            model_state,
-            payload,
+    if is_sharded:
+        index = _load_shard_index(shard_index_path)
+        expected_tensors = payload.get("tensors") if payload else None
+        model_state = _load_sharded_model_state(
+            weights_path.parent,
+            index,
             metadata_path,
-            name="model",
+            expected_tensors=expected_tensors,
         )
-    model.load_weights(str(weights_path), strict=strict)
+        if payload:
+            _validate_tensor_file_matches_metadata(
+                model_state,
+                payload,
+                metadata_path,
+                name="model",
+            )
+        model.load_weights(list(model_state.items()), strict=strict)
+    else:
+        if not weights_path.exists() and shard_index_path.exists():
+            raise ValueError(
+                f"checkpoint {path}: sharded checkpoint layout "
+                f"{SHARD_INDEX_NAME!r} is not supported without "
+                f"sharding.mode={SHARDING_MODE_SHARDED!r}"
+            )
+        if not weights_path.exists():
+            raise FileNotFoundError(
+                f"No model weights found for checkpoint {path}: {weights_path}"
+            )
+
+        model_state = mx.load(str(weights_path))
+        if not isinstance(model_state, dict):
+            raise TypeError(f"Model checkpoint must be a tensor mapping: {weights_path}")
+        if payload:
+            _validate_tensor_file_matches_metadata(
+                model_state,
+                payload,
+                metadata_path,
+                name="model",
+            )
+        model.load_weights(str(weights_path), strict=strict)
     mx.eval(model.parameters())
 
     if training_step is not None:
@@ -1241,6 +1491,7 @@ __all__ = [
     "RNG_MODE_NOT_SAVED",
     "RNG_MODE_SEED",
     "RNG_MODE_SNAPSHOT",
+    "SHARDING_MODE_SHARDED",
     "SHARDING_MODE_SINGLE_FILE",
     "SHARD_INDEX_NAME",
     "WEIGHTS_NAME",
