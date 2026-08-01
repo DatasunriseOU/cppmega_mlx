@@ -1,54 +1,71 @@
-"""Tests for the machine-readable mlx_converted checkpoint index."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-
-import pytest
 
 from scripts import generate_mlx_converted_index as gen
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CHECKPOINT_ROOT = Path("/Volumes/external/sources/cppmega/outputs/checkpoints/mlx_converted")
-INDEX_PATH = CHECKPOINT_ROOT / "index.json"
+def _checkpoint(root: Path, name: str, *, ready: bool) -> None:
+    directory = root / name
+    directory.mkdir(parents=True)
+    weights = directory / "weights.safetensors"
+    weights.write_bytes(name.encode("utf-8"))
+    digest = hashlib.sha256(weights.read_bytes()).hexdigest()
+    manifest = {
+        "schema": (
+            gen.CURRENT_CONVERSION_SCHEMA if ready else "legacy_conversion_v1"
+        ),
+        "source_checkpoint": f"/source/{name}",
+        "output": str(weights),
+        "dtype": "bfloat16",
+        "rope_only": ready,
+    }
+    if ready:
+        manifest["logit_parity"] = {"max_abs_logit_error": 0.0}
+        manifest["publish"] = {
+            "completion_marker": "model.json",
+            "weights_sha256": digest,
+        }
+    (directory / "model.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
 
 
-def test_index_file_exists_and_is_valid_json() -> None:
-    assert INDEX_PATH.is_file(), f"missing index: {INDEX_PATH}"
-    payload = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-    assert payload["schema"] == "cppmega_mlx_converted_index_v1"
-    assert payload["checkpoint_root"] == str(CHECKPOINT_ROOT)
-    assert payload["count"] == len(payload["checkpoints"])
-    assert set(payload["statuses"]) == set(payload["checkpoints"])
+def test_generate_index_is_portable_and_fail_closed(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    _checkpoint(root, "ready", ready=True)
+    _checkpoint(root, "old", ready=False)
+    _checkpoint(root, "tampered", ready=True)
+    (root / "tampered" / "weights.safetensors").write_bytes(b"changed")
+
+    payload = gen.generate_index(root)
+
+    assert payload["schema"] == "cppmega_mlx_converted_index_v2"
+    assert payload["count"] == 3
+    assert payload["ready"] == 1
+    assert payload["superseded"] == 2
+    assert payload["checkpoints"]["ready"]["status"] == "ready"
+    assert payload["checkpoints"]["ready"]["blockers"] == []
+    assert payload["checkpoints"]["tampered"]["blockers"] == ["publish_receipt"]
+    assert payload["checkpoints"]["old"]["status"] == "superseded"
+    assert payload["checkpoints"]["old"]["blockers"] == [
+        "conversion_schema",
+        "logit_parity",
+        "rope_only",
+        "publish_receipt",
+    ]
 
 
-def test_all_entries_have_required_fields() -> None:
-    payload = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-    for cid, entry in payload["checkpoints"].items():
-        assert entry["id"] == cid
-        for key in ("path", "manifest", "schema", "source_checkpoint", "weights"):
-            assert entry.get(key), f"{cid} missing {key}"
-        assert isinstance(entry["weights_bytes"], int)
-        assert len(entry["weights_sha256"]) == 64
+def test_main_honors_paths_and_publishes_idempotently(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    _checkpoint(root, "one", ready=True)
+    output = tmp_path / "index.json"
+    argv = ["--checkpoint-root", str(root), "--output", str(output)]
 
-
-def test_status_reflects_receipt_presence() -> None:
-    payload = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-    for cid, entry in payload["checkpoints"].items():
-        status = payload["statuses"][cid]
-        ready = entry.get("has_logit_parity") and entry.get("has_publish_receipt")
-        expected = "v4_ready" if ready else "v1_superseded"
-        assert status == expected, f"{cid}: expected {expected}, got {status}"
-
-
-def test_generate_index_is_idempotent() -> None:
-    first = gen.generate_index(CHECKPOINT_ROOT)
-    second = gen.generate_index(CHECKPOINT_ROOT)
-    assert first == second
-
-
-def test_generate_index_matches_written_file() -> None:
-    generated = gen.generate_index(CHECKPOINT_ROOT)
-    written = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
-    assert generated == written
+    assert gen.main(argv) == 0
+    first = output.read_bytes()
+    assert gen.main(argv) == 0
+    assert output.read_bytes() == first

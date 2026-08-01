@@ -1,57 +1,94 @@
 #!/usr/bin/env python3
-"""Generate a machine-readable index of mlx_converted checkpoints.
-
-The index maps a short checkpoint id to the directory, source checkpoint path,
-conversion schema version, and whether the conversion includes a logit-parity
-receipt. It is idempotent: re-run it after regenerating checkpoints to refresh
-the index.
-"""
+"""Generate a machine-readable index of converted MLX checkpoints."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from scripts.nanochat_data.atomic_publish import atomic_output_file  # noqa: E402
+
 DEFAULT_CHECKPOINT_ROOT = Path(
     "/Volumes/external/sources/cppmega/outputs/checkpoints/mlx_converted"
 )
 DEFAULT_INDEX_PATH = DEFAULT_CHECKPOINT_ROOT / "index.json"
+CURRENT_CONVERSION_SCHEMA = "cppmega_megatron_dense500m_to_mlx_v4"
 
 
 def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
+    digest = hashlib.sha256()
     with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _inspect_checkpoint(directory: Path) -> dict:
+def _weights_path(directory: Path, manifest: dict[str, object]) -> Path | None:
+    output = manifest.get("output")
+    if isinstance(output, str):
+        candidate = directory / Path(output).name
+        if candidate.is_file():
+            return candidate
+    candidates = sorted(directory.glob("*.safetensors"))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _inspect_checkpoint(directory: Path) -> dict[str, object]:
     manifest_path = directory / "model.json"
-    weights_path = directory / "model.safetensors"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    entry: dict = {
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{manifest_path}: expected a JSON object")
+    weights_path = _weights_path(directory, manifest)
+    actual_sha256 = _sha256_file(weights_path) if weights_path is not None else None
+    publish = manifest.get("publish")
+    has_publish_receipt = isinstance(publish, dict)
+    published_sha256 = publish.get("weights_sha256") if has_publish_receipt else None
+    reasons = []
+    if manifest.get("schema") != CURRENT_CONVERSION_SCHEMA:
+        reasons.append("conversion_schema")
+    if not isinstance(manifest.get("logit_parity"), dict):
+        reasons.append("logit_parity")
+    if manifest.get("rope_only") is not True:
+        reasons.append("rope_only")
+    if weights_path is None:
+        reasons.append("weights")
+    if (
+        not has_publish_receipt
+        or publish.get("completion_marker") != "model.json"
+        or published_sha256 != actual_sha256
+    ):
+        reasons.append("publish_receipt")
+
+    entry: dict[str, object] = {
         "id": directory.name,
         "path": str(directory),
         "manifest": str(manifest_path),
         "schema": manifest.get("schema"),
         "source_checkpoint": manifest.get("source_checkpoint"),
         "dtype": manifest.get("dtype"),
-        "has_logit_parity": "logit_parity" in manifest,
-        "has_publish_receipt": isinstance(manifest.get("publish"), dict),
+        "has_logit_parity": isinstance(manifest.get("logit_parity"), dict),
+        "has_publish_receipt": has_publish_receipt,
         "rope_only": manifest.get("rope_only"),
+        "status": "ready" if not reasons else "superseded",
+        "blockers": reasons,
     }
-    if weights_path.exists():
+    if weights_path is not None:
         entry["weights"] = str(weights_path)
         entry["weights_bytes"] = weights_path.stat().st_size
-        entry["weights_sha256"] = _sha256_file(weights_path)
+        entry["weights_sha256"] = actual_sha256
     return entry
 
 
-def generate_index(checkpoint_root: Path) -> dict:
+def generate_index(checkpoint_root: Path) -> dict[str, object]:
+    if not checkpoint_root.is_dir():
+        raise FileNotFoundError(checkpoint_root)
     entries = []
     for directory in sorted(checkpoint_root.iterdir()):
         if not directory.is_dir():
@@ -61,19 +98,12 @@ def generate_index(checkpoint_root: Path) -> dict:
         entries.append(_inspect_checkpoint(directory))
 
     by_id = {entry["id"]: entry for entry in entries}
-    statuses = {
-        entry["id"]: (
-            "v4_ready"
-            if entry.get("has_logit_parity") and entry.get("has_publish_receipt")
-            else "v1_superseded"
-        )
-        for entry in entries
-    }
     return {
-        "schema": "cppmega_mlx_converted_index_v1",
+        "schema": "cppmega_mlx_converted_index_v2",
         "checkpoint_root": str(checkpoint_root),
         "count": len(entries),
-        "statuses": statuses,
+        "ready": sum(entry["status"] == "ready" for entry in entries),
+        "superseded": sum(entry["status"] == "superseded" for entry in entries),
         "checkpoints": by_id,
     }
 
@@ -94,11 +124,14 @@ def main(argv: list[str]) -> int:
 
     index = generate_index(Path(args.checkpoint_root))
     output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with atomic_output_file(output) as staged:
+        staged.write_text(
+            json.dumps(index, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps({"output": str(output), "count": index["count"]}, indent=2))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main([]))
+    raise SystemExit(main(sys.argv[1:]))
