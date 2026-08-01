@@ -1,21 +1,19 @@
 """Native TileLang scatter for the paged KV offsets (decode) write path.
 
 The pure-MLX compatibility scatter (``serving.scatter_paged_kv_offsets``)
-rewrites one pool slice per new token through a Python host loop, which costs
-one full pool copy per token. This module compiles a single TileLang
-``@T.prim_func`` through the native ``tvm_ffi`` backend: each GPU thread owns
-exactly one pool element, checks the precomputed token->(block, slot) table,
-and writes either the incoming token value or the previous pool value. One
-launch per call regardless of batch size and token count.
+rewrites one pool slice per new token through a Python host loop. This module
+compiles two TileLang ``@T.prim_func`` kernels through the native ``tvm_ffi``
+backend: one copies the existing pool into caller-owned outputs and one writes
+the precomputed token->(block, slot) updates.
 
 Contract:
 
 * Caller-owned outputs (``k_out`` / ``v_out``) following the
   ``NativeTileLangKernel`` / mamba3-helper convention: outputs are passed as
   the trailing positional arguments and the same objects are returned.
-* Fail-closed: unsupported dtype, non-contiguous inputs, missing tilelang or
-  Metal raise ``PagedKvNativeUnavailable`` instead of silently degrading.
-  Callers that want a fallback choose it explicitly.
+* Fail-closed: unsupported dtype, missing tilelang or Metal raise
+  ``PagedKvNativeUnavailable`` instead of silently degrading. Callers that
+  want a fallback choose it explicitly.
 """
 
 from __future__ import annotations
@@ -148,6 +146,11 @@ def _scatter_offsets_kernel_for(
                 h = t1 % num_kv_heads
                 t = t1 // num_kv_heads
                 if t < token_count:
+                    b = t // new_tokens
+                    s = t % new_tokens
+                    src = (
+                        ((b * num_kv_heads + h) * new_tokens + s) * head_dim + d
+                    )
                     block = tok_block[t]
                     slot = tok_slot[t]
                     dst = (
@@ -156,8 +159,8 @@ def _scatter_offsets_kernel_for(
                         + h
                     ) * head_dim + d
                     if dst < pool_elems:
-                        k_out[dst] = k_new[sid]
-                        v_out[dst] = v_new[sid]
+                        k_out[dst] = k_new[src]
+                        v_out[dst] = v_new[src]
 
     return _compile_tvm_ffi_kernel(scatter_offsets, out_idx=[4, 5])
 

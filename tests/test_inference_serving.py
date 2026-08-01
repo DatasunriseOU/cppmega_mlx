@@ -387,7 +387,7 @@ def test_scatter_paged_kv_offsets_tilelang_matches_mlx_backend() -> None:
     if not status.available:
         pytest.skip(f"native paged KV scatter unavailable: {status.reason}")
 
-    def run(backend: str) -> np.ndarray:
+    def run(backend: str) -> tuple[np.ndarray, np.ndarray]:
         manager = _manager(num_blocks=4, block_size=4)
         manager.allocate_sequence(seq_id=1, num_tokens=6)
         manager.allocate_sequence(seq_id=2, num_tokens=7)
@@ -399,23 +399,28 @@ def test_scatter_paged_kv_offsets_tilelang_matches_mlx_backend() -> None:
         scatter_paged_kv(
             manager, table, layer_idx=0, k=past, v=past, seq_lengths=[4, 4]
         )
-        new_tokens = mx.full((batch, kv_heads, 2, head_dim), 50.0)
-        new_tokens = new_tokens + mx.arange(batch)[:, None, None, None]
+        shape = (batch, kv_heads, 2, head_dim)
+        new_tokens = 50.0 + mx.arange(
+            int(np.prod(shape)), dtype=mx.float32
+        ).reshape(shape)
         scatter_paged_kv_offsets(
             manager,
             table,
             layer_idx=0,
             k=new_tokens,
-            v=new_tokens,
+            v=new_tokens + 1000.0,
             write_offsets=[4, 5],
             backend=backend,
         )
-        k_out, _ = gather_paged_kv(
+        k_out, v_out = gather_paged_kv(
             manager, table, layer_idx=0, seq_lengths=[6, 7]
         )
-        return _as_numpy(k_out)
+        return _as_numpy(k_out), _as_numpy(v_out)
 
-    np.testing.assert_allclose(run("tilelang"), run("mlx"), atol=0, rtol=0)
+    tilelang_k, tilelang_v = run("tilelang")
+    mlx_k, mlx_v = run("mlx")
+    np.testing.assert_allclose(tilelang_k, mlx_k, atol=0, rtol=0)
+    np.testing.assert_allclose(tilelang_v, mlx_v, atol=0, rtol=0)
 
 
 def test_scatter_paged_kv_offsets_tilelang_fails_closed_on_unsupported_dtype() -> None:
