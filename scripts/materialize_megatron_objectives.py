@@ -534,9 +534,9 @@ class _ObjectiveSourceIterator(Iterator[ObjectiveSource]):
         return self
 
     def __next__(self) -> ObjectiveSource:
-        row, raw_cursor = next(self._rows)
+        raw_row, raw_cursor = next(self._rows)
         row = normalize_megatron_objective_source_row(
-            row,
+            raw_row,
             source_index=self._source_index,
         )
         token_count = len(row[TOKEN_IDS_COLUMN])  # type: ignore[arg-type]
@@ -594,7 +594,7 @@ class _ObjectiveSourceIterator(Iterator[ObjectiveSource]):
             )
 
         source = objective_source_from_tokenized_row(
-            row, source_index=self._source_index
+            raw_row, source_index=self._source_index
         )
         if source.code_packet is None:  # pragma: no cover - typed row invariant
             raise ValueError("objective source row did not produce a CodePacket")

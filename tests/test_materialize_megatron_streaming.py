@@ -6,8 +6,43 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from cppmega_mlx.data.source_identity import source_identity
 from cppmega_mlx.training.megatron_objectives import MaterializedMegatronDocument
 from scripts import materialize_megatron_objectives as materializer
+
+
+def test_source_iterator_normalizes_packed_row_only_once() -> None:
+    identity = source_identity({"repo": "org/repo", "filepath": "src/a.cc"})
+    raw_row = {
+        "input_ids": [10, 11, 12, 13],
+        "valid_token_count": 4,
+        "num_docs": 1,
+        "doc_ids": [1, 1, 1, 1],
+        "token_source_doc_ids": [101, 101, 101, 101],
+        "token_source_identity_ids": [identity.source_identity_id] * 4,
+        "source_identity_registry": [identity.as_dict()],
+        "token_chunk_starts": [],
+        "token_chunk_ends": [],
+        "token_chunk_kinds": [],
+        "token_chunk_dep_levels": [],
+        "token_call_edges": [],
+        "token_type_edges": [],
+        "token_domain_edges": [],
+        "token_build_edges": [],
+        "token_shell_edges": [],
+        "token_diagnostic_edges": [],
+        "token_cross_domain_edges": [],
+    }
+    iterator = materializer._ObjectiveSourceIterator(
+        [], seed=1, source_batch_rows=1
+    )
+    iterator._rows = iter([(raw_row, {"epoch": 0})])
+
+    source = next(iterator)
+
+    assert source.code_packet is not None
+    assert source.code_packet.token_ids.tolist() == [10, 11, 12, 13]
+    assert iterator.last_cursor == {"epoch": 0, "source_index": 0}
 
 
 def test_source_reader_uses_bounded_record_batches_without_whole_shard_read(
