@@ -56,8 +56,9 @@ def test_precomputed_cpp_files_feed_commit_diffs(tmp_path):
     commits = [second, first]
     indices, files_by_commit = egh.precompute_cpp_file_changes(str(repo), commits)
 
-    assert files_by_commit[second] == ["main.cpp"]
-    assert indices[(second, "main.cpp")] == 0
+    assert [c["new_filepath"] for c in files_by_commit[second]] == ["main.cpp"]
+    assert indices[(first, "main.cpp")] == 0
+    assert indices[(second, "main.cpp")] == 1
 
     diffs = egh.get_commit_diffs(
         str(repo),
@@ -89,12 +90,13 @@ def _write_main(repo: Path, first_line: str, last_line: str) -> None:
 
 
 def _build_diff_filtered_repo(tmp_path):
-    """Repo whose middle commit is rejected by the diff-size gate.
+    """Repo whose oversized edit and deletion are rejected by the blob gate.
 
-    Returns ``(repo, c1, c2, c3)`` where main.cpp is modified by:
-      * c1: small diff  -> accepted (expected file_local_commit_index 0)
-      * c2: diff > MAX_DIFF_CHARS -> REJECTED by get_commit_diffs (no record)
-      * c3: small diff  -> accepted (expected file_local_commit_index 1)
+    Returns ``(repo, c1, c2, c3, c4)`` where main.cpp is changed by:
+      * c1: small 'A' diff -> accepted (expected file_local_commit_index 0)
+      * c2: oversized blob -> rejected
+      * c3: deletion of the oversized blob -> rejected
+      * c4: small 'A' diff -> accepted (expected file_local_commit_index 1)
     """
     import extract_git_history as egh
 
@@ -102,26 +104,28 @@ def _build_diff_filtered_repo(tmp_path):
     repo.mkdir()
     _git(repo, "init")
 
-    # Root commit: main.cpp is Added (status 'A'), so it is never an 'M' record
-    # and never enters the index.
-    _write_main(repo, "int v = 0;", "// small")
-    _git(repo, "add", "main.cpp")
+    # Root commit is an unrelated file so the first main.cpp change is an 'A'
+    # that is still accepted by the diff gate and enters the index.
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
     _commit(repo, "initial")
 
-    _write_main(repo, "int v = 1;", "// small")
+    _write_main(repo, "int v = 0;", "// small")
+    _git(repo, "add", "main.cpp")
     c1 = _commit(repo, "first real edit")
 
-    # Oversized diff: the changed last line alone blows past MAX_DIFF_CHARS, so
-    # get_commit_diffs rejects this commit. new_content stays under the 200000
-    # content cap, so ONLY the diff-size gate filters it out.
-    huge = "// " + ("x" * (egh.MAX_DIFF_CHARS + 10000))
+    huge = "// " + ("x" * (egh.MAX_FILE_BYTES + 10000))
     _write_main(repo, "int v = 1;", huge)
-    c2 = _commit(repo, "oversized diff edit")
+    c2 = _commit(repo, "oversized blob edit")
 
-    _write_main(repo, "int v = 2;", huge)
-    c3 = _commit(repo, "second real edit")
+    _git(repo, "rm", "main.cpp")
+    c3 = _commit(repo, "delete oversized blob")
 
-    return repo, c1, c2, c3
+    _write_main(repo, "int v = 2;", "// small")
+    _git(repo, "add", "main.cpp")
+    c4 = _commit(repo, "re-add small source")
+
+    return repo, c1, c2, c3, c4
 
 
 def test_file_local_commit_index_excludes_diff_filtered_commits(tmp_path):
@@ -134,34 +138,37 @@ def test_file_local_commit_index_excludes_diff_filtered_commits(tmp_path):
     """
     import extract_git_history as egh
 
-    repo, c1, c2, c3 = _build_diff_filtered_repo(tmp_path)
-    commits = [c3, c2, c1]  # newest-first, matching git log output
+    repo, c1, c2, c3, c4 = _build_diff_filtered_repo(tmp_path)
+    commits = [c4, c3, c2, c1]  # newest-first, matching git log output
 
-    # c2 is genuinely diff-filtered out of the emitted set; c1/c3 are not.
+    # c2/c3 are genuinely blob-filtered out; c1/c4 are emitted.
     assert egh.get_commit_diffs(str(repo), c2) is None
+    assert egh.get_commit_diffs(str(repo), c3) is None
     assert egh.get_commit_diffs(str(repo), c1) is not None
-    assert egh.get_commit_diffs(str(repo), c3) is not None
+    assert egh.get_commit_diffs(str(repo), c4) is not None
 
     indices, files_by_commit = egh.precompute_cpp_file_changes(str(repo), commits)
 
     assert indices[(c1, "main.cpp")] == 0
-    assert indices[(c3, "main.cpp")] == 1  # contiguous: NOT 2
+    assert indices[(c4, "main.cpp")] == 1
     assert (c2, "main.cpp") not in indices
+    assert (c3, "main.cpp") not in indices
     assert c2 not in files_by_commit
+    assert c3 not in files_by_commit
     # files_by_commit carries only ACCEPTED (post-diff-filter) files forward.
-    assert files_by_commit[c1] == ["main.cpp"]
-    assert files_by_commit[c3] == ["main.cpp"]
+    assert [c["new_filepath"] for c in files_by_commit[c1]] == ["main.cpp"]
+    assert [c["new_filepath"] for c in files_by_commit[c4]] == ["main.cpp"]
 
 
 def test_emitted_records_carry_contiguous_indices_end_to_end(tmp_path):
     """End-to-end: the indices written into JSONL records are contiguous.
 
-    Exercises the real process_repo emit path (no mocks). The rejected c2 is
-    absent and c3's emitted file_local_commit_index is 1, not 2.
+    Exercises the real process_repo emit path (no mocks). The rejected c2/c3
+    are absent and c4's emitted file_local_commit_index is 1, not 3.
     """
     import extract_git_history as egh
 
-    repo, c1, c2, c3 = _build_diff_filtered_repo(tmp_path)
+    repo, c1, c2, c3, c4 = _build_diff_filtered_repo(tmp_path)
 
     out = tmp_path / "commits.jsonl"
     with out.open("w", encoding="utf-8") as fh:
@@ -175,10 +182,11 @@ def test_emitted_records_carry_contiguous_indices_end_to_end(tmp_path):
         r["commit_hash"]: r["file_local_commit_index"] for r in main_records
     }
 
-    assert len(main_records) == 2  # c1 and c3 only; c2 filtered out
+    assert len(main_records) == 2  # c1 and c4 only; c2/c3 filtered out
     assert c2 not in index_by_commit
+    assert c3 not in index_by_commit
     assert index_by_commit[c1] == 0
-    assert index_by_commit[c3] == 1  # the rejected commit did not inflate it
+    assert index_by_commit[c4] == 1
 
 
 def _make_cpp_repo(repo: Path) -> str:
@@ -299,16 +307,18 @@ def test_output_file_lock_rejects_second_process(tmp_path):
 
 
 def _build_linear_history(repo: Path, edits: int = 7) -> list[str]:
-    """Create ``edits`` emittable modifications after one root commit."""
+    """Create exactly ``edits`` emittable source commits after a README root."""
     repo.mkdir()
     _git(repo, "init")
-    source = repo / "main.cpp"
-    source.write_text("int f() { return 0; }\n", encoding="utf-8")
-    _git(repo, "add", "main.cpp")
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
     _commit(repo, "initial")
+    source = repo / "main.cpp"
     commits = []
-    for value in range(1, edits + 1):
+    for value in range(edits):
         source.write_text(f"int f() {{ return {value}; }}\n", encoding="utf-8")
+        if value == 0:
+            _git(repo, "add", "main.cpp")
         commits.append(_commit(repo, f"change value {value}"))
     return commits
 
@@ -369,7 +379,7 @@ def test_transactional_chunks_preserve_exact_output_order_and_indices(tmp_path):
     assert [row["commit_hash"] for row in records] == list(
         reversed(commits_oldest_first)
     )
-    assert [row["commit_hash"] for row in records] == source["commits"]
+    assert [row["commit_hash"] for row in records] == source["commits"][:-1]
     assert [row["file_local_commit_index"] for row in records] == list(
         reversed(range(7))
     )
@@ -381,11 +391,12 @@ def test_transactional_index_preserves_subject_filtered_counter_semantics(tmp_pa
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init")
-    source_file = repo / "main.cpp"
-    source_file.write_text("int f() { return 0; }\n", encoding="utf-8")
-    _git(repo, "add", "main.cpp")
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
     _commit(repo, "initial")
+    source_file = repo / "main.cpp"
     source_file.write_text("int f() { return 1; }\n", encoding="utf-8")
+    _git(repo, "add", "main.cpp")
     first = _commit(repo, "first emitted change")
     source_file.write_text("int f() { return 2; }\n", encoding="utf-8")
     filtered = _commit(repo, "clang-format source")
@@ -417,7 +428,8 @@ def test_transactional_index_preserves_subject_filtered_counter_semantics(tmp_pa
     }
     assert filtered not in index_by_commit
     assert index_by_commit[first] == 0
-    # The historical precompute counted accepted diffs before subject filtering.
+    # The filtered commit advances the counter without emitting, so the last
+    # emitted 'M' carries index 2.
     assert index_by_commit[last] == 2
 
 
@@ -429,12 +441,19 @@ def test_resume_skips_committed_chunks_and_records_exact_bad_path(
 
     repo = tmp_path / "repo"
     commits_oldest_first = _build_linear_history(repo, edits=7)
-    failing_commit = commits_oldest_first[4]
+    failing_commit = commits_oldest_first[3]
     real_get_file_diff = egh.get_file_diff
     calls: list[str] = []
 
-    def fail_one_path(repo_path: str, commit_hash: str, filepath: str):
+    def fail_one_path(
+        repo_path: str,
+        commit_hash: str,
+        change: egh._CommitFileChange,
+        *,
+        parent_hash: str | None = None,
+    ):
         calls.append(commit_hash)
+        filepath = change["new_filepath"] or change["old_filepath"] or ""
         if commit_hash == failing_commit:
             raise egh.UnitExtractionError(
                 repo_path=repo_path,
@@ -444,8 +463,7 @@ def test_resume_skips_committed_chunks_and_records_exact_bad_path(
                 error_type="GitCommandError",
                 detail="synthetic corrupt object",
             )
-        return real_get_file_diff(repo_path, commit_hash, filepath)
-
+        return real_get_file_diff(repo_path, commit_hash, change, parent_hash=parent_hash)
     monkeypatch.setattr(egh, "get_file_diff", fail_one_path)
     checkpoint_root = tmp_path / "checkpoint"
     _source, checkpoint = _open_checkpoint(
@@ -497,7 +515,7 @@ def test_resume_skips_committed_chunks_and_records_exact_bad_path(
     finally:
         resumed.close()
 
-    assert not set(commits_oldest_first[:4]).intersection(calls)
+    assert not set(commits_oldest_first[:3]).intersection(calls)
     assert failing_commit in calls
     assert stats["records_written"] == 6
     resumed_records = [json.loads(line) for line in output.read_text().splitlines()]
@@ -518,7 +536,14 @@ def test_quarantine_threshold_fails_after_recording_excess_unit(
     failing_commits = set(commits_oldest_first[:2])
     real_get_file_diff = egh.get_file_diff
 
-    def fail_two_paths(repo_path: str, commit_hash: str, filepath: str):
+    def fail_two_paths(
+        repo_path: str,
+        commit_hash: str,
+        change: egh._CommitFileChange,
+        *,
+        parent_hash: str | None = None,
+    ):
+        filepath = change["new_filepath"] or change["old_filepath"] or ""
         if commit_hash in failing_commits:
             raise egh.UnitExtractionError(
                 repo_path=repo_path,
@@ -528,7 +553,7 @@ def test_quarantine_threshold_fails_after_recording_excess_unit(
                 error_type="GitCommandError",
                 detail=f"missing object for {commit_hash}",
             )
-        return real_get_file_diff(repo_path, commit_hash, filepath)
+        return real_get_file_diff(repo_path, commit_hash, change, parent_hash=parent_hash)
 
     monkeypatch.setattr(egh, "get_file_diff", fail_two_paths)
     _source, checkpoint = _open_checkpoint(
