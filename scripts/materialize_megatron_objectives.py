@@ -132,6 +132,17 @@ _BOUNDED_SAMPLING_PRODUCER_VERSION = 1
 _DEFAULT_SOURCE_BATCH_ROWS = 64
 _DEFAULT_WRITE_BATCH_ROWS = 8
 _DEFAULT_MAX_BUFFER_BYTES = 256 * 1024 * 1024
+_SOURCE_POOL_MANIFEST_SCHEMA = "cppmega_ci_objective_pool_manifest_v1"
+_TWO_POOL_SOURCE_SNAPSHOT_SCHEMA = "cppmega_objective_source_snapshot_v2"
+_TWO_POOL_SCHEDULE = "alternate_primary_seed_v1"
+_PRIMARY_POOL = "primary_ci"
+_SEED_POOL = "objective_seed"
+_SOURCE_POOL_MANIFEST_COPY = "objective_source_pool_manifest.json"
+_CI_EXPORT_RECEIPT_COPY = "ci_export_receipt.json"
+_CI_EXPORT_SCHEMAS = {
+    "cppmega_ci_content_store_case5_export_v2",
+    "cppmega_ci_content_store_case5_export_v4",
+}
 
 
 def _source_stat(path: Path) -> _SourceStat:
@@ -316,6 +327,285 @@ def _require_source_snapshot_unchanged(
             raise RuntimeError(
                 f"objective source changed while materializing documents: {path}"
             )
+
+
+def _manifest_parquet_paths(
+    raw_records: object,
+    *,
+    root: Path,
+    where: str,
+) -> tuple[list[str], list[dict[str, object]]]:
+    if not isinstance(raw_records, list) or not raw_records:
+        raise ValueError(f"{where} must be a non-empty list")
+    canonical_root = root.resolve()
+    if not canonical_root.is_dir():
+        raise ValueError(f"{where} root is not a directory: {canonical_root}")
+    paths: list[str] = []
+    records: list[dict[str, object]] = []
+    for index, raw_record in enumerate(raw_records):
+        if not isinstance(raw_record, Mapping) or set(raw_record) != {
+            "path",
+            "rows",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError(
+                f"{where}[{index}] must contain path, rows, size_bytes, and sha256"
+            )
+        raw_path = raw_record["path"]
+        rows = raw_record["rows"]
+        size_bytes = raw_record["size_bytes"]
+        sha256 = raw_record["sha256"]
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or Path(raw_path).is_absolute()
+            or ".." in Path(raw_path).parts
+            or Path(raw_path).suffix != ".parquet"
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows < 1
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 1
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise ValueError(f"{where}[{index}] has an invalid file binding")
+        path = (canonical_root / raw_path).resolve()
+        try:
+            path.relative_to(canonical_root)
+        except ValueError as exc:
+            raise ValueError(f"{where}[{index}] escapes its source root") from exc
+        if not path.is_file() or path.stat().st_size != size_bytes:
+            raise ValueError(f"{where}[{index}] file size binding drifted: {raw_path}")
+        paths.append(str(path))
+        records.append(dict(raw_record))
+    if len(paths) != len(set(paths)):
+        raise ValueError(f"{where} contains duplicate parquet paths")
+    return paths, records
+
+
+def _load_source_pool_manifest(
+    path: Path,
+    *,
+    primary_root: Path,
+    objective_seed_root: Path,
+    sequence_length: int,
+) -> tuple[
+    list[str],
+    list[dict[str, object]],
+    list[str],
+    list[dict[str, object]],
+    bytes,
+    bytes,
+    dict[Path, _SourceStat],
+]:
+    manifest_path = path.resolve()
+    before = _source_stat(manifest_path)
+    raw = manifest_path.read_bytes()
+    after = _source_stat(manifest_path)
+    if before != after:
+        raise RuntimeError(f"source pool manifest changed while reading: {manifest_path}")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid source pool manifest: {manifest_path}") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "schema",
+        "algorithm",
+        "sequence_lengths",
+        "ci_export",
+        _PRIMARY_POOL,
+        _SEED_POOL,
+        "producer",
+    }:
+        raise ValueError("source pool manifest has unsupported top-level fields")
+    if (
+        payload["schema"] != _SOURCE_POOL_MANIFEST_SCHEMA
+        or payload["algorithm"] != _TWO_POOL_SCHEDULE
+        or not isinstance(payload["sequence_lengths"], list)
+        or sequence_length not in payload["sequence_lengths"]
+    ):
+        raise ValueError("source pool manifest schema, schedule, or bucket is invalid")
+
+    primary = payload[_PRIMARY_POOL]
+    objective_seed = payload[_SEED_POOL]
+    if (
+        not isinstance(primary, Mapping)
+        or set(primary) != {"files_by_sequence_length"}
+        or not isinstance(primary["files_by_sequence_length"], Mapping)
+        or not isinstance(objective_seed, Mapping)
+        or set(objective_seed) != {"files"}
+        or not isinstance(payload["producer"], Mapping)
+    ):
+        raise ValueError("source pool manifest pool inventory is invalid")
+    raw_primary_records = primary["files_by_sequence_length"].get(
+        str(sequence_length)
+    )
+    primary_paths, primary_records = _manifest_parquet_paths(
+        raw_primary_records,
+        root=primary_root,
+        where=f"{_PRIMARY_POOL}.files_by_sequence_length.{sequence_length}",
+    )
+    seed_paths, seed_records = _manifest_parquet_paths(
+        objective_seed["files"],
+        root=objective_seed_root,
+        where=f"{_SEED_POOL}.files",
+    )
+
+    ci_export = payload["ci_export"]
+    if not isinstance(ci_export, Mapping) or set(ci_export) != {
+        "path",
+        "sha256",
+        "schema",
+        "status",
+        "source_completion",
+    }:
+        raise ValueError("source pool manifest CI export binding is invalid")
+    if (
+        ci_export["path"] != "export_receipt.json"
+        or ci_export["schema"] not in _CI_EXPORT_SCHEMAS
+        or ci_export["status"] != "complete"
+        or not isinstance(ci_export["source_completion"], Mapping)
+    ):
+        raise ValueError("source pool manifest CI export semantics are invalid")
+    receipt_path = (primary_root.resolve() / "export_receipt.json").resolve()
+    receipt_before = _source_stat(receipt_path)
+    receipt_raw = receipt_path.read_bytes()
+    receipt_after = _source_stat(receipt_path)
+    if receipt_before != receipt_after:
+        raise RuntimeError(f"CI export receipt changed while reading: {receipt_path}")
+    if hashlib.sha256(receipt_raw).hexdigest() != ci_export["sha256"]:
+        raise ValueError("source pool manifest CI export receipt hash drifted")
+    try:
+        receipt = json.loads(receipt_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid CI export receipt: {receipt_path}") from exc
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema") != ci_export["schema"]
+        or receipt.get("status") != "complete"
+    ):
+        raise ValueError("source pool manifest differs from its CI export receipt")
+    source_completion = ci_export["source_completion"]
+    if (
+        source_completion.get("schema") != receipt["schema"]
+        or source_completion.get("status") != "complete"
+    ):
+        raise ValueError("source pool manifest CI completion binding is invalid")
+    if receipt["schema"].endswith("_v4"):
+        if (
+            source_completion.get("completion_mode") != "inventory-exhaustive"
+            or source_completion.get("production_complete") is not True
+        ):
+            raise ValueError("production CI source pool is not inventory-exhaustive")
+    elif (
+        source_completion.get("production_complete") is True
+        or source_completion.get("completion_mode") == "inventory-exhaustive"
+    ):
+        raise ValueError("threshold CI source pool cannot claim exhaustive completion")
+    return (
+        primary_paths,
+        primary_records,
+        seed_paths,
+        seed_records,
+        raw,
+        receipt_raw,
+        {manifest_path: after, receipt_path: receipt_after},
+    )
+
+
+def _build_two_pool_source_snapshot(
+    manifest_path: Path,
+    *,
+    primary_root: Path,
+    objective_seed_root: Path,
+    sequence_length: int,
+    requested_source_rows: int,
+    seed: int,
+    source_batch_rows: int,
+) -> tuple[
+    dict[str, object],
+    dict[Path, _SourceStat],
+    list[str],
+    list[str],
+    bytes,
+    bytes,
+]:
+    (
+        primary_shards,
+        primary_records,
+        seed_shards,
+        seed_records,
+        manifest_raw,
+        receipt_raw,
+        binding_signatures,
+    ) = _load_source_pool_manifest(
+        manifest_path,
+        primary_root=primary_root,
+        objective_seed_root=objective_seed_root,
+        sequence_length=sequence_length,
+    )
+    primary_requested = (requested_source_rows + 1) // 2
+    seed_requested = requested_source_rows // 2
+    primary_snapshot, primary_signatures = _build_source_snapshot(
+        primary_shards,
+        sequence_length=sequence_length,
+        requested_samples=primary_requested,
+        seed=seed,
+        sampling_mode=_BOUNDED_SAMPLING_MODE,
+        source_batch_rows=source_batch_rows,
+        source_root=primary_root,
+    )
+    seed_snapshot, seed_signatures = _build_source_snapshot(
+        seed_shards,
+        sequence_length=sequence_length,
+        requested_samples=seed_requested,
+        seed=seed,
+        sampling_mode=_BOUNDED_SAMPLING_MODE,
+        source_batch_rows=source_batch_rows,
+        source_root=objective_seed_root,
+    )
+    if (
+        primary_snapshot["files"] != primary_records
+        or seed_snapshot["files"] != seed_records
+    ):
+        raise ValueError("source pool manifest parquet bytes or row counts drifted")
+    snapshot = {
+        "schema": _TWO_POOL_SOURCE_SNAPSHOT_SCHEMA,
+        "sequence_length": int(sequence_length),
+        "algorithm": _TWO_POOL_SCHEDULE,
+        "pool_order": [_PRIMARY_POOL, _SEED_POOL],
+        "source_pool_manifest": {
+            "path": _SOURCE_POOL_MANIFEST_COPY,
+            "size_bytes": len(manifest_raw),
+            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        },
+        "ci_export_receipt": {
+            "path": _CI_EXPORT_RECEIPT_COPY,
+            "size_bytes": len(receipt_raw),
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+        },
+        "pools": {
+            _PRIMARY_POOL: primary_snapshot,
+            _SEED_POOL: seed_snapshot,
+        },
+    }
+    signatures = {
+        **primary_signatures,
+        **seed_signatures,
+        **binding_signatures,
+    }
+    return (
+        snapshot,
+        signatures,
+        primary_shards,
+        seed_shards,
+        manifest_raw,
+        receipt_raw,
+    )
 
 
 def materialized_schema() -> pa.Schema:
@@ -514,6 +804,49 @@ def _iter_parquet_source_rows(
         epoch += 1
 
 
+class _AlternatingSourceRows(
+    Iterator[tuple[dict[str, object], dict[str, int]]]
+):
+    def __init__(
+        self,
+        primary_rows: Iterator[tuple[dict[str, object], dict[str, int]]],
+        seed_rows: Iterator[tuple[dict[str, object], dict[str, int]]],
+    ) -> None:
+        self._rows = (primary_rows, seed_rows)
+        self._next_pool = 0
+        self.rows_yielded = [0, 0]
+        self.last_pool_cursors: list[dict[str, int] | None] = [None, None]
+
+    def __iter__(self) -> _AlternatingSourceRows:
+        return self
+
+    def __next__(self) -> tuple[dict[str, object], dict[str, int]]:
+        pool_index = self._next_pool
+        row, raw_cursor = next(self._rows[pool_index])
+        pool_source_index = self.rows_yielded[pool_index]
+        pool_cursor = {
+            **raw_cursor,
+            "source_index": pool_source_index,
+        }
+        self.rows_yielded[pool_index] += 1
+        self.last_pool_cursors[pool_index] = pool_cursor
+        self._next_pool = 1 - pool_index
+        return (
+            row,
+            {
+                "pool_index": pool_index,
+                "pool_source_index": pool_source_index,
+                "primary_rows_yielded": self.rows_yielded[0],
+                "objective_seed_rows_yielded": self.rows_yielded[1],
+                "next_pool_index": self._next_pool,
+                **{
+                    f"pool_{key}": value
+                    for key, value in raw_cursor.items()
+                },
+            },
+        )
+
+
 class _ObjectiveSourceIterator(Iterator[ObjectiveSource]):
     def __init__(
         self,
@@ -521,11 +854,16 @@ class _ObjectiveSourceIterator(Iterator[ObjectiveSource]):
         *,
         seed: int,
         source_batch_rows: int,
+        rows: Iterator[tuple[dict[str, object], dict[str, int]]] | None = None,
     ) -> None:
-        self._rows = _iter_parquet_source_rows(
-            shards,
-            seed=seed,
-            source_batch_rows=source_batch_rows,
+        self._rows = (
+            _iter_parquet_source_rows(
+                shards,
+                seed=seed,
+                source_batch_rows=source_batch_rows,
+            )
+            if rows is None
+            else rows
         )
         self._source_index = 0
         self.last_cursor: dict[str, int] | None = None
@@ -626,6 +964,73 @@ def _iter_sources(
         seed=seed,
         source_batch_rows=source_batch_rows,
     )
+
+
+def _iter_two_pool_sources(
+    primary_shards: list[str],
+    seed_shards: list[str],
+    *,
+    seed: int,
+    source_batch_rows: int,
+) -> tuple[_ObjectiveSourceIterator, _AlternatingSourceRows]:
+    rows = _AlternatingSourceRows(
+        _iter_parquet_source_rows(
+            primary_shards,
+            seed=seed,
+            source_batch_rows=source_batch_rows,
+        ),
+        _iter_parquet_source_rows(
+            seed_shards,
+            seed=seed,
+            source_batch_rows=source_batch_rows,
+        ),
+    )
+    return (
+        _ObjectiveSourceIterator(
+            [],
+            seed=seed,
+            source_batch_rows=source_batch_rows,
+            rows=rows,
+        ),
+        rows,
+    )
+
+
+def _bind_two_pool_sampling_cursors(
+    source_snapshot: dict[str, object],
+    *,
+    rows: _AlternatingSourceRows,
+    global_cursor: Mapping[str, int],
+    consumed_samples: int,
+) -> None:
+    if (
+        source_snapshot.get("schema") != _TWO_POOL_SOURCE_SNAPSHOT_SCHEMA
+        or source_snapshot.get("algorithm") != _TWO_POOL_SCHEDULE
+    ):
+        raise ValueError("source snapshot does not use deterministic two-pool sampling")
+    if sum(rows.rows_yielded) != consumed_samples:
+        raise ValueError("two-pool source counters do not match consumed samples")
+    if int(global_cursor.get("source_index", -1)) != consumed_samples - 1:
+        raise ValueError("two-pool global cursor does not match consumed samples")
+    if (
+        int(global_cursor.get("primary_rows_yielded", -1)) != rows.rows_yielded[0]
+        or int(global_cursor.get("objective_seed_rows_yielded", -1))
+        != rows.rows_yielded[1]
+    ):
+        raise ValueError("two-pool global cursor counters drifted")
+    pools = source_snapshot.get("pools")
+    if not isinstance(pools, dict):
+        raise ValueError("two-pool source snapshot is missing its pools")
+    for pool_index, pool_name in enumerate((_PRIMARY_POOL, _SEED_POOL)):
+        snapshot = pools.get(pool_name)
+        cursor = rows.last_pool_cursors[pool_index]
+        if not isinstance(snapshot, dict) or cursor is None:
+            raise ValueError(f"two-pool source snapshot is missing {pool_name}")
+        _bind_source_sampling_cursor(
+            snapshot,
+            cursor=cursor,
+            consumed_samples=rows.rows_yielded[pool_index],
+        )
 
 
 def _bind_case5_contract_hashes(receipt: dict[str, object]) -> None:
@@ -888,7 +1293,7 @@ def _materialize_stream(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-glob", required=True)
+    parser.add_argument("--data-glob")
     parser.add_argument(
         "--source-root",
         type=Path,
@@ -897,6 +1302,19 @@ def main() -> int:
             "Immutable root used to record canonical relative source paths; "
             "production bundles require code/<bucket>/... and commits/<bucket>/..."
         ),
+    )
+    parser.add_argument(
+        "--source-pool-manifest",
+        type=Path,
+        help=(
+            "Receipt-bound CI and objective-seed allowlist; when set, --data-glob "
+            "is forbidden and rows alternate primary CI then objective seed"
+        ),
+    )
+    parser.add_argument(
+        "--objective-seed-root",
+        type=Path,
+        help="Immutable root for objective seed paths declared by the pool manifest",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--samples", type=int, required=True)
@@ -981,18 +1399,65 @@ def main() -> int:
         raise ValueError(
             "--seq-len must be >=2 and all source/write buffer limits must be >=1"
         )
-    shards = sorted(glob.glob(args.data_glob))
-    if not shards:
-        raise FileNotFoundError(f"no parquet shards match {args.data_glob!r}")
-    source_snapshot, source_signatures = _build_source_snapshot(
-        shards,
-        sequence_length=args.seq_len,
-        requested_samples=args.samples,
-        seed=args.seed,
-        sampling_mode=_BOUNDED_SAMPLING_MODE,
-        source_batch_rows=args.source_batch_rows,
-        source_root=args.source_root,
-    )
+    two_pool_rows: _AlternatingSourceRows | None = None
+    source_pool_manifest_raw: bytes | None = None
+    ci_export_receipt_raw: bytes | None = None
+    if args.source_pool_manifest is None:
+        if args.data_glob is None:
+            raise ValueError(
+                "--data-glob is required without --source-pool-manifest"
+            )
+        if args.objective_seed_root is not None:
+            raise ValueError(
+                "--objective-seed-root requires --source-pool-manifest"
+            )
+        shards = sorted(glob.glob(args.data_glob))
+        if not shards:
+            raise FileNotFoundError(f"no parquet shards match {args.data_glob!r}")
+        source_snapshot, source_signatures = _build_source_snapshot(
+            shards,
+            sequence_length=args.seq_len,
+            requested_samples=args.samples,
+            seed=args.seed,
+            sampling_mode=_BOUNDED_SAMPLING_MODE,
+            source_batch_rows=args.source_batch_rows,
+            source_root=args.source_root,
+        )
+        source_iter = _iter_sources(
+            shards,
+            seed=args.seed,
+            source_batch_rows=args.source_batch_rows,
+        )
+    else:
+        if args.data_glob is not None or args.objective_seed_root is None:
+            raise ValueError(
+                "--source-pool-manifest requires --objective-seed-root and "
+                "forbids --data-glob"
+            )
+        (
+            source_snapshot,
+            source_signatures,
+            primary_shards,
+            seed_shards,
+            source_pool_manifest_raw,
+            ci_export_receipt_raw,
+        ) = _build_two_pool_source_snapshot(
+            args.source_pool_manifest,
+            primary_root=args.source_root,
+            objective_seed_root=args.objective_seed_root,
+            sequence_length=args.seq_len,
+            requested_source_rows=(
+                args.samples + quota_lookahead_samples
+            ),
+            seed=args.seed,
+            source_batch_rows=args.source_batch_rows,
+        )
+        source_iter, two_pool_rows = _iter_two_pool_sources(
+            primary_shards,
+            seed_shards,
+            seed=args.seed,
+            source_batch_rows=args.source_batch_rows,
+        )
 
     mixer = EligibilityAwareTaskMixer(
         STAGE1_DEFAULT_RATES,
@@ -1021,13 +1486,16 @@ def main() -> int:
         graph_config=graph_config,
         graph_weight=args.graph_aux_weight,
     )
-    source_iter = _iter_sources(
-        shards,
-        seed=args.seed,
-        source_batch_rows=args.source_batch_rows,
-    )
     final_output_dir = args.output_dir.resolve()
     with _atomic_output_directory(final_output_dir) as partial_output_dir:
+        if source_pool_manifest_raw is not None:
+            (partial_output_dir / _SOURCE_POOL_MANIFEST_COPY).write_bytes(
+                source_pool_manifest_raw
+            )
+            assert ci_export_receipt_raw is not None
+            (partial_output_dir / _CI_EXPORT_RECEIPT_COPY).write_bytes(
+                ci_export_receipt_raw
+            )
         writer = _StreamingParquetShardWriter(
             partial_output_dir,
             schema=materialized_schema(),
@@ -1059,11 +1527,20 @@ def main() -> int:
                 "objective source selection receipt cursor differs from the "
                 "iterator read cursor"
             )
-        _bind_source_sampling_cursor(
-            source_snapshot,
-            cursor=receipt_cursor,
-            consumed_samples=int(source_selection["source_rows_consumed"]),
-        )
+        consumed_source_rows = int(source_selection["source_rows_consumed"])
+        if two_pool_rows is None:
+            _bind_source_sampling_cursor(
+                source_snapshot,
+                cursor=receipt_cursor,
+                consumed_samples=consumed_source_rows,
+            )
+        else:
+            _bind_two_pool_sampling_cursors(
+                source_snapshot,
+                rows=two_pool_rows,
+                global_cursor=receipt_cursor,
+                consumed_samples=consumed_source_rows,
+            )
         contract = accumulator.finalize()
         contract["source_snapshot"] = source_snapshot
         contract["source_selection"] = source_selection
