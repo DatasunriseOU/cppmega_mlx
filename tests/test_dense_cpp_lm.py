@@ -25,6 +25,7 @@ from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
+from cppmega_mlx.inference.generation import generate_tokens
 from cppmega_mlx.models.dense_cpp_lm import (
     DenseCppBlock,
     DenseAttentionMode,
@@ -884,3 +885,16 @@ def test_rope_only_forward_matches_zero_position_table():
 def test_rope_only_requires_rope():
     with pytest.raises(ValueError, match="rope_only=True requires rope=True"):
         _smoke_config(rope=False, rope_only=True)
+
+
+def test_dense_cpp_lm_works_with_generic_generation_api():
+    """DenseCppLM returns (logits, loss) from __call__; generic generation.py
+    must unwrap the tuple and produce tokens (P055)."""
+    cfg = _smoke_config(ngram_hash_enabled=False)
+    model = DenseCppLM(cfg)
+    model.eval()
+    prompt_ids = mx.array([[1, 2, 3]])
+    generated = generate_tokens(model, prompt_ids, max_new_tokens=3, temperature=0.0)
+    mx.eval(generated)
+    assert generated.shape == (1, 6)
+    assert generated.tolist()[0][:3] == [1, 2, 3]

@@ -43,6 +43,7 @@ from cppmega_mlx.data.prompt_graph import (  # noqa: E402
 )
 from cppmega_mlx.data.prompt_graph_index import ClangPromptProjectIndexProducer  # noqa: E402
 from cppmega_mlx.data.fim import FIMSpecialTokenIds  # noqa: E402
+from cppmega_mlx.inference.generation import next_token_logits  # noqa: E402
 from cppmega_mlx.inference.infilling import build_fim_prompt_ids  # noqa: E402
 from cppmega_mlx.inference.sampling import sample_next_token  # noqa: E402
 from cppmega_mlx.inference.side_channels import (  # noqa: E402
@@ -1227,9 +1228,8 @@ def _sample_next(
     tokens: mx.array,
     logits_processors: list[Any] | None = None,
 ) -> int:
-    last = logits[0, -1].astype(mx.float32)
     sampled = sample_next_token(
-        last[None, :],
+        logits.astype(mx.float32),
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
@@ -1337,15 +1337,18 @@ def generate_completion_from_context(
                 "prompt graph biases were produced for a model with graph "
                 "routes disabled"
             )
-        logits, _loss = model(
+        logits = next_token_logits(
+            model(
+                input_ids,
+                block_bias=block_bias,
+                edge_kind_bias=edge_kind_bias,
+                # The assembled typed prompt is one intentional inference document.
+                # Source provenance remains in sidecars; packed document IDs must
+                # not split cross-file or cross-domain graph context.
+                document_ids=mx.ones_like(input_ids),
+                **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
+            ),
             input_ids,
-            block_bias=block_bias,
-            edge_kind_bias=edge_kind_bias,
-            # The assembled typed prompt is one intentional inference document.
-            # Source provenance remains in sidecars; packed document IDs must
-            # not split cross-file or cross-domain graph context.
-            document_ids=mx.ones_like(input_ids),
-            **{name: side[name] for name in MODEL_SIDE_CHANNEL_NAMES},
         )
         next_id = _sample_next(
             logits,
