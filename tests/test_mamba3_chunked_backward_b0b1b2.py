@@ -347,16 +347,16 @@ def test_backward_handoff_buffers_fp32_and_force_spilled():
         "this stage test drives the B2/B1/B0 kernels via TORCH-MPS positional "
         "buffers at the tiny non-production config G=1,H=2,N=16. That torch-MPS "
         "multi-kernel chain hits a command-buffer ordering hazard where F0's "
-        "dA_cumsum is read corrupted (NaN) by B1 -> dstates/dh0/dA_tail NaN -> "
-        "dC/dB/dh0 NaN. The race does NOT exist on the PRODUCTION MLX route "
+        "dA_cumsum is read corrupted, producing large per-grad errors (up to ~0.6) "
+        "in dx. The race does NOT exist on the PRODUCTION MLX route "
         "(mamba3_mimo_apply_with_state_path_c_fwd_path_c_bwd at nam56r H=128,N=64), "
         "which is covered green + deterministic by "
         "tests/test_mamba3_path_c_chunked_vs_path_b.py. The proto model below was "
         "updated to the production SSD (inp=x*B, NO dt) so the comparison targets "
-        "the right kernels; the remaining failure is the torch-path NaN only. "
-        "strict=False: surfaces loudly if the torch path ever starts passing."
+        "the right kernels; the remaining failure is the torch-path hazard only. "
+        "strict=True: any change that makes the torch path pass will flip this to XPASS."
     ),
-    strict=False,
+    strict=True,
 )
 @pytest.mark.parametrize("seqlen", [256, 512])
 def test_chained_backward_b2b1b0_matches_proto(seqlen, capsys):
