@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -1005,6 +1010,64 @@ def test_paged_kv_compatibility_path_decode_matches_contiguous_cache() -> None:
     np.testing.assert_allclose(
         np.array(ref_decode), np.array(out_decode), atol=1e-5, rtol=1e-5
     )
+
+
+def test_paged_kv_dsa_explicit_sparse_route_fails_closed_in_subprocess() -> None:
+    script = """
+import mlx.core as mx
+
+from cppmega_mlx.inference.serving import (
+    PagedKVBlockManager,
+    PagedKVBlockManagerConfig,
+)
+from cppmega_mlx.nn.attention import AttentionConfig, CausalSelfAttention
+
+attention = CausalSelfAttention(
+    AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="dsa")
+)
+manager = PagedKVBlockManager(
+    PagedKVBlockManagerConfig(
+        num_blocks=1,
+        block_size=4,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=mx.float32,
+    )
+)
+manager.allocate_sequence(seq_id=1, num_tokens=1)
+table = manager.block_table_for_sequences([1], max_blocks_per_seq=1)
+try:
+    attention(
+        mx.zeros((1, 1, 16)),
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[1],
+        paged_layer_idx=0,
+    )
+except NotImplementedError as error:
+    assert "Sparse-MLA FP8 route" in str(error)
+else:
+    raise AssertionError("explicit Sparse-MLA route silently degraded to dense")
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CPPMEGA_KERNEL_PATH__SPARSE_MLA": "path_c",
+            "CPPMEGA_SPARSE_MLA_FP8_ROUTE": "path_c",
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_paged_kv_compatibility_path_decode_mixed_batch() -> None:

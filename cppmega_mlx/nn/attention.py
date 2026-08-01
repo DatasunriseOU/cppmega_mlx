@@ -1267,6 +1267,15 @@ class CausalSelfAttention(nn.Module):
                 )
 
         if paged_requested:
+            if self._use_sparse_mla_fp8_path_b_baseline(
+                mask, sinks=sinks, kv_cache=kv_cache
+            ) or self._use_sparse_mla_fp8_path_c(
+                mask, sinks=sinks, kv_cache=kv_cache
+            ):
+                raise NotImplementedError(
+                    "Paged KV compatibility path does not support an explicitly "
+                    "selected Sparse-MLA FP8 route"
+                )
             return self._apply_paged_kv_compatibility_path(
                 hidden_states,
                 mask=mask,
