@@ -358,6 +358,28 @@ def test_scatter_paged_kv_offsets_rejects_missing_live_block() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "table, match",
+    [
+        ([[-1, 0]], "missing a live physical block"),
+        ([[0, 0]], "duplicate physical block"),
+    ],
+)
+def test_scatter_paged_kv_offsets_preflights_live_prefix(table, match) -> None:
+    manager = _manager(num_blocks=2, block_size=4)
+    k = mx.zeros((1, manager.num_kv_heads, 1, manager.head_dim))
+
+    with pytest.raises(ValueError, match=match):
+        scatter_paged_kv_offsets(
+            manager,
+            mx.array(table, dtype=mx.int32),
+            layer_idx=0,
+            k=k,
+            v=k,
+            write_offsets=[4],
+        )
+
+
 def test_inference_root_exports_serving_primitives() -> None:
     assert inference.PagedKVBlockManager is PagedKVBlockManager
     assert inference.ContinuousBatchScheduler is ContinuousBatchScheduler

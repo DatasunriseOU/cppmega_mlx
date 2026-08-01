@@ -785,6 +785,24 @@ def scatter_paged_kv_offsets(
             f"{max_seq_len}"
         )
 
+    seen_blocks: set[int] = set()
+    for batch_idx, offset in enumerate(offset_values):
+        needed_blocks = (
+            offset + new_tokens + manager.block_size - 1
+        ) // manager.block_size
+        for logical_idx in range(needed_blocks):
+            block_idx = int(block_table[batch_idx, logical_idx].item())
+            if block_idx == -1:
+                raise ValueError(
+                    "block_table is missing a live physical block at position "
+                    f"{logical_idx * manager.block_size} for batch row {batch_idx}"
+                )
+            if block_idx < 0 or block_idx >= manager.num_blocks:
+                raise ValueError("block_table contains an invalid physical block")
+            if block_idx in seen_blocks:
+                raise ValueError("block_table contains a duplicate physical block")
+            seen_blocks.add(block_idx)
+
     # ponytail: correctness-first host loop; replace with a native paged
     # scatter kernel when decode throughput matters.
     for batch_idx, offset in enumerate(offset_values):
@@ -793,13 +811,6 @@ def scatter_paged_kv_offsets(
             logical_idx = position // manager.block_size
             slot = position % manager.block_size
             block_idx = int(block_table[batch_idx, logical_idx].item())
-            if block_idx == -1:
-                raise ValueError(
-                    "block_table is missing a live physical block at position "
-                    f"{position} for batch row {batch_idx}"
-                )
-            if block_idx < 0 or block_idx >= manager.num_blocks:
-                raise ValueError("block_table contains an invalid physical block")
             manager.k_pool = mx.slice_update(
                 manager.k_pool,
                 k[batch_idx, :, token_idx, :][None, None, None, ...],
