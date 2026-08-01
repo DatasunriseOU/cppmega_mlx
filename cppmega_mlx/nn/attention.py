@@ -15,6 +15,7 @@ from cppmega_mlx.inference.serving import (
     PagedKVBlockManager,
     gather_paged_kv,
     scatter_paged_kv,
+    scatter_paged_kv_offsets,
 )
 from cppmega_mlx.runtime.kernel_policy import KernelPath, record_dispatch, selected_path
 from cppmega_mlx.runtime.path_c_taps import emit_and_tap_path_c_tensor
@@ -743,11 +744,25 @@ class CausalSelfAttention(nn.Module):
         freqs = mx.outer(positions, self.rope_inv_freq)
         return mx.cos(freqs)[None, None, :, :], mx.sin(freqs)[None, None, :, :]
 
+    def _rotary_tables_per_sequence(
+        self, seq_len: int, offsets: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        """RoPE tables with a per-batch-row start offset, shape ``(B,1,S,D/2)``."""
+
+        if self.rope_inv_freq is None:
+            raise ValueError("RoPE tables requested when use_rope=False")
+        positions = offsets.astype(mx.float32)[:, None] + mx.arange(
+            seq_len, dtype=mx.float32
+        )[None, :]
+        freqs = positions[..., None] * self.rope_inv_freq[None, None, :]
+        return mx.cos(freqs)[:, None, :, :], mx.sin(freqs)[:, None, :, :]
+
     def _project_qkv(
         self,
         hidden_states: mx.array,
         *,
         rope_offset: int = 0,
+        rope_offsets: mx.array | None = None,
     ) -> tuple[mx.array, mx.array, mx.array]:
         batch, seq, _ = hidden_states.shape
         cfg = self.config
@@ -770,7 +785,10 @@ class CausalSelfAttention(nn.Module):
         k = mx.transpose(k, (0, 2, 1, 3))
         v = mx.transpose(v, (0, 2, 1, 3))
         if self.rope_inv_freq is not None:
-            cos, sin = self._rotary_tables(seq, rope_offset)
+            if rope_offsets is not None:
+                cos, sin = self._rotary_tables_per_sequence(seq, rope_offsets)
+            else:
+                cos, sin = self._rotary_tables(seq, rope_offset)
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
         return q, k, v
@@ -1089,8 +1107,9 @@ class CausalSelfAttention(nn.Module):
 
         This path exists so the continuous-batch scheduler can allocate and
         preempt paged KV blocks while the model still reuses ``mx.fast.scaled_dot_product_attention``
-        on contiguous K/V tensors. RoPE offset is fixed to 0, so this path
-        currently supports prefill-length forward steps only.
+        on contiguous K/V tensors. ``paged_seq_lengths`` are the per-sequence
+        totals *after* this step; rows whose past length is non-zero are
+        treated as decode (chunk) steps with per-sequence RoPE offsets.
         """
 
         if self.config.mode == "dsa":
@@ -1102,21 +1121,34 @@ class CausalSelfAttention(nn.Module):
         else:
             seq_lengths_arr = mx.array(list(paged_seq_lengths), dtype=mx.int32)
         query_length = int(hidden_states.shape[1])
-        if not mx.array(seq_lengths_arr == query_length).all().item():
-            raise NotImplementedError(
-                "Paged KV compatibility path currently requires query_length == seq_lengths "
-                "(prefill-only); decode with per-sequence RoPE offsets is not wired yet"
+        past_lengths = seq_lengths_arr - query_length
+        if not mx.array(past_lengths >= 0).all().item():
+            raise ValueError(
+                "paged_seq_lengths must be >= query_length for every batch row "
+                f"(query_length={query_length})"
             )
+        is_prefill = bool(mx.array(past_lengths == 0).all().item())
 
-        q, k, v = self._project_qkv(hidden_states, rope_offset=0)
-        scatter_paged_kv(
-            paged_kv_manager,
-            paged_block_table,
-            paged_layer_idx,
-            k,
-            v,
-            seq_lengths_arr,
-        )
+        if is_prefill:
+            q, k, v = self._project_qkv(hidden_states, rope_offset=0)
+            scatter_paged_kv(
+                paged_kv_manager,
+                paged_block_table,
+                paged_layer_idx,
+                k,
+                v,
+                seq_lengths_arr,
+            )
+        else:
+            q, k, v = self._project_qkv(hidden_states, rope_offsets=past_lengths)
+            scatter_paged_kv_offsets(
+                paged_kv_manager,
+                paged_block_table,
+                paged_layer_idx,
+                k,
+                v,
+                past_lengths,
+            )
         k, v = gather_paged_kv(
             paged_kv_manager,
             paged_block_table,
@@ -1125,12 +1157,28 @@ class CausalSelfAttention(nn.Module):
         )
         key_length = int(k.shape[2])
         if mask is None or (isinstance(mask, str) and mask == "causal"):
-            mask = causal_sdpa_mask(
-                query_length,
-                sliding_window=self.config.sliding_window,
-                query_offset=0,
-                key_length=key_length,
-            )
+            if is_prefill:
+                mask = causal_sdpa_mask(
+                    query_length,
+                    sliding_window=self.config.sliding_window,
+                    query_offset=0,
+                    key_length=key_length,
+                )
+            else:
+                # Per-row decode mask: query j of row b sits at absolute
+                # position past_lengths[b] + j and may attend keys up to and
+                # including that position (optionally windowed).
+                query_positions = past_lengths[:, None] + mx.arange(
+                    query_length, dtype=mx.int32
+                )[None, :]
+                key_positions = mx.arange(key_length, dtype=mx.int32)[None, :]
+                visible = key_positions[None, :, :] <= query_positions[:, :, None]
+                if self.config.sliding_window is not None:
+                    visible = visible & (
+                        key_positions[None, :, :]
+                        > query_positions[:, :, None] - self.config.sliding_window
+                    )
+                mask = visible[:, None, :, :]
         mask = _merge_dense_attention_bias(
             mask,
             attention_bias,

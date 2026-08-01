@@ -13,6 +13,7 @@ from cppmega_mlx.inference import (
     gather_paged_kv,
     require_model_integrated_paged_attention,
     scatter_paged_kv,
+    scatter_paged_kv_offsets,
 )
 
 
@@ -302,12 +303,69 @@ def test_scatter_paged_kv_rejects_shape_mismatch() -> None:
         scatter_paged_kv(manager, table, layer_idx=0, k=k, v=v, seq_lengths=[5])
 
 
+def test_scatter_paged_kv_offsets_appends_at_absolute_positions() -> None:
+    manager = _manager(num_blocks=4, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=6)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+
+    batch, kv_heads, head_dim = 1, manager.num_kv_heads, manager.head_dim
+    past = mx.arange(kv_heads * 4 * head_dim, dtype=mx.float32).reshape(
+        batch, kv_heads, 4, head_dim
+    )
+    scatter_paged_kv(manager, table, layer_idx=0, k=past, v=past, seq_lengths=[4])
+
+    new_tokens = mx.full((batch, kv_heads, 2, head_dim), 100.0)
+    scatter_paged_kv_offsets(
+        manager, table, layer_idx=0, k=new_tokens, v=new_tokens, write_offsets=[4]
+    )
+    k_out, _ = gather_paged_kv(manager, table, layer_idx=0, seq_lengths=[6])
+
+    np.testing.assert_allclose(_as_numpy(k_out[0, :, :4, :]), _as_numpy(past[0]))
+    np.testing.assert_allclose(_as_numpy(k_out[0, :, 4:6, :]), 100.0)
+
+
+@pytest.mark.parametrize(
+    "write_offsets, new_tokens, match",
+    [
+        ([7], 2, "exceed block_table capacity"),
+        ([-1], 1, r"within \[0, 8\]"),
+    ],
+)
+def test_scatter_paged_kv_offsets_rejects_out_of_capacity(
+    write_offsets, new_tokens, match
+) -> None:
+    manager = _manager(num_blocks=2, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+    k = mx.zeros((1, manager.num_kv_heads, new_tokens, manager.head_dim))
+
+    with pytest.raises(ValueError, match=match):
+        scatter_paged_kv_offsets(
+            manager, table, layer_idx=0, k=k, v=k, write_offsets=write_offsets
+        )
+
+
+def test_scatter_paged_kv_offsets_rejects_missing_live_block() -> None:
+    manager = _manager(num_blocks=4, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=2)
+    # Wider table than the allocation covers: second logical block is padding.
+    table = mx.array([[manager.block_table_for_sequences([1], max_blocks_per_seq=1)[0, 0], -1]], dtype=mx.int32)
+    k = mx.zeros((1, manager.num_kv_heads, 3, manager.head_dim))
+
+    with pytest.raises(ValueError, match="missing a live physical block"):
+        scatter_paged_kv_offsets(
+            manager, table, layer_idx=0, k=k, v=k, write_offsets=[2]
+        )
+
+
 def test_inference_root_exports_serving_primitives() -> None:
     assert inference.PagedKVBlockManager is PagedKVBlockManager
     assert inference.ContinuousBatchScheduler is ContinuousBatchScheduler
     assert inference.gather_paged_kv is gather_paged_kv
     assert inference.scatter_paged_kv is scatter_paged_kv
+    assert inference.scatter_paged_kv_offsets is scatter_paged_kv_offsets
     assert "PagedKVBlockManager" in inference.__all__
     assert "gather_paged_kv" in inference.__all__
     assert "scatter_paged_kv" in inference.__all__
+    assert "scatter_paged_kv_offsets" in inference.__all__
     assert "require_model_integrated_paged_attention" in inference.__all__

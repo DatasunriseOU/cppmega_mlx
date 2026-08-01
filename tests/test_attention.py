@@ -911,7 +911,7 @@ def test_paged_kv_compatibility_path_matches_contiguous_baseline() -> None:
     )
 
 
-def test_paged_kv_compatibility_path_rejects_decode_offsets() -> None:
+def test_paged_kv_compatibility_path_rejects_short_seq_lengths() -> None:
     from cppmega_mlx.inference.serving import (
         PagedKVBlockManager,
         PagedKVBlockManagerConfig,
@@ -919,7 +919,7 @@ def test_paged_kv_compatibility_path_rejects_decode_offsets() -> None:
 
     cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
     attn = CausalSelfAttention(cfg)
-    x = _rand((1, 1, 16), seed=7)
+    x = _rand((1, 4, 16), seed=7)
     manager = PagedKVBlockManager(
         PagedKVBlockManagerConfig(
             num_blocks=4,
@@ -933,15 +933,147 @@ def test_paged_kv_compatibility_path_rejects_decode_offsets() -> None:
     manager.allocate_sequence(seq_id=1, num_tokens=4)
     table = manager.block_table_for_sequences([1], max_blocks_per_seq=1)
 
-    with pytest.raises(NotImplementedError, match="prefill-only"):
+    with pytest.raises(ValueError, match=">= query_length"):
         attn(
             x,
             mask="causal",
             paged_kv_manager=manager,
             paged_block_table=table,
-            paged_seq_lengths=[4],
+            paged_seq_lengths=[3],
             paged_layer_idx=0,
         )
+
+
+def test_paged_kv_compatibility_path_decode_matches_contiguous_cache() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
+    attn = CausalSelfAttention(cfg)
+    prefill = _rand((2, 5, 16), seed=21)
+    decode_step = _rand((2, 1, 16), seed=22)
+
+    # Contiguous cache reference.
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=2,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+    ref_prefill = attn(prefill, mask="causal", kv_cache=cache, layer_idx=0)
+    ref_decode = attn(decode_step, kv_cache=cache, layer_idx=0)
+    mx.eval(ref_prefill, ref_decode)
+
+    # Paged compatibility path.
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=8,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=6)
+    manager.allocate_sequence(seq_id=2, num_tokens=6)
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+
+    out_prefill = attn(
+        prefill,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[5, 5],
+        paged_layer_idx=0,
+    )
+    out_decode = attn(
+        decode_step,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[6, 6],
+        paged_layer_idx=0,
+    )
+    mx.eval(out_prefill, out_decode)
+
+    np.testing.assert_allclose(
+        np.array(ref_prefill), np.array(out_prefill), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.array(ref_decode), np.array(out_decode), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_paged_kv_compatibility_path_decode_mixed_batch() -> None:
+    from cppmega_mlx.inference.serving import (
+        PagedKVBlockManager,
+        PagedKVBlockManagerConfig,
+    )
+
+    cfg = AttentionConfig(d_model=16, num_q_heads=4, num_kv_heads=2, mode="gqa")
+    attn = CausalSelfAttention(cfg)
+    past_b = _rand((1, 4, 16), seed=31)
+    step = _rand((2, 2, 16), seed=32)
+
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=8,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.float32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=2)
+    manager.allocate_sequence(seq_id=2, num_tokens=6)
+
+    # Row B prefill: 4 tokens written through the paged path itself.
+    table_b = manager.block_table_for_sequences([2], max_blocks_per_seq=2)
+    attn(
+        past_b,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table_b,
+        paged_seq_lengths=[4],
+        paged_layer_idx=0,
+    )
+
+    # Joint step: row A prefills 2 tokens, row B decodes a 2-token chunk.
+    table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+    out = attn(
+        step,
+        mask="causal",
+        paged_kv_manager=manager,
+        paged_block_table=table,
+        paged_seq_lengths=[2, 6],
+        paged_layer_idx=0,
+    )
+    mx.eval(out)
+
+    # Reference row A: plain prefill of the same 2 tokens.
+    ref_a = attn(step[:1], mask="causal")
+    # Reference row B: contiguous cache prefilled with the same 4 tokens,
+    # then the same 2-token chunk.
+    cache = make_contiguous_kv_cache(
+        num_layers=1,
+        batch_size=1,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+    attn(past_b, mask="causal", kv_cache=cache, layer_idx=0)
+    ref_b = attn(step[1:], kv_cache=cache, layer_idx=0)
+    mx.eval(ref_a, ref_b)
+
+    np.testing.assert_allclose(
+        np.array(ref_a), np.array(out[:1]), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.array(ref_b), np.array(out[1:]), atol=1e-5, rtol=1e-5
+    )
 
 
 def test_paged_kv_compatibility_path_rejects_dsa() -> None:

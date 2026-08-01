@@ -722,6 +722,98 @@ def scatter_paged_kv(
             )
 
 
+def scatter_paged_kv_offsets(
+    manager: PagedKVBlockManager,
+    block_table: mx.array,
+    layer_idx: int,
+    k: mx.array,
+    v: mx.array,
+    write_offsets: mx.array | Sequence[int],
+) -> None:
+    """Write new-token K/V into the paged pool at per-sequence absolute offsets.
+
+    This is the decode-side write of the paged KV compatibility path: row ``i``
+    appends ``k.shape[2]`` new tokens starting at absolute position
+    ``write_offsets[i]`` inside its sequence. The caller is responsible for
+    ensuring that ``block_table`` entries are unique across the batch (an
+    invariant enforced by ``PagedKVBlockManager``).
+
+    Args:
+        manager: paged KV block manager that owns the physical pool.
+        block_table: int32 array of shape ``(batch, max_blocks_per_seq)``.
+        layer_idx: layer whose K/V blocks should be written.
+        k: tensor of shape ``(batch, kv_heads, new_tokens, head_dim)``.
+        v: tensor of shape ``(batch, kv_heads, new_tokens, head_dim)``.
+        write_offsets: int32 array or list of length ``batch`` with the
+            per-sequence start positions of the new tokens.
+    """
+
+    if not isinstance(manager, PagedKVBlockManager):
+        raise TypeError("manager must be a PagedKVBlockManager")
+    _validate_int("layer_idx", layer_idx)
+    if layer_idx < 0 or layer_idx >= manager.num_layers:
+        raise IndexError("layer_idx out of range")
+    if block_table.ndim != 2:
+        raise ValueError(f"block_table must be 2-D, got {block_table.ndim}")
+    if k.shape != v.shape:
+        raise ValueError("k and v must have the same shape")
+    if k.ndim != 4:
+        raise ValueError(f"k must be 4-D, got {k.ndim}")
+    batch = int(block_table.shape[0])
+    max_blocks = int(block_table.shape[1])
+    if k.shape[0] != batch:
+        raise ValueError(f"k batch dim {k.shape[0]} must match block_table {batch}")
+    if k.shape[1] != manager.num_kv_heads:
+        raise ValueError(
+            f"k kv_heads dim {k.shape[1]} must match manager {manager.num_kv_heads}"
+        )
+    if k.shape[3] != manager.head_dim:
+        raise ValueError(
+            f"k head_dim {k.shape[3]} must match manager {manager.head_dim}"
+        )
+
+    max_seq_len = max_blocks * manager.block_size
+    _, offset_values = _paged_seq_lengths(
+        write_offsets,
+        batch=batch,
+        capacity=max_seq_len,
+    )
+    new_tokens = int(k.shape[2])
+    if any(offset + new_tokens > max_seq_len for offset in offset_values):
+        raise ValueError(
+            "write_offsets + new_tokens exceed block_table capacity "
+            f"{max_seq_len}"
+        )
+
+    # ponytail: correctness-first host loop; replace with a native paged
+    # scatter kernel when decode throughput matters.
+    for batch_idx, offset in enumerate(offset_values):
+        for token_idx in range(new_tokens):
+            position = offset + token_idx
+            logical_idx = position // manager.block_size
+            slot = position % manager.block_size
+            block_idx = int(block_table[batch_idx, logical_idx].item())
+            if block_idx == -1:
+                raise ValueError(
+                    "block_table is missing a live physical block at position "
+                    f"{position} for batch row {batch_idx}"
+                )
+            if block_idx < 0 or block_idx >= manager.num_blocks:
+                raise ValueError("block_table contains an invalid physical block")
+            manager.k_pool = mx.slice_update(
+                manager.k_pool,
+                k[batch_idx, :, token_idx, :][None, None, None, ...],
+                mx.array([block_idx, layer_idx, slot, 0, 0]),
+                axes=(0, 1, 2, 3, 4),
+            )
+            manager.v_pool = mx.slice_update(
+                manager.v_pool,
+                v[batch_idx, :, token_idx, :][None, None, None, ...],
+                mx.array([block_idx, layer_idx, slot, 0, 0]),
+                axes=(0, 1, 2, 3, 4),
+            )
+
+
 def _pad_or_trim_kv(x: mx.array, target_len: int) -> mx.array:
     """Pad or trim a (batch, heads, seq, dim) tensor along the sequence axis."""
 
@@ -841,4 +933,5 @@ __all__ = [
     "gather_paged_kv",
     "require_model_integrated_paged_attention",
     "scatter_paged_kv",
+    "scatter_paged_kv_offsets",
 ]
