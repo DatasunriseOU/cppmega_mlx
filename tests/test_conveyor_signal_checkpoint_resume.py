@@ -38,6 +38,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import streaming_reindex as sr
+
 MLX_ROOT = Path(__file__).resolve().parents[1]
 HARNESS = MLX_ROOT / "tests" / "conveyor_ckpt_harness.py"
 
@@ -107,14 +109,21 @@ def _build(ckpt_root: Path):
     paths["repo_list"].write_text(
         json.dumps(
             {
+                "schema_version": 2,
                 "repos": [
                     {
-                        "name": repo,
+                        "bare_name": repo,
                         "owner_repo": f"test/{repo}",
                         "project_identity": f"test/{repo}",
                     }
                     for repo in REPOS
-                ]
+                ],
+                "by_bare_name": {
+                    repo: f"test/{repo}" for repo in REPOS
+                },
+                "project_identities": sorted(f"test/{repo}" for repo in REPOS),
+                "repo_names": sorted(f"test/{repo}" for repo in REPOS),
+                "unresolved": [],
             },
             sort_keys=True,
         )
@@ -138,7 +147,14 @@ def _build(ckpt_root: Path):
                     "path": str(paths["repo_list"].resolve()),
                     "sha256": sha256(paths["repo_list"]),
                 },
-                "expected_repos_sha256": "2" * 64,
+                "expected_repos_sha256": hashlib.sha256(
+                    json.dumps(
+                        [f"test/{repo}" for repo in REPOS],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
                 "scan_id": "3" * 64,
                 "expected_repo_count": len(REPOS),
                 "declared_pr_count": 0,
@@ -164,6 +180,7 @@ def _build(ckpt_root: Path):
         "--dedup-db", "",
         "--pr-store", str(paths["pr_store"]),
         "--repo-list", str(paths["repo_list"]),
+        "--pr-repo-list", str(paths["repo_list"]),
         "--pr-completion-receipt", str(paths["pr_completion"]),
         "--dedup-checkpoint-tokens", "0",
         "--memory-limit-gb", "99",
@@ -207,7 +224,11 @@ def test_sigterm_checkpoint_then_zero_rework_resume(tmp_path, capsys):
                 break  # exited before we could signal -> handled by assert below
             man = _read_manifest(paths["manifest"])
             done_r = _range_keys_done(man, FIRST_REPO)
-            sentinel = paths["extract_cache"] / FIRST_REPO / f"{FIRST_REPO}_commits.jsonl.done"
+            sentinel = (
+                paths["extract_cache"]
+                / sr.filesystem_repo_key(FIRST_REPO)
+                / f"{FIRST_REPO}_commits.jsonl.done"
+            )
             # SIGTERM exactly when the extract is done AND >=1 but NOT all ranges
             # are committed -> guarantees a mid-repo interruption.
             if sentinel.exists() and 1 <= len(done_r) < NRECORDS:
@@ -236,11 +257,17 @@ def test_sigterm_checkpoint_then_zero_rework_resume(tmp_path, capsys):
     # repoB must NOT have been staged after the stop (sequential driver).
     assert not _range_keys_done(man1, "repoB"), "repoB staged after SIGTERM stop"
 
-    cache_jsonl = paths["extract_cache"] / FIRST_REPO / f"{FIRST_REPO}_commits.jsonl"
+    cache_jsonl = (
+        paths["extract_cache"]
+        / sr.filesystem_repo_key(FIRST_REPO)
+        / f"{FIRST_REPO}_commits.jsonl"
+    )
     sentinel = Path(str(cache_jsonl) + ".done")
     assert cache_jsonl.exists(), "extract jsonl NOT retained after interrupt"
     assert sentinel.exists(), "extract sentinel NOT retained after interrupt"
-    assert (paths["work_dir"] / FIRST_REPO / "_src").exists(), "work _src NOT retained"
+    assert (
+        paths["work_dir"] / sr.filesystem_repo_key(FIRST_REPO) / "_src"
+    ).exists(), "work _src NOT retained"
 
     ex1 = _read_events(paths["extract_events"])
     a_extracts_1 = [e for e in ex1 if e["repo"] == FIRST_REPO]
@@ -319,9 +346,13 @@ def test_sigterm_checkpoint_then_zero_rework_resume(tmp_path, capsys):
     # exactly one marker per range -> no duplicate range outputs
     assert len(marker_files) == len(set(marker_files)) == len(REPOS) * NRECORDS
     # fully-done repos: temp + extract cache reclaimed.
-    assert not (paths["work_dir"] / FIRST_REPO).exists(), \
+    assert not (
+        paths["work_dir"] / sr.filesystem_repo_key(FIRST_REPO)
+    ).exists(), \
         "fully-done repo work dir not reclaimed"
-    assert not (paths["extract_cache"] / FIRST_REPO).exists(), \
+    assert not (
+        paths["extract_cache"] / sr.filesystem_repo_key(FIRST_REPO)
+    ).exists(), \
         "fully-done repo extract cache not reclaimed"
     final_correct = True
 

@@ -369,9 +369,22 @@ def acquire_repo_lock(repo_dir: Path) -> HeldLock:
     return HeldLock(lock_path, handle)
 
 
+def _repo_source(repo_dir: Path) -> tuple[str, Path]:
+    sources = sorted(repo_dir.glob("*_commits.jsonl"))
+    if len(sources) != 1:
+        raise VerificationError(
+            f"{repo_dir}: expected exactly one published commit JSONL, "
+            f"found {len(sources)}"
+        )
+    source = sources[0]
+    repo = source.name.removesuffix("_commits.jsonl")
+    if not repo:
+        raise VerificationError(f"{source}: empty repository name")
+    return repo, source
+
+
 def verify_repo(repo_dir: Path, proof: Proof) -> dict[str, Any]:
-    repo = repo_dir.name
-    source = repo_dir / f"{repo}_commits.jsonl"
+    repo, source = _repo_source(repo_dir)
     publication_path = Path(f"{source}.extract-checkpoint") / "publication.json"
     _regular_file(source, label="published commit JSONL")
     _regular_file(publication_path, label="extractor publication")
@@ -420,9 +433,18 @@ def verify_repo(repo_dir: Path, proof: Proof) -> dict[str, Any]:
             if rows == 0:
                 continue
             length = int(raw_length)
-            parquet_path = (
-                proof.parquet_root / str(length) / f"{repo}_r{item['start']}.parquet"
+            artifact_filename = item.get(
+                "artifact_filename",
+                f"{repo}_r{item['start']}.parquet",
             )
+            if (
+                not isinstance(artifact_filename, str)
+                or Path(artifact_filename).name != artifact_filename
+            ):
+                raise VerificationError(
+                    f"{repo}: invalid artifact filename at {item['key']}"
+                )
+            parquet_path = proof.parquet_root / str(length) / artifact_filename
             verified = _verify_parquet(parquet_path, length=length, metrics=metrics)
             parquet_totals["files"] += 1
             for key, value in verified.items():
@@ -470,8 +492,7 @@ def build_plan(
                 )
                 continue
             _contained_direct_child(cache_root, repo_dir)
-            repo = repo_dir.name
-            source = repo_dir / f"{repo}_commits.jsonl"
+            repo, source = _repo_source(repo_dir)
             publication = Path(f"{source}.extract-checkpoint") / "publication.json"
             if not publication.is_file():
                 blocked.append(

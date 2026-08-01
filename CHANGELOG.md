@@ -2,6 +2,20 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## Case-safe source artifact isolation (2026-08-01)
+
+- Mirrored injective case-insensitive filesystem keys for source work,
+  source/extract caches, and code/commit Parquet publication. Logical repository
+  names and project identities remain unchanged in manifests and sidecars, so
+  `DirectXTK` and `directxtk` no longer overwrite one physical APFS path.
+- Cleanup verification consumes the manifest-bound artifact filename and
+  recovers the logical repo from the published JSONL, while retaining legacy
+  raw-name compatibility.
+- Focused verification: 79 source-contract tests, 74 conveyor/cache tests,
+  7 cleanup tests, and the real SIGTERM/resume subprocess test passed.
+- The legacy `bionic`/`v8` → `nickg/nvc` identity defect remains open and is
+  not hidden by this storage fix.
+
 ## Canonical live training-data inventory (2026-07-31)
 
 - Mirrored the physically audited inventory generator, pinned input config,

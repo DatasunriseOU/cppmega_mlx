@@ -77,6 +77,8 @@ def _clean_test_revision_snapshot() -> dict:
     empty_sha = "0" * 64
     return {
         "schema_version": conv.CODE_REVISION_SCHEMA_VERSION,
+        "producer_role": conv.CODE_REVISION_PRODUCER_ROLE,
+        "repository_identity": conv.CODE_REVISION_REPOSITORY_IDENTITY,
         "git_commit": TEST_CODE_REVISION,
         "dirty": False,
         "dirty_fingerprint": empty_sha,
@@ -177,7 +179,7 @@ def fake_stream_repo_subtrees_with_git(work_root, should_process, *, on_no_git=N
     for repo in REPOS:
         if not should_process(repo):
             continue
-        repo_dir = Path(work_root) / repo / "_src"
+        repo_dir = Path(work_root) / sr.filesystem_repo_key(repo) / "_src"
         (repo_dir / ".git").mkdir(parents=True, exist_ok=True)
         yield repo, repo_dir
 
@@ -242,20 +244,24 @@ def fake_run_code_half(
     recompressor=None,
     *,
     revision_guard=None,
+    source_quarantine_manifest=None,
 ):
-    del revision_guard
+    del revision_guard, source_quarantine_manifest
     return {"source": f"{repo}::code", "lengths": _lengths_info(lengths_code, 10)}
 
 
 def fake_process_range(repo, repo_dir, records_jsonl, start, end, lengths_sorted,
-                       repo_work, dedup_db, dedup_near, pr_store, repo_list,
+                       repo_work, dedup_db, dedup_near, pr_store, project_id,
+                       pr_owner_repo,
                        memory_limit_gb=10.0, analysis_cache_entries=128, *,
                        pr_scan_id=None):
     """Fake per-range commit stage. Sleeps (so the test can SIGTERM mid-repo),
     records ONE durable event per ACTUAL execution, and writes a persistent
     marker 'parquet' so final completeness can be checked."""
-    if pr_scan_id != "3" * 64:
-        raise AssertionError(f"unexpected harness PR scan id: {pr_scan_id!r}")
+    if project_id != f"test/{repo}" or pr_owner_repo != f"test/{repo}":
+        raise AssertionError(
+            f"unexpected harness range identity: {project_id!r}/{pr_owner_repo!r}"
+        )
     time.sleep(RANGE_SLEEP)
     _append_event(RANGE_EVENTS, {
         "repo": repo, "start": int(start), "end": int(end),

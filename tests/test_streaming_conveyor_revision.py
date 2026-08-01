@@ -13,6 +13,23 @@ import pytest
 from scripts import streaming_conveyor as sc
 
 
+def test_repo_filesystem_keys_isolate_case_variants() -> None:
+    upper = sc.sr.filesystem_repo_key("DirectXTK")
+    lower = sc.sr.filesystem_repo_key("directxtk")
+
+    assert lower == "directxtk"
+    assert upper == "%44irect%58%54%4b"
+    assert upper.casefold() != lower.casefold()
+    assert (
+        sc.sr.code_output_filename("DirectXTK").casefold()
+        != sc.sr.code_output_filename("directxtk").casefold()
+    )
+    assert (
+        sc.sr.commit_output_filename("DirectXTK", 0).casefold()
+        != sc.sr.commit_output_filename("directxtk", 0).casefold()
+    )
+
+
 def test_source_stream_read_error_is_only_suppressed_after_checkpoint_signal() -> None:
     error = tarfile.ReadError("unexpected end of data")
 

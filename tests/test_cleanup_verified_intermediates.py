@@ -173,6 +173,33 @@ def test_parquet_row_token_invariants_are_fail_closed(tmp_path: Path) -> None:
         cleanup.build_plan(cache_root, [proof])
 
 
+def test_manifest_artifact_filename_selects_case_safe_parquet(
+    tmp_path: Path,
+) -> None:
+    cache_root, proof = _fixture(tmp_path)
+    encoded_cache = cache_root / "%53ample"
+    (cache_root / "sample").rename(encoded_cache)
+    source = encoded_cache / "sample_commits.jsonl"
+    publication_path = (
+        Path(f"{source}.extract-checkpoint") / "publication.json"
+    )
+    publication = json.loads(publication_path.read_text(encoding="utf-8"))
+    publication["output_path"] = str(source.resolve())
+    _write_json(publication_path, publication)
+    legacy = tmp_path / "parquet" / "1024" / "sample_r0.parquet"
+    encoded = legacy.with_name("%53ample_r0.parquet")
+    legacy.rename(encoded)
+    proof.done["sample::r0"]["artifact_filename"] = encoded.name
+
+    verified, blocked, locks = cleanup.build_plan(cache_root, [proof])
+    try:
+        assert blocked == []
+        assert verified[0]["parquet"]["files"] == 1
+    finally:
+        for lock in locks:
+            lock.close()
+
+
 def test_empty_after_dedup_range_does_not_require_a_stage(tmp_path: Path) -> None:
     cache_root, proof = _fixture(tmp_path)
     proof.done["sample::r0"] = {
