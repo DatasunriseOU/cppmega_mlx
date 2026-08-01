@@ -2,6 +2,15 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## FP8 NaN fail-fast (2026-08-01)
+
+- TileLang CUDA and Metal amax kernels now emit a per-block NaN poison flag
+  alongside the maximum. This keeps NaN out of `atomic_max`, avoids a
+  full-tensor staging scan, and makes `fp8_pack_tilelang` raise instead of
+  deriving a finite scale from poisoned input.
+- The real-MPS engine test covers finite parity and mixed finite/NaN input;
+  all 22 focused FP8 tests pass.
+
 ## Case-safe source artifact isolation (2026-08-01)
 
 - Mirrored injective case-insensitive filesystem keys for source work,

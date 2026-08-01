@@ -343,7 +343,8 @@ def make_fp8_amax_kernel(
 
     Inputs:
         ``X``: ``(N,)`` ``in_dtype`` (fp16 / bf16 / fp32).
-        ``Amax``: ``(1,)`` fp32, pre-zeroed.
+        ``Amax``: ``(2,)`` fp32, pre-zeroed. Slot 0 is the absolute maximum;
+        slot 1 is a NaN poison flag.
 
     The TileLang DSL surface used here is intentionally narrow so the same
     PrimFunc lowers to both CUDA and Metal:
@@ -392,11 +393,13 @@ def make_fp8_amax_kernel(
     @T.prim_func
     def fp8_amax_reduce(
         X: T.Tensor((N,), DTYPE),
-        Amax: T.Tensor((1,), "float32"),
+        Amax: T.Tensor((2,), "float32"),
     ):
         with T.Kernel(T.ceildiv(N, BLOCK), threads=threads) as bx:
             X_abs = T.alloc_fragment((BLOCK,), "float32")
+            X_nan = T.alloc_fragment((BLOCK,), "float32")
             local_amax = T.alloc_fragment((1,), "float32")
+            local_nan = T.alloc_fragment((1,), "float32")
 
             # Single-pass load + abs + cast to fp32. Loading directly from
             # global into the per-block fragment removes the prior
@@ -409,10 +412,21 @@ def make_fp8_amax_kernel(
                 gi = bx * BLOCK + i
                 if gi < N:
                     X_abs[i] = T.abs(T.cast(X[gi], "float32"))
+                    value_bits = T.reinterpret(
+                        T.cast(X[gi], "float32"), T.uint32
+                    )
+                    X_nan[i] = T.if_then_else(
+                        (value_bits & T.uint32(0x7FFFFFFF))
+                        > T.uint32(0x7F800000),
+                        T.cast(1, "float32"),
+                        T.cast(0, "float32"),
+                    )
                 else:
                     X_abs[i] = T.cast(0, "float32")
+                    X_nan[i] = T.cast(0, "float32")
 
             T.reduce_max(X_abs, local_amax, dim=0, clear=True)
+            T.reduce_max(X_nan, local_nan, dim=0, clear=True)
 
             # Single thread writes the block-local amax via atomic_max into
             # the global fp32 scalar. TileLang lowers this to atomicMax on
@@ -424,17 +438,17 @@ def make_fp8_amax_kernel(
             # fp32 has undefined behaviour on NaN inputs and the Metal CAS
             # loop spins forever (NaN != NaN, so compare_exchange never
             # succeeds). ``v == v`` is False iff v is NaN; substitute 0.0
-            # (amax identity) on NaN. Trade-off: a NaN-poisoned input now
-            # yields the finite max over the real data, so the wave-3
-            # ``FloatingPointError`` in ``fp8_pack_tilelang`` fires only for
-            # Inf inputs (Inf survives the filter: ``inf == inf``).
+            # (amax identity) on NaN. ``Amax[1]`` carries the separately
+            # bit-detected poison flag, so the host rejects NaN without ever
+            # passing NaN through atomic_max.
             if T.get_thread_binding(0) == 0:
                 amax_safe = T.if_then_else(
                     local_amax[0] == local_amax[0],
                     local_amax[0],
                     T.cast(0, "float32"),
                 )
-                T.atomic_max(Amax, amax_safe)
+                T.atomic_max(Amax[0], amax_safe)
+                T.atomic_max(Amax[1], local_nan[0])
 
     return fp8_amax_reduce
 
@@ -460,10 +474,8 @@ def _make_fp8_amax_partials_kernel(
 
     Inputs:
         ``X``: ``(N,)`` ``in_dtype``.
-        ``Partials``: ``(ceildiv(N, BLOCK),)`` fp32, one slot per block.
-
-    The NaN pre-filter mirrors the atomic kernel so partials never carry NaN
-    into the device-side reduce.
+        ``Partials``: ``(ceildiv(N, BLOCK), 2)`` fp32. Column 0 is the block
+        maximum; column 1 is the NaN poison flag.
     """
 
     if n_elements <= 0:
@@ -497,31 +509,42 @@ def _make_fp8_amax_partials_kernel(
     @T.prim_func
     def _fp8_amax_partials(
         X: T.Tensor((N,), DTYPE),
-        Partials: T.Tensor((NB,), "float32"),
+        Partials: T.Tensor((NB, 2), "float32"),
     ):
         with T.Kernel(NB, threads=threads) as bx:
             X_abs = T.alloc_fragment((BLOCK,), "float32")
+            X_nan = T.alloc_fragment((BLOCK,), "float32")
             local_amax = T.alloc_fragment((1,), "float32")
+            local_nan = T.alloc_fragment((1,), "float32")
 
             for i in T.Parallel(BLOCK):
                 gi = bx * BLOCK + i
                 if gi < N:
                     X_abs[i] = T.abs(T.cast(X[gi], "float32"))
+                    value_bits = T.reinterpret(
+                        T.cast(X[gi], "float32"), T.uint32
+                    )
+                    X_nan[i] = T.if_then_else(
+                        (value_bits & T.uint32(0x7FFFFFFF))
+                        > T.uint32(0x7F800000),
+                        T.cast(1, "float32"),
+                        T.cast(0, "float32"),
+                    )
                 else:
                     X_abs[i] = T.cast(0, "float32")
+                    X_nan[i] = T.cast(0, "float32")
 
             T.reduce_max(X_abs, local_amax, dim=0, clear=True)
+            T.reduce_max(X_nan, local_nan, dim=0, clear=True)
 
-            # No atomic hazard here (each block owns Partials[bx]) but keep
-            # the NaN -> 0.0 filter so a poisoned block cannot push NaN into
-            # the device-side reduce, matching the atomic kernel's semantics.
             if T.get_thread_binding(0) == 0:
                 amax_safe = T.if_then_else(
                     local_amax[0] == local_amax[0],
                     local_amax[0],
                     T.cast(0, "float32"),
                 )
-                Partials[bx] = amax_safe
+                Partials[bx, 0] = amax_safe
+                Partials[bx, 1] = local_nan[0]
 
     return _fp8_amax_partials
 
@@ -727,10 +750,10 @@ def _amax_kernel_for(bucket_n: int, in_dtype: str, target: str) -> Any:
                 _kernel: Any = partials_kernel, _n_blocks: int = n_blocks,
             ) -> None:
                 partials = torch.empty(
-                    _n_blocks, dtype=torch.float32, device=x.device
+                    (_n_blocks, 2), dtype=torch.float32, device=x.device
                 )
                 _kernel(x, partials)
-                amax.copy_(partials.amax())
+                amax.copy_(partials.amax(dim=0))
 
             return _metal_two_stage_amax
         prim = make_fp8_amax_kernel(
@@ -870,9 +893,9 @@ def fp8_amax_tilelang(x: torch.Tensor) -> torch.Tensor:
             flat = padded
         kernel = _amax_kernel_for(bucket_n, in_dtype, target)
 
-    amax = torch.zeros(1, dtype=torch.float32, device=flat.device)
-    kernel(flat, amax)
-    return amax
+    stats = torch.zeros(2, dtype=torch.float32, device=flat.device)
+    kernel(flat, stats)
+    return stats[:1].masked_fill(stats[1:2] > 0, float("nan"))
 
 
 def precompile_amax_kernel(
@@ -978,17 +1001,9 @@ def fp8_pack_tilelang(tensor: torch.Tensor, *, clamp: bool = False):
 
     amax_buf = fp8_amax_tilelang(tensor)
     amax_val = amax_buf.item()
-    # Inf survives the target-specific amax reduction and yields a non-finite
-    # ``amax_val``. Falling through to ``inv_scale = fp8_max / amax_val`` would
-    # produce zero and silently poison every output element, so fail loudly.
-    #
-    # Known baseline limitation: both the CUDA atomic path and the Metal
-    # partials path map a NaN block-local maximum to zero before the final
-    # reduction. That avoids undefined CUDA atomicMax behaviour and a Metal
-    # CAS/lowering hazard, but means this scalar check cannot reject NaN input.
-    # Fixing that without a full-size temporary scan requires a separately
-    # lowered device-side poison flag; the current TileLang Metal lowering does
-    # not preserve the attempted ``value == value`` NaN flag through reduction.
+    # NaN/Inf yield a non-finite ``amax_val``. Falling through to
+    # ``inv_scale = fp8_max / amax_val`` would silently poison every output
+    # element, so fail loudly.
     if not math.isfinite(amax_val):
         raise FloatingPointError(
             f"fp8_pack_tilelang: input contains non-finite values "

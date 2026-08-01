@@ -107,6 +107,7 @@ import torch
 from cppmega_mlx.nn._tilelang._engine_dispatch import tilelang_engine_mode
 from cppmega_mlx.nn._tilelang.fp8_amax import (
     fp8_amax_tilelang,
+    fp8_pack_tilelang,
     fp8_quantize_tilelang,
 )
 
@@ -119,6 +120,14 @@ torch.mps.synchronize()
 expected = cpu.to(torch.float8_e4m3fn)
 assert amax.item() == cpu.abs().amax().item()
 assert torch.equal(quantized.view(torch.uint8).cpu(), expected.view(torch.uint8))
+poisoned = x.clone()
+poisoned[17] = float("nan")
+try:
+    fp8_pack_tilelang(poisoned)
+except FloatingPointError:
+    pass
+else:
+    raise AssertionError("fp8_pack_tilelang silently accepted NaN input")
 print("fp8_mps_engine_ok")
 """,
         ],
