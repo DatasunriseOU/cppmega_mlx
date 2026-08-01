@@ -158,11 +158,11 @@ defined regions, except modals (centered, portal'd to body).
 | `DimEnvEditor` (sidebar host) | UX#2 | Shipped `7bc0b43` |
 | `TrainOpsTab` | UX#3 | Shipped `7bc0b43` |
 | `TopBar` (3 groups + Precision) | UX#7 | Shipped `5a4e314` |
-| `DraftTabsStrip` | U01 | V9 planned |
-| `CanvasToolbar` | U02 | V9 planned |
-| `EmptyState` | U06 | V9 planned |
-| `BrickChip` | U07 | V9 planned |
-| `KeyboardShortcutsOverlay` | U10 | V9 planned |
+| `DraftTabsStrip` | U01 | V9 in progress |
+| `CanvasToolbar` | U02 | V9 in progress |
+| `EmptyState` | U06 | deferred to V10 |
+| `BrickChip` | U07 | deferred to V10 |
+| `KeyboardShortcutsOverlay` | U10 | deferred to V10 |
 
 ## 9. Forbidden patterns
 

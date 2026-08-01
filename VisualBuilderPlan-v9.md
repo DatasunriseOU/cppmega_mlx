@@ -1,6 +1,11 @@
 # VisualBuilderPlan-v9 — UX Polish & Visual System Closure
 
-**Status**: planned 2026-05-24 (epic `cppmega-mlx-v9` — to be created)
+**Status**: narrowed & in progress 2026-08-01  
+**Decision**: U01 + U02 ship as the V9 scope; U03–U10 are deferred to V10
+because release blockers (P025–P040 data pipeline, P085–P096 hardware parity)
+are consuming all P1/P2 capacity. U01/U02 were chosen because they deliver the
+highest operator value per unit of work (discoverable drafts + persistent
+canvas splicing toolbar).
 
 **Driver**: post-V8 operator-feedback cycle. V8 closed the
 gallery→train round trip (R01-R12). V9 closes the *visual surface*
@@ -245,6 +250,32 @@ hinted in button titles.
 - `HexColorRatchet.test.ts` baseline drops from 592 to ≤ 150 by end
   of U03 (≥ 75% reduction).
 
+## 6.5 V9 scope decision (2026-08-01)
+
+After reviewing capacity against the August release blockers, the V9 epic is
+scoped down to the two highest-value P2 items:
+
+- **U01 — Draft tabs strip** (operator can switch between concurrent specs).
+- **U02 — Floating canvas toolbar** (Parallel / Insert / Transplant are
+  discoverable without opening a sidebar tab).
+
+The remaining U03–U10 work is valuable but not release-critical.  It is
+formally deferred to **V10** with the following rationale:
+
+| Deferred | Reason |
+|---|---|
+| U03 mass hex migration | Large surface-area refactor; blocked behind U04 token design anyway. |
+| U04 theme tokens v2 | Needs dedicated design slot after V9 surface stabilises. |
+| U05 sidebar tab strip | Usability win but current wrapping is functional. |
+| U06 empty states | Nice-to-have; can be added incrementally per tab. |
+| U07 BrickNode unity | Depends on U04 tokens. |
+| U08 responsive TopBar | Desktop viewport ≥ 1024 px is the current supported target. |
+| U09 help catalogue audit | Important, but help topics are not blocking training workflows. |
+| U10 keyboard shortcuts overlay | Only two shortcuts exist today; low ROI until more are bound. |
+
+The bd epic `cppmega-mlx-zozw` and the U03–U10 child tickets are updated to
+reflect this deferral.  U01/U02 tickets remain open and are the active V9 work.
+
 ## 7. Out of scope (V10+)
 
 - True theming (user-switchable light/dark/contrast).
@@ -255,14 +286,12 @@ hinted in button titles.
 
 ## 8. Done definition
 
-V9 is done when:
-- All 10 U-epics closed in bd (sub-tickets either closed or
-  deferred to V10 with explicit reason).
-- `npx vitest run` from `vbgui/`: 0 failures (counting only
-  V9-relevant test files; pre-existing HelpModal/Palette/Backward
+V9 (scoped to U01 + U02) is done when:
+- U01 and U02 epics closed in bd (sub-tickets closed).
+- U03–U10 tickets formally deferred to V10 with explicit reason.
+- `npx vitest run` from `vbgui/`: 0 failures in U01/U02 test files
+  (counting only V9-relevant test files; pre-existing HelpModal/Palette/Backward
   failures are tracked separately).
-- `HexColorRatchet` baseline ≤ 150.
 - `VisualBuilderPlan-v9.md` + `VisualBuilderSpec-v9.md` + `vbgui/STYLE.md`
-  shipped on `main`.
-- A 5-min screen-recording captures Draft tabs + Canvas toolbar +
-  empty states + `?` overlay (UAT footage).
+  shipped on `main` with the scope decision recorded.
+- UAT footage captures Draft tabs (U01) + Canvas toolbar (U02).
