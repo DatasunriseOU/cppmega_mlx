@@ -84,6 +84,23 @@ DOMAIN_SOURCE_TO_TARGET: dict[str, str] = {
     "embedding.cppmega_domain.up_proj.weight": "domain_embedding.up_proj.weight",
 }
 
+NGRAM_SOURCE_TO_TARGET: dict[str, str] = {
+    "embedding.cppmega_ngram_hash.table_offsets": "ngram_hash_embedding.table_offsets",
+    "embedding.cppmega_ngram_hash.table_sizes_t": "ngram_hash_embedding.table_sizes_t",
+    "embedding.cppmega_ngram_hash.hash_mults": "ngram_hash_embedding.hash_mults",
+    "embedding.cppmega_ngram_hash.hash_bias": "ngram_hash_embedding.hash_bias",
+    "embedding.cppmega_ngram_hash.order_for_table": "ngram_hash_embedding.order_for_table",
+    "embedding.cppmega_ngram_hash.order_mask": "ngram_hash_embedding.order_mask",
+    "embedding.cppmega_ngram_hash.unified_table.weight": "ngram_hash_embedding.unified_table.weight",
+    "embedding.cppmega_ngram_hash.out_proj.weight": "ngram_hash_embedding.out_proj.weight",
+}
+
+STRUCTURE_SOURCE_TO_TARGET: dict[str, str] = {
+    "embedding.cppmega_structure.component_scales": "structure_embedding.component_scales",
+    "embedding.cppmega_structure.stacked_emb.weight": "structure_embedding.stacked_emb.weight",
+    "embedding.cppmega_structure.up_proj.weight": "structure_embedding.up_proj.weight",
+}
+
 # Tensor-valued model entries omitted from conversion must be listed here with
 # a reason. The allowlist is intentionally empty for this narrow checkpoint
 # family: every model tensor is either mapped or conversion fails.
@@ -399,46 +416,13 @@ def build_key_plan(
     plan = [
         KeyPlan("embedding.word_embeddings.weight", "token_embedding.weight"),
         KeyPlan("embedding.word_embeddings.weight", "lm_head.weight"),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.table_offsets",
-            "ngram_hash_embedding.table_offsets",
+        *(
+            KeyPlan(source, target)
+            for source, target in NGRAM_SOURCE_TO_TARGET.items()
         ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.table_sizes_t",
-            "ngram_hash_embedding.table_sizes_t",
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.hash_mults", "ngram_hash_embedding.hash_mults"
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.hash_bias", "ngram_hash_embedding.hash_bias"
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.order_for_table",
-            "ngram_hash_embedding.order_for_table",
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.order_mask", "ngram_hash_embedding.order_mask"
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.unified_table.weight",
-            "ngram_hash_embedding.unified_table.weight",
-        ),
-        KeyPlan(
-            "embedding.cppmega_ngram_hash.out_proj.weight",
-            "ngram_hash_embedding.out_proj.weight",
-        ),
-        KeyPlan(
-            "embedding.cppmega_structure.component_scales",
-            "structure_embedding.component_scales",
-        ),
-        KeyPlan(
-            "embedding.cppmega_structure.stacked_emb.weight",
-            "structure_embedding.stacked_emb.weight",
-        ),
-        KeyPlan(
-            "embedding.cppmega_structure.up_proj.weight",
-            "structure_embedding.up_proj.weight",
+        *(
+            KeyPlan(source, target)
+            for source, target in STRUCTURE_SOURCE_TO_TARGET.items()
         ),
         KeyPlan("decoder.final_norm.weight", "norm.weight"),
     ]
@@ -901,8 +885,16 @@ def apply_mapping(
 def conversion_runtime_requirements(
     *,
     domain_tensors_present: bool,
+    source_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Runtime sidecar contract recorded beside converted weights."""
+
+    if source_keys is None:
+        ngram_present = True
+        structure_present = True
+    else:
+        ngram_present = set(NGRAM_SOURCE_TO_TARGET) <= set(source_keys)
+        structure_present = set(STRUCTURE_SOURCE_TO_TARGET) <= set(source_keys)
 
     return {
         "recipe": "stage1_graph_domain_v1",
@@ -927,6 +919,20 @@ def conversion_runtime_requirements(
             ]
             if domain_tensors_present
             else [],
+        },
+        "side_channels": {
+            "ngram_hash": {
+                "learned_tensors_present": bool(ngram_present),
+                "required": True,
+                "source_schema": "cppmega_ngram_hash_v1",
+                "target_tensors": sorted(NGRAM_SOURCE_TO_TARGET.values()),
+            },
+            "structure": {
+                "learned_tensors_present": bool(structure_present),
+                "required": True,
+                "source_schema": "cppmega_structure_v1",
+                "target_tensors": sorted(STRUCTURE_SOURCE_TO_TARGET.values()),
+            },
         },
         "packed_documents": {
             "document_ids_required_when_packed": True,
@@ -1438,7 +1444,8 @@ def convert_checkpoint(
         "dtype": "bfloat16" if bf16 else "float32",
         "validation": validation,
         "runtime_requirements": conversion_runtime_requirements(
-            domain_tensors_present=domain_tensors_present
+            domain_tensors_present=domain_tensors_present,
+            source_keys=set(source_specs),
         ),
         "notes": [
             "Megatron AF alternating layer positions are folded into DenseCppLM blocks",

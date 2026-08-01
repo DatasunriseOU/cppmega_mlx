@@ -639,6 +639,31 @@ def test_runtime_requirements_do_not_claim_domain_tensors_for_old_checkpoint() -
     assert enriched["domain_routes"]["required"] is True
     assert enriched["domain_routes"]["residual_scale"] == 1.0
 
+    # Side-channel tensors are required for this checkpoint family.
+    for family in ("ngram_hash", "structure"):
+        assert old["side_channels"][family]["learned_tensors_present"] is True
+        assert old["side_channels"][family]["required"] is True
+        assert old["side_channels"][family]["target_tensors"]
+        assert enriched["side_channels"][family]["learned_tensors_present"] is True
+
+
+def test_runtime_requirements_detect_missing_side_channel_tensors() -> None:
+    mod = _load_module()
+
+    # Only domain + ngram hash present: structure tensors missing.
+    source_keys = set(mod.DOMAIN_SOURCE_TO_TARGET) | set(mod.NGRAM_SOURCE_TO_TARGET)
+    req = mod.conversion_runtime_requirements(
+        domain_tensors_present=True, source_keys=source_keys
+    )
+    assert req["side_channels"]["ngram_hash"]["learned_tensors_present"] is True
+    assert req["side_channels"]["structure"]["learned_tensors_present"] is False
+    assert req["side_channels"]["ngram_hash"]["target_tensors"] == sorted(
+        mod.NGRAM_SOURCE_TO_TARGET.values()
+    )
+    assert req["side_channels"]["structure"]["target_tensors"] == sorted(
+        mod.STRUCTURE_SOURCE_TO_TARGET.values()
+    )
+
 
 def test_converter_writes_evaluator_metadata_as_model_json(tmp_path: Path) -> None:
     mod = _load_module()
