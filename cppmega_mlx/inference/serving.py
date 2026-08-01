@@ -729,6 +729,8 @@ def scatter_paged_kv_offsets(
     k: mx.array,
     v: mx.array,
     write_offsets: mx.array | Sequence[int],
+    *,
+    backend: Literal["mlx", "tilelang"] = "mlx",
 ) -> None:
     """Write new-token K/V into the paged pool at per-sequence absolute offsets.
 
@@ -746,6 +748,10 @@ def scatter_paged_kv_offsets(
         v: tensor of shape ``(batch, kv_heads, new_tokens, head_dim)``.
         write_offsets: int32 array or list of length ``batch`` with the
             per-sequence start positions of the new tokens.
+        backend: ``"mlx"`` (default) uses the correctness-first host loop;
+            ``"tilelang"`` dispatches the native TileLang Metal kernel and
+            fails closed when tilelang/Metal or the input dtypes are
+            unsupported.
     """
 
     if not isinstance(manager, PagedKVBlockManager):
@@ -802,6 +808,20 @@ def scatter_paged_kv_offsets(
             if block_idx in seen_blocks:
                 raise ValueError("block_table contains a duplicate physical block")
             seen_blocks.add(block_idx)
+
+    if backend == "tilelang":
+        from cppmega_mlx.nn._tilelang.paged_kv_tilelang import (
+            scatter_paged_kv_offsets_native,
+        )
+
+        scatter_paged_kv_offsets_native(
+            manager, block_table, layer_idx, k, v, offset_values
+        )
+        return
+    if backend != "mlx":
+        raise ValueError(
+            f"unknown backend {backend!r}; expected 'mlx' or 'tilelang'"
+        )
 
     # ponytail: correctness-first host loop; replace with a native paged
     # scatter kernel when decode throughput matters.

@@ -380,6 +380,98 @@ def test_scatter_paged_kv_offsets_preflights_live_prefix(table, match) -> None:
         )
 
 
+def test_scatter_paged_kv_offsets_tilelang_matches_mlx_backend() -> None:
+    from cppmega_mlx.nn._tilelang.paged_kv_tilelang import paged_kv_native_status
+
+    status = paged_kv_native_status()
+    if not status.available:
+        pytest.skip(f"native paged KV scatter unavailable: {status.reason}")
+
+    def run(backend: str) -> np.ndarray:
+        manager = _manager(num_blocks=4, block_size=4)
+        manager.allocate_sequence(seq_id=1, num_tokens=6)
+        manager.allocate_sequence(seq_id=2, num_tokens=7)
+        table = manager.block_table_for_sequences([1, 2], max_blocks_per_seq=2)
+        batch, kv_heads, head_dim = 2, manager.num_kv_heads, manager.head_dim
+        past = mx.arange(
+            batch * kv_heads * 4 * head_dim, dtype=mx.float32
+        ).reshape(batch, kv_heads, 4, head_dim)
+        scatter_paged_kv(
+            manager, table, layer_idx=0, k=past, v=past, seq_lengths=[4, 4]
+        )
+        new_tokens = mx.full((batch, kv_heads, 2, head_dim), 50.0)
+        new_tokens = new_tokens + mx.arange(batch)[:, None, None, None]
+        scatter_paged_kv_offsets(
+            manager,
+            table,
+            layer_idx=0,
+            k=new_tokens,
+            v=new_tokens,
+            write_offsets=[4, 5],
+            backend=backend,
+        )
+        k_out, _ = gather_paged_kv(
+            manager, table, layer_idx=0, seq_lengths=[6, 7]
+        )
+        return _as_numpy(k_out)
+
+    np.testing.assert_allclose(run("tilelang"), run("mlx"), atol=0, rtol=0)
+
+
+def test_scatter_paged_kv_offsets_tilelang_fails_closed_on_unsupported_dtype() -> None:
+    from cppmega_mlx.nn._tilelang.paged_kv_tilelang import (
+        PagedKvNativeUnavailable,
+        paged_kv_native_status,
+    )
+
+    status = paged_kv_native_status()
+    if not status.available:
+        pytest.skip(f"native paged KV scatter unavailable: {status.reason}")
+
+    manager = PagedKVBlockManager(
+        PagedKVBlockManagerConfig(
+            num_blocks=2,
+            block_size=4,
+            num_layers=1,
+            num_kv_heads=2,
+            head_dim=4,
+            dtype=mx.int32,
+        )
+    )
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+    k = mx.zeros((1, manager.num_kv_heads, 1, manager.head_dim), dtype=mx.int32)
+
+    with pytest.raises(PagedKvNativeUnavailable, match="unsupported pool dtype"):
+        scatter_paged_kv_offsets(
+            manager,
+            table,
+            layer_idx=0,
+            k=k,
+            v=k,
+            write_offsets=[0],
+            backend="tilelang",
+        )
+
+
+def test_scatter_paged_kv_offsets_rejects_unknown_backend() -> None:
+    manager = _manager(num_blocks=2, block_size=4)
+    manager.allocate_sequence(seq_id=1, num_tokens=8)
+    table = manager.block_table_for_sequences([1], max_blocks_per_seq=2)
+    k = mx.zeros((1, manager.num_kv_heads, 1, manager.head_dim))
+
+    with pytest.raises(ValueError, match="unknown backend"):
+        scatter_paged_kv_offsets(
+            manager,
+            table,
+            layer_idx=0,
+            k=k,
+            v=k,
+            write_offsets=[0],
+            backend="cuda",  # type: ignore[arg-type]
+        )
+
+
 def test_inference_root_exports_serving_primitives() -> None:
     assert inference.PagedKVBlockManager is PagedKVBlockManager
     assert inference.ContinuousBatchScheduler is ContinuousBatchScheduler

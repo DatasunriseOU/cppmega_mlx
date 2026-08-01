@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "report": "paged_kv_offsets_scatter_bench_2026_08_01",
+  "timestamp": "2026-08-01T21:47:34.675796+00:00",
+  "host": "local Metal (mlx 0.32.0, TileLang tvm_ffi native, kernels cached before timing)",
+  "workload": "decode-typical offsets scatter: B rows x 1 new token at offset 100, float32 pools (block_size=16, layers=1, kv_heads=8, head_dim=128)",
+  "geometries": [
+    {
+      "batch": 32,
+      "num_blocks": 512,
+      "pool_mb": 34,
+      "mlx_host_loop": {
+        "best_ms": 11.4,
+        "mean_ms": 30.1
+      },
+      "tilelang_native": {
+        "best_ms": 9.1,
+        "mean_ms": 14.9
+      },
+      "speedup_best": 1.25
+    },
+    {
+      "batch": 256,
+      "num_blocks": 2048,
+      "pool_mb": 134,
+      "mlx_host_loop": {
+        "best_ms": 117.5,
+        "mean_ms": 206.3
+      },
+      "tilelang_native": {
+        "best_ms": 89.5,
+        "mean_ms": 130.6
+      },
+      "speedup_best": 1.31
+    }
+  ],
+  "analysis": [
+    "MLX lazy evaluation fuses the host loop's B*S slice_updates into fewer GPU passes than the naive B*S pool copies, so the host loop is not as catastrophic as the op count suggests.",
+    "Native path is consistently faster (1.25-1.31x best, ~2x mean) and deterministic: exactly one pool copy + one scatter launch, independent of lazy-fusion behavior and Python loop overhead.",
+    "Dominant residual cost is the full-pool copy; removing it requires an in-place scatter ABI (out= aliasing input), which the tvm_ffi owner-output contract currently does not express."
+  ]
+}
