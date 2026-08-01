@@ -26,6 +26,7 @@ from cppmega_mlx.training.checkpoint import (
     RNG_MODE_SEED,
     RNG_MODE_SNAPSHOT,
     SHARD_INDEX_NAME,
+    SHARDING_MODE_SHARDED,
     SHARDING_MODE_SINGLE_FILE,
     WEIGHTS_NAME,
     load_checkpoint,
@@ -721,6 +722,186 @@ def test_checkpoint_rng_seed_and_single_file_sharding_metadata_roundtrip(tmp_pat
         "index": None,
         "source": "cppmega_mlx.training.checkpoint",
     }
+
+
+def test_checkpoint_sharded_save_and_load_roundtrip(tmp_path) -> None:
+    config = _tiny_config()
+    model = TinyLM(config)
+    checkpoint_path = tmp_path / "sharded"
+    saved = save_checkpoint(
+        model,
+        checkpoint_path,
+        max_file_size_gb=1e-6,  # force sharding for the tiny model
+    )
+
+    assert saved["sharding"]["mode"] == checkpoint_module.SHARDING_MODE_SHARDED
+    assert saved["sharding"]["num_shards"] >= 1
+    assert saved["sharding"]["index"] == SHARD_INDEX_NAME
+    assert all(
+        name.startswith("model-") and name.endswith(".safetensors")
+        for name in saved["sharding"]["weights"]
+    )
+    index = json.loads((checkpoint_path / SHARD_INDEX_NAME).read_text())
+    assert index["metadata"]["num_shards"] == saved["sharding"]["num_shards"]
+    assert set(index["weight_map"].keys()) == set(saved["tensors"])
+
+    loaded_model = TinyLM(config)
+    loaded = load_checkpoint(loaded_model, checkpoint_path)
+    assert loaded["sharding"] == saved["sharding"]
+    _assert_tree_allclose(loaded_model.parameters(), model.parameters())
+
+
+def test_checkpoint_sharded_removes_stale_single_file(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "mixed"
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    assert (checkpoint_path / WEIGHTS_NAME).exists()
+
+    save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        max_file_size_gb=1e-6,
+    )
+    assert not (checkpoint_path / WEIGHTS_NAME).exists()
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+
+def test_checkpoint_single_file_removes_stale_shards(tmp_path) -> None:
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "mixed"
+    save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        max_file_size_gb=1e-6,
+    )
+    shard_files = list(checkpoint_path.glob("model-*-of-*.safetensors"))
+    assert shard_files
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+    save_checkpoint(TinyLM(config), checkpoint_path)
+    assert (checkpoint_path / WEIGHTS_NAME).exists()
+    assert not list(checkpoint_path.glob("model-*-of-*.safetensors"))
+    assert not (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+
+def test_checkpoint_stale_shard_cleanup_deletes_index_last(tmp_path) -> None:
+    """A shard unlink failure must leave the index in place for a later pass."""
+    checkpoint_path = tmp_path / "cleanup-order"
+    checkpoint_path.mkdir()
+    index_path = checkpoint_path / SHARD_INDEX_NAME
+    index_path.write_text(json.dumps({"weight_map": {}}))
+    first_shard = checkpoint_path / "model-00001-of-00003.safetensors"
+    first_shard.write_bytes(b"stale")
+    blocking_dir = checkpoint_path / "model-00002-of-00003.safetensors"
+    blocking_dir.mkdir()
+    third_shard = checkpoint_path / "model-00003-of-00003.safetensors"
+    third_shard.write_bytes(b"stale")
+
+    with pytest.raises(OSError):
+        checkpoint_module._remove_stale_sharded_weights(checkpoint_path)
+
+    assert not first_shard.exists()
+    assert third_shard.exists()
+    assert index_path.exists()
+
+    blocking_dir.rmdir()
+    checkpoint_module._remove_stale_sharded_weights(checkpoint_path)
+    assert not third_shard.exists()
+    assert not index_path.exists()
+
+
+def test_checkpoint_stale_shard_cleanup_ignores_foreign_files(tmp_path) -> None:
+    """Cleanup without an index must not touch files we do not own."""
+    checkpoint_path = tmp_path / "cleanup-foreign"
+    checkpoint_path.mkdir()
+    foreign = checkpoint_path / "model-00001-of-00001.safetensors"
+    foreign.write_bytes(b"not ours")
+
+    checkpoint_module._remove_stale_sharded_weights(checkpoint_path)
+    assert foreign.exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "../escape.safetensors",
+        "/absolute/model-00001-of-00001.safetensors",
+        "subdir/model-00001-of-00001.safetensors",
+        "model-1-of-1.safetensors",
+        "evil.safetensors",
+        "model-00001-of-00001.safetensors/../../escape.safetensors",
+    ],
+)
+def test_checkpoint_sharded_load_rejects_unsafe_index_paths(tmp_path, unsafe_name) -> None:
+    """A crafted index must not redirect shard loads outside the checkpoint dir."""
+    config = _tiny_config()
+    checkpoint_path = tmp_path / "unsafe-index"
+    save_checkpoint(
+        TinyLM(config),
+        checkpoint_path,
+        max_file_size_gb=1e-6,
+    )
+    index_path = checkpoint_path / SHARD_INDEX_NAME
+    index = json.loads(index_path.read_text())
+    index["weight_map"] = {name: unsafe_name for name in index["weight_map"]}
+    index_path.write_text(json.dumps(index))
+
+    with pytest.raises(ValueError, match="unsafe shard filename"):
+        load_checkpoint(TinyLM(config), checkpoint_path)
+
+
+def test_checkpoint_failed_sharded_save_keeps_previous_single_checkpoint_loadable(
+    tmp_path, monkeypatch
+) -> None:
+    """Crash before the metadata write must leave the old single-file layout loadable."""
+    config = _tiny_config()
+    model = TinyLM(config)
+    checkpoint_path = tmp_path / "crash-single-to-sharded"
+    save_checkpoint(model, checkpoint_path)
+
+    def fail_once(payload, metadata_path):
+        raise RuntimeError("simulated crash before metadata write")
+
+    monkeypatch.setattr(
+        checkpoint_module, "_validate_checkpoint_metadata", fail_once
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_checkpoint(model, checkpoint_path, max_file_size_gb=1e-6)
+    monkeypatch.undo()
+
+    # The previous layout is fully intact and still described by the old metadata.
+    assert (checkpoint_path / WEIGHTS_NAME).exists()
+    loaded_model = TinyLM(config)
+    loaded = load_checkpoint(loaded_model, checkpoint_path)
+    assert loaded["sharding"]["mode"] == SHARDING_MODE_SINGLE_FILE
+    _assert_tree_allclose(loaded_model.parameters(), model.parameters())
+
+
+def test_checkpoint_failed_single_save_keeps_previous_sharded_checkpoint_loadable(
+    tmp_path, monkeypatch
+) -> None:
+    """Crash before the metadata write must leave the old sharded layout loadable."""
+    config = _tiny_config()
+    model = TinyLM(config)
+    checkpoint_path = tmp_path / "crash-sharded-to-single"
+    save_checkpoint(model, checkpoint_path, max_file_size_gb=1e-6)
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+
+    def fail_once(payload, metadata_path):
+        raise RuntimeError("simulated crash before metadata write")
+
+    monkeypatch.setattr(
+        checkpoint_module, "_validate_checkpoint_metadata", fail_once
+    )
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_checkpoint(model, checkpoint_path)
+    monkeypatch.undo()
+
+    assert (checkpoint_path / SHARD_INDEX_NAME).exists()
+    loaded_model = TinyLM(config)
+    loaded = load_checkpoint(loaded_model, checkpoint_path)
+    assert loaded["sharding"]["mode"] == SHARDING_MODE_SHARDED
+    _assert_tree_allclose(loaded_model.parameters(), model.parameters())
 
 
 def test_checkpoint_explicit_not_saved_rng_mode_overrides_default_snapshot(tmp_path) -> None:
