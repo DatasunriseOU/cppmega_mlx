@@ -29,33 +29,45 @@ from cppmega_mlx.recipes.pattern import (
 )
 
 
-def _cppmega_source_layout():
+def _import_cppmega_module(module_name: str):
+    """Import a cppmega module from the sibling checkout without leaking its path."""
     reference_root = Path(__file__).resolve().parents[2] / "cppmega"
     if not reference_root.exists():
         pytest.skip("../cppmega reference checkout is not present")
-    if str(reference_root) not in sys.path:
-        sys.path.insert(0, str(reference_root))
-    module = pytest.importorskip("cppmega.megatron.nam56r_layout")
-    # Use dynamic import so local pyright does not require the sibling checkout.
-    module = import_module(module.__name__)
+    root_str = str(reference_root)
+    was_in_path = root_str in sys.path
+    if not was_in_path:
+        sys.path.insert(0, root_str)
+    try:
+        module = pytest.importorskip(module_name)
+        # Use dynamic import so local pyright does not require the sibling checkout.
+        module = import_module(module.__name__)
+    finally:
+        if not was_in_path:
+            sys.path.remove(root_str)
     module_file = module.__file__
     assert module_file is not None
     assert Path(module_file).resolve().is_relative_to(reference_root.resolve())
+    return module
+
+
+def _cppmega_source_layout():
+    module = _import_cppmega_module("cppmega.megatron.nam56r_layout")
     return module.load_attention_layer_numbers, module.load_dsa_a_layer_ranks
 
 
 def _cppmega_source_parse_nem_pattern():
-    reference_root = Path(__file__).resolve().parents[2] / "cppmega"
-    if not reference_root.exists():
-        pytest.skip("../cppmega reference checkout is not present")
-    if str(reference_root) not in sys.path:
-        sys.path.insert(0, str(reference_root))
-    module = pytest.importorskip("cppmega.recipes.nam56r_megatron")
-    module = import_module(module.__name__)
-    module_file = module.__file__
-    assert module_file is not None
-    assert Path(module_file).resolve().is_relative_to(reference_root.resolve())
+    module = _import_cppmega_module("cppmega.recipes.nam56r_megatron")
     return module.parse_nem_pattern
+
+
+def test_cppmega_reference_import_preserves_sys_path():
+    reference_root = str(Path(__file__).resolve().parents[2] / "cppmega")
+    was_in_path = reference_root in sys.path
+
+    _import_cppmega_module("cppmega.megatron.nam56r_layout")
+
+    assert (reference_root in sys.path) is was_in_path
 
 
 def test_expand_symbols_tiles_pattern_to_depth_with_one_based_layers():
