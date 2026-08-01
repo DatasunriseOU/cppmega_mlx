@@ -29,17 +29,25 @@ CREATE TABLE symbols (
     token_est    INTEGER NOT NULL,
     body_len     INTEGER NOT NULL,
     text         TEXT NOT NULL,
+    symbol_key   TEXT NOT NULL,
+    symbol_id    TEXT NOT NULL,
     PRIMARY KEY (qname, sym_type)
 );
 """
 
 
 def _make_symbol_index(path: Path, body: str) -> None:
+    from cppmega_mlx.data.symbol_identity import compute_symbol_id
+
+    symbol_key = (
+        "repo_file_location:project=boost;file=boost/base.hpp;"
+        "line=10;column=0;kind=func;qname=boost::base_fn"
+    )
     conn = sqlite3.connect(path)
     try:
         conn.executescript(SYMBOL_SCHEMA)
         conn.execute(
-            "INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "boost::base_fn",
                 "boost",
@@ -53,6 +61,8 @@ def _make_symbol_index(path: Path, body: str) -> None:
                 len(body) // 4,
                 len(body),
                 body,
+                symbol_key,
+                f"{compute_symbol_id(symbol_key):016x}",
             ),
         )
         conn.commit()
@@ -101,6 +111,18 @@ int base_fn(int x) {
     )
     assert len(docs) == 3
     assert stats["docs_emitted"] == 3
+    assert all(doc["symbol_identity_schema_version"] == 3 for doc in docs)
+    assert all(len(doc["symbol_identities"]) == 1 for doc in docs)
+    assert all(
+        doc["chunk_boundaries"][0]["symbol_id"]
+        == doc["symbol_identities"][0]["symbol_id"]
+        for doc in docs
+    )
+    assert all(
+        doc["symbol_ids"]
+        == [doc["symbol_identities"][0]["symbol_id"]] * len(doc["text"])
+        for doc in docs
+    )
 
     docs_again, stats_again = build_repeat_docs(
         symbols,
