@@ -284,7 +284,7 @@ def test_path_c_extra_binds_exact_tilelang_stack_and_compatible_z3() -> None:
     assert "cython>=3.0,<4" in path_c
     assert (
         "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git"
-        "@334266afd448ae06e7893119a0ebb72d7fe1e776 ; "
+        "@6c338795c92d26eb931e3a626911093f22c0fd49 ; "
         f"{marker}"
     ) in path_c
     assert (
