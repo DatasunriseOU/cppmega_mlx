@@ -312,6 +312,11 @@ def test_checked_out_tokenizer_artifacts_match_imported_domain_contract() -> Non
 
 
 def test_cppmega_tokenizer_v2_matches_vendored_artifact_when_available() -> None:
+    # Sync procedure: cppmega/data/tokenizer_v2/tokenizer.json is the canonical
+    # artifact (its SHA-256 is the one recorded in sealed megatron_ready bundle
+    # manifests). The vendored cppmega_mlx/tokenizer/tokenizer.json must be a
+    # byte-identical copy of it; on drift, re-copy the canonical file into this
+    # repo instead of editing the vendored copy.
     tokenizer_path = _CPP_TOKENIZER_V2_DIR / "tokenizer.json"
     if not tokenizer_path.is_file():
         pytest.skip(f"{tokenizer_path} is not available")
