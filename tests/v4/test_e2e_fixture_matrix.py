@@ -21,7 +21,6 @@ from tests.fixtures.build_e2e_matrix import (
     TOKENIZERS_DIR,
     TOKENIZER_SPECS,
     INDEX_PATH,
-    generate_parquets,
     generate_tokenizers,
     validate_round_trip,
 )
@@ -30,13 +29,6 @@ from tests.fixtures.build_e2e_matrix import (
 REQUIRED_TOKENIZERS = {"T1_cppmega_v3", "T2_gpt2_small",
                        "T3_minimal_no_fim", "T4_fim_only"}
 REQUIRED_SCHEMAS = set(PARQUET_SCHEMAS)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def ensure_fixtures_present():
-    """Generate once per module so each test runs against fresh artefacts."""
-    generate_tokenizers()
-    generate_parquets()
 
 
 # ---------------------------------------------------------------------------
