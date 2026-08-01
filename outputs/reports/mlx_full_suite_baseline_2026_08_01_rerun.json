@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "report": "mlx_full_suite_baseline_2026_08_01_rerun",
+  "repo": "cppmega.mlx",
+  "commit": "0ebf49a10b028ba37c4339f9a491057280eaca57",
+  "tree": "deb221aff245de651ad1adf9b52d3b486fa82c0d",
+  "timestamp": "2026-08-01T19:12:42.336953+00:00",
+  "interpreter": "/Volumes/external/sources/.venvs/cppmega.mlx/bin/python",
+  "platform": "darwin",
+  "summary": {
+    "passed": 7860,
+    "failed": 0,
+    "skipped": 70,
+    "xfailed": 2,
+    "duration_seconds": 1790.17
+  },
+  "source_artifacts": {
+    "log": {
+      "sha256": "d816b89193337e7d988cd3e73bf964ec8d62bd5afa895d0b1803a7a0081c36d3",
+      "size_bytes": 17943,
+      "retained": false
+    },
+    "junitxml": {
+      "sha256": "14cac935115aa0b1425b3bb74bfb625cb99e99ff86b05c4d297b22d8938a25f3",
+      "size_bytes": 1084447,
+      "retained": false
+    }
+  },
+  "command": "cd /Volumes/external/sources/cppmega.mlx && .venv/bin/python -m pytest tests/ -q --durations=50 --junitxml=outputs/evals/mlx_full_suite_baseline_2026_08_01_rerun.xml",
+  "note": "Compact durable receipt; reconstructible raw log and JUnit XML were removed after hashing."
+}

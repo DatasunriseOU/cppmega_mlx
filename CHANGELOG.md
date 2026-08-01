@@ -2,6 +2,14 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## Full local suite baseline (2026-08-01)
+
+- Exact tree `deb221aff245de651ad1adf9b52d3b486fa82c0d` completed with
+  7,860 passed, 70 skipped, 2 xfailed, and 0 failed in 1,790.17 seconds.
+- The compact versioned receipt preserves the exact command and hashes of the
+  removed reconstructible log/JUnit files at
+  `outputs/reports/mlx_full_suite_baseline_2026_08_01_rerun.json`.
+
 ## FP8 NaN fail-fast (2026-08-01)
 
 - TileLang CUDA and Metal amax kernels now emit a per-block NaN poison flag
