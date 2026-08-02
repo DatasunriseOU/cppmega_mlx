@@ -2,6 +2,13 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## Rerun-safe E2E matrix reports (2026-08-02)
+
+- Matrix aggregation now reads only the artifacts named by
+  `--require-artifact`, so an earlier attempt's `e2e_matrix_report` output
+  cannot be mistaken for a Playwright input during a failed-job rerun.
+- Unrequested screenshot trees are excluded from the same report boundary.
+
 ## Full local suite baseline (2026-08-01)
 
 - Exact tree `deb221aff245de651ad1adf9b52d3b486fa82c0d` completed with

@@ -159,6 +159,10 @@ def _artifact_summary(
         raise ReportInputError(
             f"{artifacts}: required artifacts are missing: {missing_artifacts}"
         )
+    if required_artifacts:
+        artifact_dirs = [
+            path for path in artifact_dirs if path.name in required_artifacts
+        ]
 
     rows: list[dict[str, Any]] = []
     for shard_dir in artifact_dirs:
@@ -210,9 +214,18 @@ def _format_table(rows: list[dict[str, Any]]) -> str:
     return header + sep + body
 
 
-def _screenshot_buckets(artifacts: Path) -> Counter:
+def _screenshot_buckets(
+    artifacts: Path,
+    *,
+    required_artifacts: set[str] | None = None,
+) -> Counter:
     counts: Counter[str] = Counter()
-    for png in artifacts.rglob("*.png"):
+    roots = (
+        [artifacts / name for name in sorted(required_artifacts)]
+        if required_artifacts
+        else [artifacts]
+    )
+    for png in (png for root in roots for png in root.rglob("*.png")):
         rel = png.relative_to(artifacts)
         # Bucket is the first dir under the shard's screenshots/ tree.
         parts = rel.parts
@@ -267,7 +280,10 @@ def _build_report(
         "## Screenshot buckets",
         "",
     ]
-    buckets = _screenshot_buckets(artifacts)
+    buckets = _screenshot_buckets(
+        artifacts,
+        required_artifacts=required_artifacts,
+    )
     if buckets:
         for name, n in sorted(buckets.items()):
             out.append(f"- `{name}` — {n} files")

@@ -199,6 +199,42 @@ def test_report_fails_closed_when_required_artifact_was_not_downloaded(
     assert "specialised-results" in text
 
 
+def test_report_ignores_unrequested_rerun_artifacts(tmp_path: Path):
+    artifacts = tmp_path / "artifacts"
+    _write_playwright_results(
+        artifacts / "custom-results",
+        expected=1,
+    )
+    stale_report = artifacts / "e2e_matrix_report"
+    stale_report.mkdir(parents=True)
+    (stale_report / "e2e_matrix_report.md").write_text("old attempt")
+    stale_screenshots = stale_report / "screenshots" / "old-attempt"
+    stale_screenshots.mkdir(parents=True)
+    (stale_screenshots / "stale.png").write_bytes(b"\x89PNG")
+
+    out = tmp_path / "report.md"
+    rc = subprocess.run(
+        [
+            sys.executable,
+            str(REPORT_SCRIPT),
+            "--artifacts",
+            str(artifacts),
+            "--output",
+            str(out),
+            "--require-artifact",
+            "custom-results",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode
+
+    assert rc == 0
+    text = out.read_text()
+    assert "Playwright result files parsed: **1**" in text
+    assert "old-attempt" not in text
+
+
 def test_report_aggregates_playwright_json(tmp_path: Path):
     artifacts = tmp_path / "artifacts"
     artifact = artifacts / "custom-results"
