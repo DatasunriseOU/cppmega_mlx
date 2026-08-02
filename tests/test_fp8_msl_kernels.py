@@ -21,14 +21,13 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
-
-import numpy as np
-import pytest
+from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
+import pytest
 
 from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
     FP8MSLKernelStatus,
@@ -64,6 +63,34 @@ def test_fp8_msl_license_notice_present() -> None:
     assert "MIT" in __license_notice__
     assert "AppMana" in __license_notice__
     assert "audiohacking" in __license_notice__
+
+
+def test_fp8_amax_portable_import_does_not_load_mlx() -> None:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+
+from cppmega_mlx.nn._tilelang.fp8_amax import fp8_amax_path_c_status
+
+assert callable(fp8_amax_path_c_status)
+assert "mlx" not in sys.modules
+assert not any(name.startswith("mlx.") for name in sys.modules)
+assert "cppmega_mlx.nn.engram" not in sys.modules
+assert "cppmega_mlx.nn._tilelang.mamba3" not in sys.modules
+print("fp8_amax_portable_import_ok")
+""",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    assert "fp8_amax_portable_import_ok" in probe.stdout
 
 
 def test_fp8_msl_source_no_longer_constructs_direct_msl() -> None:
@@ -469,9 +496,7 @@ def test_fp8_scaled_matmul_vjp_matches_dequant_oracle() -> None:
     mx.eval(*kernel_vjps, *oracle_vjps)
 
     for kg, og in zip(kernel_vjps, oracle_vjps):
-        np.testing.assert_allclose(
-            np.asarray(kg), np.asarray(og), rtol=1e-5, atol=1e-5
-        )
+        np.testing.assert_allclose(np.asarray(kg), np.asarray(og), rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

@@ -60,158 +60,173 @@ Public Path C surface — what is *exported here* vs what only lives in submodul
   proof/override surface reached via the submodule import.
 """
 
-from cppmega_mlx.nn._tilelang import (
-    _engine_dispatch,
-    _mamba3_helpers,
-    _mamba3_helpers_tilelang,
-    _msl_transform,
-    _path_b_lowering,
-    fp8_msl_kernels,
-    m2rnn,
-    mamba3,
-    sparse_mla,
-    sparse_mla_blockscaled,
-    sparse_mla_fp8,
-    topk_selector,
-)
-from cppmega_mlx.nn._tilelang._engine_dispatch import (
-    dispatch_lower,
-    tilelang_engine_mode,
-)
-from cppmega_mlx.nn._tilelang._mamba3_helpers import (
-    bwd_dadt_fused,
-    bwd_dtrap_ddt,
-    compute_dacs_segsum,
-)
-from cppmega_mlx.nn._tilelang._path_b_lowering import (
-    TransformedKernel,
-    build_mlx_body,
-    transform_tilelang_kernel,
-)
-from cppmega_mlx.nn._tilelang.fp8_msl_kernels import (
-    FP8MSLKernelStatus,
-    fp8_msl_status,
-    fp8_scaled_matmul,
-    fp8_scaled_matmul_raw,
-    fp8_scaled_vecmat,
-    fp8_to_half,
-    half_to_fp8,
-)
-from cppmega_mlx.nn._tilelang.m2rnn import (
-    M2RNNMetalStatus,
-    m2rnn_apply,
-    m2rnn_apply_with_state,
-    m2rnn_bwd_metal,
-    m2rnn_fwd_metal,
-    m2rnn_metal_status,
-    m2rnn_reference,
-)
-from cppmega_mlx.nn._tilelang.mamba3 import (
-    Mamba3MetalStatus,
-    mamba3_mimo_apply,
-    mamba3_mimo_bwd_metal,
-    mamba3_mimo_fwd_metal,
-    mamba3_mimo_metal_status,
-    mamba3_mimo_reference,
-)
-from cppmega_mlx.nn._tilelang.sparse_mla import (
-    SparseMLAMetalStatus,
-    sparse_mla_apply,
-    sparse_mla_bwd_metal,
-    sparse_mla_fwd_metal,
-    sparse_mla_metal_status,
-)
-from cppmega_mlx.nn._tilelang.sparse_mla_path_c import (
-    SparseMLAPathCStatus,
-    dump_lowered_bwd_msl,
-    dump_lowered_fwd_msl,
-    sparse_mla_bwd_path_c,
-    sparse_mla_fwd_path_c,
-    sparse_mla_path_c_status,
-)
-from cppmega_mlx.nn._tilelang.sparse_mla_blockscaled import (
-    MXFP8_BLOCK_SIZE,
-    SparseMLABlockScaledMetalStatus,
-    sparse_mla_blockscaled_apply,
-    sparse_mla_blockscaled_bwd_metal,
-    sparse_mla_blockscaled_fwd_metal,
-    sparse_mla_blockscaled_metal_status,
-    sparse_mla_blockscaled_reference,
-)
-from cppmega_mlx.nn._tilelang.sparse_mla_fp8 import (
-    SparseMLAFp8MetalStatus,
-    sparse_mla_fp8_apply,
-    sparse_mla_fp8_bwd_metal,
-    sparse_mla_fp8_fwd_metal,
-    sparse_mla_fp8_metal_status,
-    sparse_mla_fp8_reference,
-    sparse_mla_quantized_matmul_reference,
-)
-from cppmega_mlx.nn._tilelang.topk_selector import (
-    PathBStatus,
-    topk_selector_path_b_status,
-    topk_selector_reference,
-)
-from cppmega_mlx.nn._tilelang.topk_selector import topk_selector as topk_selector_fn
+from __future__ import annotations
 
-# Experimental status/lowering helpers — re-exported via _experimental for organization.
-from cppmega_mlx.nn._tilelang._experimental import (
-    E8M0_BLOCK_SIZE,
-    E8M0_LAYOUT,
-    E8M0_SCALE_FORMAT,
-    FP8VecmatPathCStatus,
-    SparseMLABlockScaledPathCStatus,
-    SparseMLABlockScaledQKReducePathCStatus,
-    blockscaled_sparse_mla_qk_msl_features,
-    blockscaled_sparse_mla_qk_path_c_status,
-    blockscaled_sparse_mla_qk_reduce_msl_features,
-    blockscaled_sparse_mla_qk_reduce_path_c,
-    blockscaled_sparse_mla_qk_reduce_path_c_status,
-    blockscaled_sparse_mla_qk_scaled_matmul_probe_status,
-    fp8_vecmat_msl_features,
-    fp8_vecmat_path_c_status,
-    lower_blockscaled_sparse_mla_qk_msl,
-    lower_blockscaled_sparse_mla_qk_reduce_msl,
-    lower_fp8_vecmat_msl,
-    make_blockscaled_sparse_mla_qk_kernel,
-    make_blockscaled_sparse_mla_qk_reduce_kernel,
-    make_fp8_vecmat_reduce_kernel,
-)
+from importlib import import_module
+from typing import Any
+
+_SUBMODULE_EXPORTS = {
+    "_engine_dispatch": "cppmega_mlx.nn._tilelang._engine_dispatch",
+    "_mamba3_helpers": "cppmega_mlx.nn._tilelang._mamba3_helpers",
+    "_mamba3_helpers_tilelang": "cppmega_mlx.nn._tilelang._mamba3_helpers_tilelang",
+    "_msl_transform": "cppmega_mlx.nn._tilelang._msl_transform",
+    "_path_b_lowering": "cppmega_mlx.nn._tilelang._path_b_lowering",
+    "fp8_msl_kernels": "cppmega_mlx.nn._tilelang.fp8_msl_kernels",
+    "m2rnn": "cppmega_mlx.nn._tilelang.m2rnn",
+    "mamba3": "cppmega_mlx.nn._tilelang.mamba3",
+    "sparse_mla": "cppmega_mlx.nn._tilelang.sparse_mla",
+    "sparse_mla_blockscaled": "cppmega_mlx.nn._tilelang.sparse_mla_blockscaled",
+    "sparse_mla_fp8": "cppmega_mlx.nn._tilelang.sparse_mla_fp8",
+    "topk_selector": "cppmega_mlx.nn._tilelang.topk_selector",
+}
+
+_EXPORT_GROUPS = {
+    "cppmega_mlx.nn._tilelang._engine_dispatch": (
+        "dispatch_lower",
+        "tilelang_engine_mode",
+    ),
+    "cppmega_mlx.nn._tilelang._mamba3_helpers": (
+        "bwd_dadt_fused",
+        "bwd_dtrap_ddt",
+        "compute_dacs_segsum",
+    ),
+    "cppmega_mlx.nn._tilelang._path_b_lowering": (
+        "TransformedKernel",
+        "build_mlx_body",
+        "transform_tilelang_kernel",
+    ),
+    "cppmega_mlx.nn._tilelang.fp8_msl_kernels": (
+        "FP8MSLKernelStatus",
+        "fp8_msl_status",
+        "fp8_scaled_matmul",
+        "fp8_scaled_matmul_raw",
+        "fp8_scaled_vecmat",
+        "fp8_to_half",
+        "half_to_fp8",
+    ),
+    "cppmega_mlx.nn._tilelang.m2rnn": (
+        "M2RNNMetalStatus",
+        "m2rnn_apply",
+        "m2rnn_apply_with_state",
+        "m2rnn_bwd_metal",
+        "m2rnn_fwd_metal",
+        "m2rnn_metal_status",
+        "m2rnn_reference",
+    ),
+    "cppmega_mlx.nn._tilelang.mamba3": (
+        "Mamba3MetalStatus",
+        "mamba3_mimo_apply",
+        "mamba3_mimo_bwd_metal",
+        "mamba3_mimo_fwd_metal",
+        "mamba3_mimo_metal_status",
+        "mamba3_mimo_reference",
+    ),
+    "cppmega_mlx.nn._tilelang.sparse_mla": (
+        "SparseMLAMetalStatus",
+        "sparse_mla_apply",
+        "sparse_mla_bwd_metal",
+        "sparse_mla_fwd_metal",
+        "sparse_mla_metal_status",
+    ),
+    "cppmega_mlx.nn._tilelang.sparse_mla_path_c": (
+        "SparseMLAPathCStatus",
+        "dump_lowered_bwd_msl",
+        "dump_lowered_fwd_msl",
+        "sparse_mla_bwd_path_c",
+        "sparse_mla_fwd_path_c",
+        "sparse_mla_path_c_status",
+    ),
+    "cppmega_mlx.nn._tilelang.sparse_mla_blockscaled": (
+        "MXFP8_BLOCK_SIZE",
+        "SparseMLABlockScaledMetalStatus",
+        "sparse_mla_blockscaled_apply",
+        "sparse_mla_blockscaled_bwd_metal",
+        "sparse_mla_blockscaled_fwd_metal",
+        "sparse_mla_blockscaled_metal_status",
+        "sparse_mla_blockscaled_reference",
+    ),
+    "cppmega_mlx.nn._tilelang.sparse_mla_fp8": (
+        "SparseMLAFp8MetalStatus",
+        "sparse_mla_fp8_apply",
+        "sparse_mla_fp8_bwd_metal",
+        "sparse_mla_fp8_fwd_metal",
+        "sparse_mla_fp8_metal_status",
+        "sparse_mla_fp8_reference",
+        "sparse_mla_quantized_matmul_reference",
+    ),
+    "cppmega_mlx.nn._tilelang.topk_selector": (
+        "PathBStatus",
+        "topk_selector_path_b_status",
+        "topk_selector_reference",
+    ),
+    "cppmega_mlx.nn._tilelang._experimental": (
+        "E8M0_BLOCK_SIZE",
+        "E8M0_LAYOUT",
+        "E8M0_SCALE_FORMAT",
+        "FP8VecmatPathCStatus",
+        "SparseMLABlockScaledPathCStatus",
+        "SparseMLABlockScaledQKReducePathCStatus",
+        "blockscaled_sparse_mla_qk_msl_features",
+        "blockscaled_sparse_mla_qk_path_c_status",
+        "blockscaled_sparse_mla_qk_reduce_msl_features",
+        "blockscaled_sparse_mla_qk_reduce_path_c",
+        "blockscaled_sparse_mla_qk_reduce_path_c_status",
+        "blockscaled_sparse_mla_qk_scaled_matmul_probe_status",
+        "fp8_vecmat_msl_features",
+        "fp8_vecmat_path_c_status",
+        "lower_blockscaled_sparse_mla_qk_msl",
+        "lower_blockscaled_sparse_mla_qk_reduce_msl",
+        "lower_fp8_vecmat_msl",
+        "make_blockscaled_sparse_mla_qk_kernel",
+        "make_blockscaled_sparse_mla_qk_reduce_kernel",
+        "make_fp8_vecmat_reduce_kernel",
+    ),
+}
+_EXPORT_MODULES = {
+    name: module_name for module_name, names in _EXPORT_GROUPS.items() for name in names
+}
+_ALIASED_EXPORTS = {
+    "topk_selector_fn": (
+        "cppmega_mlx.nn._tilelang.topk_selector",
+        "topk_selector",
+    ),
+}
 
 __all__ = [
-    "dispatch_lower",
-    "tilelang_engine_mode",
-    "_engine_dispatch",
-    "FP8MSLKernelStatus",
-    "FP8VecmatPathCStatus",
     "E8M0_BLOCK_SIZE",
     "E8M0_LAYOUT",
     "E8M0_SCALE_FORMAT",
+    "MXFP8_BLOCK_SIZE",
+    "FP8MSLKernelStatus",
+    "FP8VecmatPathCStatus",
     "M2RNNMetalStatus",
     "Mamba3MetalStatus",
-    "MXFP8_BLOCK_SIZE",
     "PathBStatus",
     "SparseMLABlockScaledMetalStatus",
-    "SparseMLABlockScaledQKReducePathCStatus",
     "SparseMLABlockScaledPathCStatus",
+    "SparseMLABlockScaledQKReducePathCStatus",
     "SparseMLAFp8MetalStatus",
     "SparseMLAMetalStatus",
     "SparseMLAPathCStatus",
     "TransformedKernel",
+    "_engine_dispatch",
     "_mamba3_helpers",
     "_mamba3_helpers_tilelang",
     "_msl_transform",
     "_path_b_lowering",
-    "build_mlx_body",
-    "bwd_dadt_fused",
-    "bwd_dtrap_ddt",
     "blockscaled_sparse_mla_qk_msl_features",
     "blockscaled_sparse_mla_qk_path_c_status",
     "blockscaled_sparse_mla_qk_reduce_msl_features",
     "blockscaled_sparse_mla_qk_reduce_path_c",
     "blockscaled_sparse_mla_qk_reduce_path_c_status",
     "blockscaled_sparse_mla_qk_scaled_matmul_probe_status",
+    "build_mlx_body",
+    "bwd_dadt_fused",
+    "bwd_dtrap_ddt",
     "compute_dacs_segsum",
+    "dispatch_lower",
+    "dump_lowered_bwd_msl",
+    "dump_lowered_fwd_msl",
     "fp8_msl_kernels",
     "fp8_msl_status",
     "fp8_scaled_matmul",
@@ -221,12 +236,9 @@ __all__ = [
     "fp8_vecmat_msl_features",
     "fp8_vecmat_path_c_status",
     "half_to_fp8",
-    "lower_fp8_vecmat_msl",
     "lower_blockscaled_sparse_mla_qk_msl",
     "lower_blockscaled_sparse_mla_qk_reduce_msl",
-    "make_blockscaled_sparse_mla_qk_reduce_kernel",
-    "make_blockscaled_sparse_mla_qk_kernel",
-    "make_fp8_vecmat_reduce_kernel",
+    "lower_fp8_vecmat_msl",
     "m2rnn",
     "m2rnn_apply",
     "m2rnn_apply_with_state",
@@ -234,6 +246,9 @@ __all__ = [
     "m2rnn_fwd_metal",
     "m2rnn_metal_status",
     "m2rnn_reference",
+    "make_blockscaled_sparse_mla_qk_kernel",
+    "make_blockscaled_sparse_mla_qk_reduce_kernel",
+    "make_fp8_vecmat_reduce_kernel",
     "mamba3",
     "mamba3_mimo_apply",
     "mamba3_mimo_bwd_metal",
@@ -250,8 +265,6 @@ __all__ = [
     "sparse_mla_blockscaled_reference",
     "sparse_mla_bwd_metal",
     "sparse_mla_bwd_path_c",
-    "dump_lowered_bwd_msl",
-    "dump_lowered_fwd_msl",
     "sparse_mla_fp8",
     "sparse_mla_fp8_apply",
     "sparse_mla_fp8_bwd_metal",
@@ -263,9 +276,32 @@ __all__ = [
     "sparse_mla_metal_status",
     "sparse_mla_path_c_status",
     "sparse_mla_quantized_matmul_reference",
+    "tilelang_engine_mode",
     "topk_selector",
     "topk_selector_fn",
     "topk_selector_path_b_status",
     "topk_selector_reference",
     "transform_tilelang_kernel",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _SUBMODULE_EXPORTS.get(name)
+    if module_name is not None:
+        value = import_module(module_name)
+    else:
+        alias = _ALIASED_EXPORTS.get(name)
+        if alias is not None:
+            module_name, attribute_name = alias
+        else:
+            module_name = _EXPORT_MODULES.get(name)
+            attribute_name = name
+        if module_name is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
