@@ -7,6 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from cppmega_mlx.data.batch import LMTokenBatch
 from cppmega_mlx.data.code_packet import CodePacket
 from cppmega_mlx.data.domain_packet import DomainEdgeIndex
 from cppmega_mlx.data.graph_packet import EdgeIndex
@@ -41,6 +42,15 @@ def _aligned_packet(*, document_ids: mx.array | None) -> CodePacket:
         chunk_kinds=_array([1, 1]),
         chunk_dep_levels=_array([0, 0]),
     )
+
+
+def test_lm_token_batch_rejects_noncontiguous_document_runs() -> None:
+    with pytest.raises(ValueError, match="reused non-contiguously"):
+        LMTokenBatch(
+            tokens=mx.array([[10, 11, 12, 13]]),
+            document_ids=mx.array([[1, 2, 1, 1]]),
+            loss_mask=mx.array([[0, 0, 1, 1]]),
+        )
 
 
 def test_objective_batch_preserves_document_ids_and_masks_boundary_target() -> None:

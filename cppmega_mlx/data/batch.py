@@ -144,11 +144,13 @@ class LMTokenBatch:
                     "document_ids must match tokens shape "
                     f"{self.tokens.shape}, got {self.document_ids.shape}"
                 )
-            if not batch_values_are_prevalidated():
-                _validate_document_id_values(
-                    self.document_ids,
-                    where="document_ids",
-                )
+        if self.document_ids is not None and not batch_values_are_prevalidated():
+            _validate_packed_sequence_contract(
+                document_ids=self.document_ids,
+                attention_mask=self.attention_mask,
+                loss_mask=self.loss_mask,
+                where="LMTokenBatch",
+            )
         if self.platform_ids is not None:
             if self.platform_ids.ndim not in (2, 3):
                 raise ValueError(
@@ -555,6 +557,130 @@ def _validate_document_id_values(value: Any, *, where: str) -> None:
         if "values must be >= 0" in str(error):
             raise ValueError(f"{where} must be non-negative") from error
         raise
+
+
+def _binary_mask(value: Any, *, where: str, shape: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim != 2:
+        raise ValueError(f"{where} must be shaped {shape}, got {array.shape}")
+    invalid = ~np.isfinite(array) | ((array != 0) & (array != 1))
+    if np.any(invalid):
+        row, column = np.argwhere(invalid)[0]
+        raise ValueError(
+            f"{where} must contain only finite binary values 0 or 1; "
+            f"row {int(row)}, column {int(column)} has {array[row, column]!r}"
+        )
+    return array != 0
+
+
+def _validate_packed_sequence_contract(
+    *,
+    document_ids: Any | None,
+    attention_mask: Any | None,
+    loss_mask: Any | None,
+    where: str,
+) -> None:
+    """Validate row-local packing boundaries without guessing unseen targets."""
+
+    documents: np.ndarray | None = None
+    if document_ids is not None:
+        try:
+            documents = validated_integer_array(
+                document_ids,
+                where=f"{where}.document_ids",
+                min_value=0,
+                allow_integral_float=False,
+            )
+        except ValueError as error:
+            if "values must be >= 0" in str(error):
+                raise ValueError(f"{where}.document_ids must be non-negative") from error
+            raise
+        if documents.ndim != 2:
+            raise ValueError(
+                f"{where}.document_ids must be shaped (B, S), got {documents.shape}"
+            )
+
+    valid_tokens: np.ndarray | None = None
+    if attention_mask is not None:
+        valid_tokens = _binary_mask(
+            attention_mask,
+            where=f"{where}.attention_mask",
+            shape="(B, S)",
+        )
+        holes = (~valid_tokens[:, :-1]) & valid_tokens[:, 1:]
+        if np.any(holes):
+            row, column = np.argwhere(holes)[0]
+            raise ValueError(
+                f"{where}: padding must be trailing; row {int(row)} has a valid "
+                f"token after padding at column {int(column) + 1}"
+            )
+        if documents is not None and documents.shape != valid_tokens.shape:
+            raise ValueError(
+                f"{where}: document_ids shape {documents.shape} must match "
+                f"attention_mask shape {valid_tokens.shape}"
+            )
+    elif documents is not None:
+        valid_tokens = np.ones(documents.shape, dtype=np.bool_)
+
+    if documents is not None and valid_tokens is not None:
+        for row_index, (row_documents, row_valid) in enumerate(
+            zip(documents, valid_tokens, strict=True)
+        ):
+            active = row_documents[row_valid]
+            if not active.size:
+                continue
+            run_ids = active[np.r_[True, active[1:] != active[:-1]]]
+            unique_ids, counts = np.unique(run_ids, return_counts=True)
+            reused = unique_ids[counts > 1]
+            if reused.size:
+                raise ValueError(
+                    f"{where}: document ID {int(reused[0])} is reused "
+                    f"non-contiguously in row {row_index}"
+                )
+
+    if loss_mask is None:
+        return
+    losses = _binary_mask(
+        loss_mask,
+        where=f"{where}.loss_mask",
+        shape="(B, T)",
+    )
+    if valid_tokens is None:
+        return
+    batch_size, sequence_length = valid_tokens.shape
+    if losses.shape[0] != batch_size or losses.shape[1] not in (
+        sequence_length,
+        sequence_length - 1,
+    ):
+        raise ValueError(
+            f"{where}.loss_mask shape {losses.shape} cannot align to packed "
+            f"sequence shape {valid_tokens.shape}"
+        )
+
+    transition_count = min(losses.shape[1], sequence_length - 1)
+    valid_pairs = (
+        valid_tokens[:, :transition_count]
+        & valid_tokens[:, 1 : transition_count + 1]
+    )
+    allowed = np.zeros(losses.shape, dtype=np.bool_)
+    allowed[:, :transition_count] = valid_pairs
+    if documents is not None:
+        allowed[:, :transition_count] &= (
+            documents[:, :transition_count]
+            == documents[:, 1 : transition_count + 1]
+        )
+
+    # A full-width explicit target or a cut window can supervise the final
+    # valid source even though its target is not present in this physical row.
+    if losses.shape[1] == sequence_length:
+        allowed[:, -1] = valid_tokens[:, -1]
+    violations = losses & ~allowed
+    if np.any(violations):
+        row, column = np.argwhere(violations)[0]
+        raise ValueError(
+            f"{where}.loss_mask must be zero at cross-document/padding transitions; "
+            f"row {int(row)}, source column {int(column)}"
+        )
 
 
 def ensure_lm_batch(batch: LMTokenBatch | Mapping[str, Any] | mx.array) -> LMTokenBatch:

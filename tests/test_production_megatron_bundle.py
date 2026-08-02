@@ -541,7 +541,7 @@ def _write_mmididx(prefix: Path, tokens: np.ndarray) -> None:
 
 def _sidecar_values(name: str) -> np.ndarray:
     if name == "loss_mask":
-        return np.ones(_BUCKET, dtype=np.uint8)
+        return np.asarray([1, 1, 1, 0, 1, 1, 1, 1], dtype=np.uint8)
     if name == "doc_ids":
         return np.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.uint32)
     if name == "token_domain_ids":
@@ -730,7 +730,7 @@ def _build_bundle(
     )
     contract = {
         "schema": "cppmega_pre_materialized_objectives_v1",
-        "totals": {"samples": 1, "input_tokens": 7, "loss_tokens": 7},
+        "totals": {"samples": 1, "input_tokens": 7, "loss_tokens": 6},
         "materialization": {
             "format": "shifted_lm_document_v1",
             "loss_mask_alignment": "source_token_predicts_next_v1",
@@ -1580,7 +1580,7 @@ def test_stale_objective_contract_fails_before_mmap(
     fixture = _build_bundle(tmp_path)
     contract = fixture.root / "provenance/objective_contract_seq8.json"
     payload = json.loads(contract.read_text(encoding="utf-8"))
-    payload["totals"]["loss_tokens"] = 6
+    payload["totals"]["loss_tokens"] = 5
     _write_json(contract, payload)
     _forbid_mmap(monkeypatch)
 

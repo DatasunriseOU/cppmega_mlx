@@ -93,15 +93,29 @@ def _production_batch_rows(
     structure = mx.ones(tokens.shape, dtype=mx.int32)
     if document_rows is None:
         document_rows = tuple((0, 0, 0, 1, 1, 1) for _ in pairs_by_row)
+    document_ids = mx.array(document_rows, dtype=mx.int32)
+    attention_mask = (
+        mx.ones(tokens.shape, dtype=mx.float32)
+        if attention_rows is None
+        else mx.array(attention_rows, dtype=mx.float32)
+    )
+    valid = attention_mask.astype(mx.bool_)
+    loss_mask = mx.concatenate(
+        [
+            (
+                (document_ids[:, :-1] == document_ids[:, 1:])
+                & valid[:, :-1]
+                & valid[:, 1:]
+            ).astype(mx.float32),
+            valid[:, -1:].astype(mx.float32),
+        ],
+        axis=1,
+    )
     return LMTokenBatch(
         tokens=tokens,
-        attention_mask=(
-            None
-            if attention_rows is None
-            else mx.array(attention_rows, dtype=mx.float32)
-        ),
-        loss_mask=mx.ones(tokens.shape, dtype=mx.float32),
-        document_ids=mx.array(document_rows, dtype=mx.int32),
+        attention_mask=None if attention_rows is None else attention_mask,
+        loss_mask=loss_mask,
+        document_ids=document_ids,
         structure_ids=structure,
         dep_levels=structure,
         ast_depth_ids=structure,
@@ -385,7 +399,7 @@ def test_stage1_graphless_batch_is_lm_only_and_updates_optimizer() -> None:
     mx.eval(update_l1)
 
     assert metrics.updated is True
-    assert metrics.ntokens == 5
+    assert metrics.ntokens == 4
     assert float(update_l1.item()) > 0.0
 
 
@@ -420,7 +434,7 @@ def test_stage1_combined_loss_reaches_model_and_graph_indexer_parameters() -> No
     )
     metrics = stepper(batch)
     assert metrics.updated is True
-    assert metrics.ntokens == 5
+    assert metrics.ntokens == 4
     assert metrics.loss > 0.0
 
 

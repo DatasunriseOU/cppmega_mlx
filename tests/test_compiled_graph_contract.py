@@ -79,10 +79,19 @@ def _batch(
                 "confidence_ids": mx.full(tokens.shape, 1, dtype=mx.int32),
             }
         }
+    loss_mask = mx.ones(tokens.shape, dtype=mx.float32)
+    if document_ids is not None:
+        loss_mask = mx.concatenate(
+            [
+                (document_ids[:, :-1] == document_ids[:, 1:]).astype(mx.float32),
+                loss_mask[:, -1:],
+            ],
+            axis=1,
+        )
     return LMTokenBatch(
         tokens=tokens,
         target_tokens=targets,
-        loss_mask=mx.ones(tokens.shape, dtype=mx.float32),
+        loss_mask=loss_mask,
         document_ids=document_ids,
         graph_batch=graph,
         side_channels=side_channels,

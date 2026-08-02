@@ -587,7 +587,7 @@ def test_nanochat_input_target_loss_docids_parquet_drive_training_batch(tmp_path
         {
             "input_ids": pa.array([[10, 11, 12, 13]], type=pa.large_list(pa.int32())),
             "target_ids": pa.array([[11, 12, 13, 14]], type=pa.large_list(pa.int32())),
-            "loss_mask": pa.array([[1, 1, 0, 0]], type=pa.large_list(pa.int8())),
+            "loss_mask": pa.array([[1, 0, 1, 1]], type=pa.large_list(pa.int8())),
             "doc_ids": pa.array([[0, 0, 1, 1]], type=pa.large_list(pa.int32())),
             "token_structure_ids": pa.array(
                 [[2, 2, 3, 3]], type=pa.large_list(pa.int16())
@@ -609,7 +609,7 @@ def test_nanochat_input_target_loss_docids_parquet_drive_training_batch(tmp_path
 
     np.testing.assert_array_equal(np.array(batch.inputs), [[10, 11, 12, 13]])
     np.testing.assert_array_equal(np.array(batch.targets), [[11, 12, 13, 14]])
-    np.testing.assert_array_equal(np.array(batch.target_mask), [[1, 1, 0, 0]])
+    np.testing.assert_array_equal(np.array(batch.target_mask), [[1, 0, 1, 1]])
     np.testing.assert_array_equal(np.array(batch.input_document_ids), [[0, 0, 1, 1]])
     np.testing.assert_array_equal(
         np.array(batch.model_kwargs()["structure_ids"]),
@@ -636,8 +636,49 @@ def test_nanochat_input_target_loss_docids_parquet_drive_training_batch(tmp_path
     loss, ntokens = next_token_cross_entropy(UniformLogitModel(), batch)
     parquet_dataset.mx.eval(loss, ntokens)
 
-    assert int(ntokens.item()) == 2
+    assert int(ntokens.item()) == 3
     assert float(loss.item()) > 0
+
+
+@pytest.mark.parametrize(
+    ("document_ids", "attention_mask", "loss_mask", "valid_count", "match"),
+    [
+        ([1, 2, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1], None, "reused non-contiguously"),
+        ([1, 1, 2, 2], [1, 0, 1, 0], [0, 0, 0, 0], None, "padding must be trailing"),
+        ([1, 1, 1, 1], [1, float("nan"), 1, 1], [0, 0, 0, 0], None, "finite binary"),
+        ([1, 1, 1, 1], [1, 1, 1, 1], [1, float("nan"), 1, 1], None, "finite binary"),
+        ([1, 1, 1, 1], [1, 1, 1, 1], [1, 0.5, 1, 1], None, "finite binary"),
+        ([1, 1, 2, 2], [1, 1, 1, 1], [1, 1, 1, 1], None, "cross-document"),
+        ([1, 1, 0, 0], None, [1, 1, 0, 0], 2, "padding transitions"),
+    ],
+)
+def test_packed_parquet_rejects_invalid_boundary_contract(
+    tmp_path,
+    document_ids,
+    attention_mask,
+    loss_mask,
+    valid_count,
+    match,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    columns = {
+        "input_ids": pa.array([[10, 11, 12, 13]], type=pa.large_list(pa.int32())),
+        "doc_ids": pa.array([document_ids], type=pa.large_list(pa.int32())),
+        "loss_mask": pa.array([loss_mask], type=pa.large_list(pa.float32())),
+    }
+    if attention_mask is not None:
+        columns["attention_mask"] = pa.array(
+            [attention_mask],
+            type=pa.large_list(pa.float32()),
+        )
+    if valid_count is not None:
+        columns["valid_token_count"] = pa.array([valid_count], type=pa.int32())
+    path = tmp_path / "invalid-packed.parquet"
+    pq.write_table(pa.table(columns), path)
+
+    with pytest.raises(ValueError, match=match):
+        TokenParquetDataset(path, seq_len=4, batch_size=1)
 
 
 def test_source_level_structure_ids_are_ignored_when_not_token_aligned(

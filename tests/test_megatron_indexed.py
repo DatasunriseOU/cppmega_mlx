@@ -1410,15 +1410,15 @@ def test_source_transition_loss_mask_blocks_cross_document_label(tmp_path) -> No
     prefix = tmp_path / "source_transition_mask"
     _write_mmididx(
         prefix,
-        [np.array([10, 11, 20, 21], dtype=np.int32)],
+        [np.array([10, 11, 20, 21, 22, 23, 24, 25], dtype=np.int32)],
         dtype=np.int32,
     )
-    loss_mask = np.array([1, 0, 1, 0], dtype=np.uint8)
-    document_ids = np.array([1, 1, 2, 2], dtype=np.uint32)
+    loss_mask = np.array([1, 0, 1, 1, 1, 1, 1, 1], dtype=np.uint8)
+    document_ids = np.array([1, 1, 2, 2, 2, 2, 2, 2], dtype=np.uint32)
     loss_mask.tofile(tmp_path / "transition_loss_mask.bin")
     document_ids.tofile(tmp_path / "transition_doc_ids.bin")
     manifest = {
-        "token_count": 4,
+        "token_count": 8,
         "document_count": 1,
         "side_channel_paths": {
             "loss_mask": {
@@ -1444,16 +1444,24 @@ def test_source_transition_loss_mask_blocks_cross_document_label(tmp_path) -> No
         encoding="utf-8",
     )
 
+    invalid_loss_mask = loss_mask.copy()
+    invalid_loss_mask[1] = 1
+    invalid_loss_mask.tofile(tmp_path / "transition_loss_mask.bin")
+    with pytest.raises(ValueError, match="cross-document"):
+        next(MegatronIndexedDataset(prefix, seq_len=4, batch_size=1).iter_batches())
+
+    loss_mask.tofile(tmp_path / "transition_loss_mask.bin")
     batch = next(MegatronIndexedDataset(prefix, seq_len=4, batch_size=1).iter_batches())
 
     np.testing.assert_array_equal(np.asarray(batch.inputs), [[10, 11, 20]])
     np.testing.assert_array_equal(np.asarray(batch.targets), [[11, 20, 21]])
     np.testing.assert_array_equal(np.asarray(batch.target_mask), [[1, 0, 1]])
+    assert int(np.asarray(batch.loss_mask)[0, -1]) == 1
     cross_document = np.asarray(batch.input_document_ids) != np.asarray(
         batch.target_document_ids
     )
     assert int(np.asarray(batch.target_mask)[cross_document].sum()) == 0
-    assert int(np.asarray(batch.target_mask).sum()) == int(loss_mask.sum())
+    assert int(np.asarray(batch.target_mask).sum()) == int(loss_mask[:3].sum())
 
 
 def test_compact_fixed_rows_restore_padding_and_document_graphs(tmp_path) -> None:

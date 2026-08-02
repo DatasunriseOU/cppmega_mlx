@@ -18,7 +18,7 @@ from typing import Any, Literal, cast
 import mlx.core as mx
 import numpy as np
 
-from cppmega_mlx.data.batch import LMTokenBatch
+from cppmega_mlx.data.batch import LMTokenBatch, _validate_packed_sequence_contract
 from cppmega_mlx.data.domain_schema import (
     TOKEN_DOMAIN_EDGE_COLUMN_FAMILIES,
     normalize_domain_edge_record,
@@ -335,6 +335,18 @@ class TokenParquetDataset:
         )
         token_windows = _fixed_windows_from_rows(token_rows, seq_len)
         specs = _fixed_window_specs_from_rows(token_rows, seq_len)
+        declared_valid_windows = None
+        if _VALID_TOKEN_COUNT_COLUMN in columns.values:
+            valid_counts = _valid_token_counts_from_columns(columns, token_rows)
+            declared_valid_windows = _windows_from_specs(
+                [
+                    [1] * count + [0] * (len(row) - count)
+                    for row, count in zip(token_rows, valid_counts, strict=True)
+                ],
+                specs,
+                seq_len,
+                dtype=np.float32,
+            )
         target_rows, target_source = _optional_token_aligned_rows_with_source(
             columns,
             token_rows,
@@ -431,6 +443,28 @@ class TokenParquetDataset:
             key: _to_side_channel_values(key, value)
             for key, value in side_channels.items()
         }
+        loaded_attention = self._side_channels.get("attention_mask")
+        if (
+            declared_valid_windows is not None
+            and loaded_attention is not None
+            and not np.array_equal(
+                declared_valid_windows != 0,
+                loaded_attention != 0,
+            )
+        ):
+            raise ValueError(
+                f"parquet {self.path}: attention_mask disagrees with "
+                f"{_VALID_TOKEN_COUNT_COLUMN}"
+            )
+        if declared_valid_windows is not None and loaded_attention is None:
+            self._side_channels["attention_mask"] = declared_valid_windows
+            loaded_attention = declared_valid_windows
+        _validate_packed_sequence_contract(
+            document_ids=self._document_ids,
+            attention_mask=loaded_attention,
+            loss_mask=self._loss_mask,
+            where=f"parquet {self.path}",
+        )
         self._family_side_channels = {
             family: {
                 column: _family_side_channel_values(column, value)

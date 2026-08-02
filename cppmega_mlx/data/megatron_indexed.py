@@ -18,6 +18,7 @@ from cppmega_mlx.config.model import (
 from cppmega_mlx.data.batch import (
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     LMTokenBatch,
+    _validate_packed_sequence_contract,
 )
 from cppmega_mlx.data.domain_schema import DomainEdgeKind
 from cppmega_mlx.data.graph_packet import EdgeIndex, GraphBatch, GraphPacket
@@ -978,6 +979,12 @@ def _lm_batch_from_numpy(
     *,
     graph_batch: GraphBatch | None = None,
 ) -> LMTokenBatch:
+    _validate_packed_sequence_contract(
+        document_ids=arrays.get("document_ids"),
+        attention_mask=arrays.get(_ATTENTION_SIDE_CHANNEL_KEY),
+        loss_mask=arrays.get(_LOSS_MASK_SIDE_CHANNEL_KEY),
+        where="Megatron indexed batch",
+    )
     kwargs = {
         key: mx.array(arrays[key])
         for key in _LM_BATCH_DIRECT_SIDE_CHANNEL_KEYS
