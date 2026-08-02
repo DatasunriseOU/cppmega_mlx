@@ -482,6 +482,69 @@ def test_legacy_repair_rejects_unexpected_apply_arguments() -> None:
     assert "unexpected argument" in result.stderr.lower()
 
 
+def test_legacy_repair_preserves_cppmega_receipt_across_uv_recreate(
+    tmp_path: Path,
+) -> None:
+    script = ROOT / "scripts" / "fix_mlx_abi.sh"
+    env_root = tmp_path / "env"
+    purelib = env_root / "lib" / "python3.13" / "site-packages"
+    fake_python = env_root / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    purelib.mkdir(parents=True)
+    (env_root / "pyvenv.cfg").write_text("home = /base\n", encoding="utf-8")
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *sysconfig*) printf '%s\\n' \"$FAKE_PURELIB\" ;;\n"
+        "  *sys.base_prefix*) printf '%s\\n%s\\n' \"$FAKE_PREFIX\" /base ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    manifest = env_root / "cppmega-environment.json"
+    source_paths = purelib / "00_cppmega_sources.pth"
+    manifest.write_text('{"schema": 1}\n', encoding="utf-8")
+    source_paths.write_text("/source/cppmega\n/source/megatron\n", encoding="utf-8")
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    fake_uv = tools / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = sync ]; then\n"
+        "  rm \"$FAKE_PREFIX/cppmega-environment.json\"\n"
+        "  rm \"$FAKE_PURELIB/00_cppmega_sources.pth\"\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CPPMEGA_MLX_PYTHON": str(fake_python),
+            "CPPMEGA_MLX_ENV_ROOT": str(env_root),
+            "FAKE_PREFIX": str(env_root),
+            "FAKE_PURELIB": str(purelib),
+            "PATH": f"{tools}{os.pathsep}{environment['PATH']}",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(script), "--apply"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert manifest.read_text(encoding="utf-8") == '{"schema": 1}\n'
+    assert source_paths.read_text(encoding="utf-8") == (
+        "/source/cppmega\n/source/megatron\n"
+    )
+
+
 def test_legacy_repair_launcher_is_executable() -> None:
     script = ROOT / "scripts" / "fix_mlx_abi.sh"
 

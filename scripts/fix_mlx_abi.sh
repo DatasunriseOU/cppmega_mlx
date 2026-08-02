@@ -94,6 +94,49 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
+PURELIB="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+case "$PURELIB" in
+  "$ENV_PREFIX/"*)
+    ;;
+  *)
+    echo "ERROR: environment site-packages is outside $ENV_PREFIX: $PURELIB" >&2
+    exit 2
+    ;;
+esac
+CPPMEGA_MANIFEST="$ENV_PREFIX/cppmega-environment.json"
+CPPMEGA_SOURCE_PATHS="$PURELIB/00_cppmega_sources.pth"
+if [[ -e "$CPPMEGA_MANIFEST" || -e "$CPPMEGA_SOURCE_PATHS" ]]; then
+  if [[ ! -f "$CPPMEGA_MANIFEST" || -L "$CPPMEGA_MANIFEST" \
+      || ! -f "$CPPMEGA_SOURCE_PATHS" || -L "$CPPMEGA_SOURCE_PATHS" ]]; then
+    echo "ERROR: refusing to preserve an incomplete or symlinked cppmega receipt" >&2
+    exit 2
+  fi
+  RECEIPT_BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/cppmega-mlx-receipt.XXXXXX")"
+  cp -p "$CPPMEGA_MANIFEST" "$RECEIPT_BACKUP/cppmega-environment.json"
+  cp -p "$CPPMEGA_SOURCE_PATHS" "$RECEIPT_BACKUP/00_cppmega_sources.pth"
+
+  restore_cppmega_receipt() {
+    mkdir -p "$(dirname "$CPPMEGA_SOURCE_PATHS")"
+    cp -p "$RECEIPT_BACKUP/cppmega-environment.json" "$CPPMEGA_MANIFEST"
+    cp -p "$RECEIPT_BACKUP/00_cppmega_sources.pth" "$CPPMEGA_SOURCE_PATHS"
+    cmp -s "$RECEIPT_BACKUP/cppmega-environment.json" "$CPPMEGA_MANIFEST"
+    cmp -s "$RECEIPT_BACKUP/00_cppmega_sources.pth" "$CPPMEGA_SOURCE_PATHS"
+  }
+  cleanup_receipt_backup() {
+    rm -f "$RECEIPT_BACKUP/cppmega-environment.json"
+    rm -f "$RECEIPT_BACKUP/00_cppmega_sources.pth"
+    rmdir "$RECEIPT_BACKUP"
+  }
+  restore_receipt_on_exit() {
+    status="$?"
+    trap - EXIT
+    restore_cppmega_receipt || status=1
+    cleanup_receipt_backup || status=1
+    exit "$status"
+  }
+  trap restore_receipt_on_exit EXIT
+fi
+
 env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
   -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \
   -u TVM_HOME -u TVM_ROOT -u TVM_LIBRARY_PATH -u TVM_IMPORT_PYTHON_PATH \
@@ -115,6 +158,12 @@ env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
   uv sync --project "$REPO_ROOT" --locked --no-sources \
     --python "$PYTHON_BIN" --extra parquet --extra gui --extra widget \
     --extra path-c --group dev
+
+if [[ -n "${RECEIPT_BACKUP:-}" ]]; then
+  restore_cppmega_receipt
+  cleanup_receipt_backup
+  trap - EXIT
+fi
 
 exec env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
   -u CPPMEGA_MLX_SOURCE_ROOT -u CPPMEGA_TILELANG_SOURCE_ROOT \

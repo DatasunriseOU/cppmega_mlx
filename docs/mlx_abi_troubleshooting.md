@@ -133,7 +133,9 @@ only with an explicit `CPPMEGA_MLX_ENV_ROOT`; targets inside any Git checkout
 are rejected. `--apply` accepts no additional `uv` arguments, validates that
 the selected Python belongs to the requested venv, runs
 `uv lock --check --no-sources`, and then syncs with both `--locked` and
-`--no-sources`.
+`--no-sources`. If the dedicated venv also carries the cppmega source receipt,
+the repair preserves and verifies that manifest and source-path file across
+uv's environment recreation.
 
 ### 3. Manual: pin DYLD search order
 
