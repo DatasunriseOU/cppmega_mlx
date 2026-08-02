@@ -43,7 +43,7 @@ path-c = [
     "cython>=3.0,<4",
     "einops>=0.8",
     "ml-dtypes>=0.5",
-    "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git@6c338795c92d26eb931e3a626911093f22c0fd49 ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
+    "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git@de8bb88cc382b0e78bc804244f79c4be8cc9e75f ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
     "torch==2.13.0",
 ]
 
