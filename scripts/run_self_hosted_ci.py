@@ -387,7 +387,7 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
-project_modules = ("cppmega_mlx", "scripts")
+project_modules = ("cppmega_mlx", "scripts.run_self_hosted_ci")
 
 def inside_root(value: Path) -> bool:
     try:

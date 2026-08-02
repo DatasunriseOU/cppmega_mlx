@@ -338,6 +338,35 @@ def test_source_import_probe_rejects_a_foreign_namespace_path(
     assert "outside reviewed root" in log_path.read_text(encoding="utf-8")
 
 
+def test_source_import_probe_accepts_foreign_scripts_namespace_members(
+    tmp_path: Path,
+) -> None:
+    foreign_root = tmp_path / "foreign-source-receipt"
+    foreign_scripts = foreign_root / "scripts"
+    foreign_scripts.mkdir(parents=True)
+    (foreign_scripts / "unrelated.py").write_text("VALUE = 1\n", encoding="utf-8")
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(REPO_ROOT), str(foreign_root))
+    )
+    log_path = tmp_path / "shared-scripts-probe.log"
+    result = ci.run_step(
+        name="shared-scripts-source-binding",
+        command=ci._source_import_probe_command(sys.executable, REPO_ROOT),
+        cwd=tmp_path,
+        log_path=log_path,
+        timeout_seconds=30,
+        env=environment,
+    )
+
+    assert result["exit_code"] == 0, log_path.read_text(encoding="utf-8")
+    receipt = json.loads(log_path.read_text(encoding="utf-8"))
+    assert set(receipt["imports"]) == {
+        "cppmega_mlx",
+        "scripts.run_self_hosted_ci",
+    }
+
+
 def test_lane_manifests_cover_current_case5_and_training_regressions() -> None:
     for test_path in (
         "tests/test_case5_domain_ingestion.py",
