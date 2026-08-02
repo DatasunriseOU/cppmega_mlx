@@ -60,10 +60,27 @@ def test_alternating_source_rows_preserve_pool_and_global_replay_state() -> None
 def test_two_pool_snapshot_binds_manifest_receipt_bytes_and_pool_cursors(
     tmp_path: Path,
 ) -> None:
-    primary_root = tmp_path / "ci"
-    primary = primary_root / "1024" / "ci.parquet"
+    original_root = tmp_path / "original-ci"
+    original = (
+        original_root / "1024" / "ci-case5-train-1024-000000.parquet"
+    )
+    original.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1, 2]}), original)
+    primary_root = tmp_path / "snapshot" / "ci"
+    primary = (
+        primary_root / "1024" / "ci-case5-train-1024-000000.parquet"
+    )
     primary.parent.mkdir(parents=True)
-    pq.write_table(pa.table({"value": [1, 2]}), primary)
+    pq.write_table(
+        pa.table({"value": [101, 102]}).replace_schema_metadata(
+            {b"boundary-repaired": b"true"}
+        ),
+        primary,
+    )
+    validation = (
+        primary_root / "1024" / "ci-case5-validation-1024-000001.parquet"
+    )
+    pq.write_table(pa.table({"value": [201]}), validation)
     seed_root = tmp_path / "seed"
     seed = seed_root / "commits" / "1024" / "seed.parquet"
     seed.parent.mkdir(parents=True)
@@ -75,7 +92,10 @@ def test_two_pool_snapshot_binds_manifest_receipt_bytes_and_pool_cursors(
     receipt_raw = (
         json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    (primary_root / "export_receipt.json").write_bytes(receipt_raw)
+    binding_root = tmp_path / "bindings"
+    binding_root.mkdir()
+    receipt_path = binding_root / "export_receipt.json"
+    receipt_path.write_bytes(receipt_raw)
     manifest = {
         "schema": materializer._SOURCE_POOL_MANIFEST_SCHEMA,
         "algorithm": materializer._TWO_POOL_SCHEDULE,
@@ -100,7 +120,7 @@ def test_two_pool_snapshot_binds_manifest_receipt_bytes_and_pool_cursors(
         },
         "producer": {"script": "fixture"},
     }
-    manifest_path = tmp_path / "source_pools.json"
+    manifest_path = binding_root / "source_pools.json"
     manifest_path.write_text(
         json.dumps(manifest, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -126,6 +146,12 @@ def test_two_pool_snapshot_binds_manifest_receipt_bytes_and_pool_cursors(
     assert snapshot["schema"] == materializer._TWO_POOL_SOURCE_SNAPSHOT_SCHEMA
     assert snapshot["pool_order"] == ["primary_ci", "objective_seed"]
     assert primary_shards == [str(primary.resolve())]
+    assert snapshot["pools"]["primary_ci"]["files"] == [
+        _manifest_record(primary, root=primary_root)
+    ]
+    assert hashlib.sha256(primary.read_bytes()).hexdigest() != hashlib.sha256(
+        original.read_bytes()
+    ).hexdigest()
     assert seed_shards == [str(seed.resolve())]
     assert hashlib.sha256(manifest_raw).hexdigest() == (
         snapshot["source_pool_manifest"]["sha256"]
@@ -159,9 +185,82 @@ def test_two_pool_snapshot_binds_manifest_receipt_bytes_and_pool_cursors(
     assert snapshot["pools"]["primary_ci"]["sampling"]["requested_samples"] == 2
     assert snapshot["pools"]["objective_seed"]["sampling"]["requested_samples"] == 2
 
-    (primary_root / "export_receipt.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="binding drifted"):
+        materializer._build_two_pool_source_snapshot(
+            manifest_path,
+            primary_root=original_root,
+            objective_seed_root=seed_root,
+            sequence_length=1024,
+            requested_source_rows=4,
+            seed=17,
+            source_batch_rows=2,
+        )
+
+    receipt_path.write_text("{}", encoding="utf-8")
     with pytest.raises(RuntimeError, match="source changed"):
         materializer._require_source_snapshot_unchanged(signatures)
+
+
+@pytest.mark.parametrize("split", ("validation", "test"))
+def test_two_pool_snapshot_rejects_non_train_primary_shard(
+    tmp_path: Path,
+    split: str,
+) -> None:
+    primary_root = tmp_path / "snapshot" / "ci"
+    non_train = (
+        primary_root / "1024" / f"ci-case5-{split}-1024-000001.parquet"
+    )
+    non_train.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [1]}), non_train)
+    seed_root = tmp_path / "snapshot"
+    seed = seed_root / "code" / "1024" / "seed.parquet"
+    seed.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"value": [2]}), seed)
+    receipt = {
+        "schema": "cppmega_ci_content_store_case5_export_v2",
+        "status": "complete",
+    }
+    receipt_raw = json.dumps(receipt).encode("utf-8")
+    binding_root = tmp_path / "bindings"
+    binding_root.mkdir()
+    (binding_root / "export_receipt.json").write_bytes(receipt_raw)
+    manifest = {
+        "schema": materializer._SOURCE_POOL_MANIFEST_SCHEMA,
+        "algorithm": materializer._TWO_POOL_SCHEDULE,
+        "sequence_lengths": [1024],
+        "ci_export": {
+            "path": "export_receipt.json",
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+            "schema": receipt["schema"],
+            "status": "complete",
+            "source_completion": {
+                "schema": receipt["schema"],
+                "status": "complete",
+            },
+        },
+        "primary_ci": {
+            "files_by_sequence_length": {
+                "1024": [_manifest_record(non_train, root=primary_root)]
+            }
+        },
+        "objective_seed": {
+            "files": [_manifest_record(seed, root=seed_root)]
+        },
+        "producer": {"script": "fixture"},
+    }
+    manifest_path = binding_root / "source_pools.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a canonical train shard"):
+        materializer._build_two_pool_source_snapshot(
+            manifest_path,
+            primary_root=primary_root,
+            objective_seed_root=seed_root,
+            sequence_length=1024,
+            requested_source_rows=2,
+            seed=17,
+            source_batch_rows=2,
+        )
 
 
 def test_source_iterator_normalizes_packed_row_only_once() -> None:

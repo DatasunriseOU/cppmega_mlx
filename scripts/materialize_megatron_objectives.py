@@ -17,6 +17,7 @@ import glob
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import struct
 import sys
@@ -143,6 +144,9 @@ _CI_EXPORT_SCHEMAS = {
     "cppmega_ci_content_store_case5_export_v2",
     "cppmega_ci_content_store_case5_export_v4",
 }
+_PRIMARY_TRAIN_SHARD_NAME = re.compile(
+    r"ci-case5-train-([0-9]+)-([0-9]{6})\.parquet"
+)
 
 
 def _source_stat(path: Path) -> _SourceStat:
@@ -337,8 +341,13 @@ def _manifest_parquet_paths(
 ) -> tuple[list[str], list[dict[str, object]]]:
     if not isinstance(raw_records, list) or not raw_records:
         raise ValueError(f"{where} must be a non-empty list")
-    canonical_root = root.resolve()
-    if not canonical_root.is_dir():
+    absolute_root = root.absolute()
+    canonical_root = absolute_root.resolve()
+    if (
+        absolute_root.is_symlink()
+        or canonical_root != absolute_root
+        or not canonical_root.is_dir()
+    ):
         raise ValueError(f"{where} root is not a directory: {canonical_root}")
     paths: list[str] = []
     records: list[dict[str, object]] = []
@@ -353,15 +362,18 @@ def _manifest_parquet_paths(
                 f"{where}[{index}] must contain path, rows, size_bytes, and sha256"
             )
         raw_path = raw_record["path"]
+        relative = Path(raw_path) if isinstance(raw_path, str) else None
         rows = raw_record["rows"]
         size_bytes = raw_record["size_bytes"]
         sha256 = raw_record["sha256"]
         if (
             not isinstance(raw_path, str)
             or not raw_path
-            or Path(raw_path).is_absolute()
-            or ".." in Path(raw_path).parts
-            or Path(raw_path).suffix != ".parquet"
+            or relative is None
+            or relative.is_absolute()
+            or relative.as_posix() != raw_path
+            or ".." in relative.parts
+            or relative.suffix != ".parquet"
             or isinstance(rows, bool)
             or not isinstance(rows, int)
             or rows < 1
@@ -373,12 +385,18 @@ def _manifest_parquet_paths(
             or any(character not in "0123456789abcdef" for character in sha256)
         ):
             raise ValueError(f"{where}[{index}] has an invalid file binding")
-        path = (canonical_root / raw_path).resolve()
+        candidate = canonical_root / relative
+        path = candidate.resolve()
         try:
             path.relative_to(canonical_root)
         except ValueError as exc:
             raise ValueError(f"{where}[{index}] escapes its source root") from exc
-        if not path.is_file() or path.stat().st_size != size_bytes:
+        if (
+            candidate.is_symlink()
+            or candidate != path
+            or not path.is_file()
+            or path.stat().st_size != size_bytes
+        ):
             raise ValueError(f"{where}[{index}] file size binding drifted: {raw_path}")
         paths.append(str(path))
         records.append(dict(raw_record))
@@ -402,7 +420,16 @@ def _load_source_pool_manifest(
     bytes,
     dict[Path, _SourceStat],
 ]:
-    manifest_path = path.resolve()
+    absolute_manifest_path = path.absolute()
+    manifest_path = absolute_manifest_path.resolve()
+    if (
+        absolute_manifest_path.is_symlink()
+        or manifest_path != absolute_manifest_path
+        or not manifest_path.is_file()
+    ):
+        raise ValueError(
+            f"source pool manifest is not a regular canonical file: {path}"
+        )
     before = _source_stat(manifest_path)
     raw = manifest_path.read_bytes()
     after = _source_stat(manifest_path)
@@ -444,6 +471,30 @@ def _load_source_pool_manifest(
     raw_primary_records = primary["files_by_sequence_length"].get(
         str(sequence_length)
     )
+    if not isinstance(raw_primary_records, list) or not raw_primary_records:
+        raise ValueError(
+            f"{_PRIMARY_POOL}.files_by_sequence_length.{sequence_length} "
+            "must be a non-empty list"
+        )
+    for index, raw_record in enumerate(raw_primary_records):
+        raw_path = raw_record.get("path") if isinstance(raw_record, Mapping) else None
+        relative = Path(raw_path) if isinstance(raw_path, str) else None
+        match = (
+            _PRIMARY_TRAIN_SHARD_NAME.fullmatch(relative.name)
+            if relative is not None
+            else None
+        )
+        if (
+            relative is None
+            or len(relative.parts) != 2
+            or relative.parts[0] != str(sequence_length)
+            or match is None
+            or int(match.group(1)) != sequence_length
+        ):
+            raise ValueError(
+                f"{_PRIMARY_POOL}.files_by_sequence_length.{sequence_length}"
+                f"[{index}] is not a canonical train shard"
+            )
     primary_paths, primary_records = _manifest_parquet_paths(
         raw_primary_records,
         root=primary_root,
@@ -471,7 +522,17 @@ def _load_source_pool_manifest(
         or not isinstance(ci_export["source_completion"], Mapping)
     ):
         raise ValueError("source pool manifest CI export semantics are invalid")
-    receipt_path = (primary_root.resolve() / "export_receipt.json").resolve()
+    receipt_candidate = manifest_path.parent / str(ci_export["path"])
+    receipt_path = receipt_candidate.resolve()
+    if (
+        receipt_candidate.is_symlink()
+        or receipt_path != receipt_candidate
+        or receipt_path.parent != manifest_path.parent
+        or not receipt_path.is_file()
+    ):
+        raise ValueError(
+            "source pool manifest CI export receipt is not a regular adjacent file"
+        )
     receipt_before = _source_stat(receipt_path)
     receipt_raw = receipt_path.read_bytes()
     receipt_after = _source_stat(receipt_path)
@@ -1300,7 +1361,8 @@ def main() -> int:
         required=True,
         help=(
             "Immutable root used to record canonical relative source paths; "
-            "production bundles require code/<bucket>/... and commits/<bucket>/..."
+            "single-pool bundles use the shared snapshot root, while two-pool "
+            "materialization requires its repaired snapshot/ci root"
         ),
     )
     parser.add_argument(
