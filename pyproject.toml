@@ -38,12 +38,12 @@ widget = [
     "ipywidgets>=8.0",
 ]
 path-c = [
-    "apache-tvm-ffi @ git+https://github.com/DatasunriseOU/tvm-ffi.git@521efeb30bfd9e4946b248b3d76e6391028233a3 ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
+    "apache-tvm-ffi @ git+https://github.com/DatasunriseOU/tvm-ffi.git@e4353339293459e3e8a393afc1b6a6a869e75b13 ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
     "cloudpickle>=3.1",
     "cython>=3.0,<4",
     "einops>=0.8",
     "ml-dtypes>=0.5",
-    "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git@de8bb88cc382b0e78bc804244f79c4be8cc9e75f ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
+    "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git@a760fe587995def0f3108ee204be453d87467c5d ; (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Linux' and platform_machine == 'x86_64')",
     "torch==2.13.0",
 ]
 

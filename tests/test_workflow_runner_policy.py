@@ -4,7 +4,6 @@ import re
 import tomllib
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOSTED_RUNNER = re.compile(
     r"\b(?:ubuntu|macos|windows)-(?:latest|[0-9]+(?:\.[0-9]+)?)\b",
@@ -284,12 +283,12 @@ def test_path_c_extra_binds_exact_tilelang_stack_and_compatible_z3() -> None:
     assert "cython>=3.0,<4" in path_c
     assert (
         "tilelang @ git+https://github.com/DatasunriseOU/tilelang.git"
-        "@de8bb88cc382b0e78bc804244f79c4be8cc9e75f ; "
+        "@a760fe587995def0f3108ee204be453d87467c5d ; "
         f"{marker}"
     ) in path_c
     assert (
         "apache-tvm-ffi @ git+https://github.com/DatasunriseOU/tvm-ffi.git"
-        "@521efeb30bfd9e4946b248b3d76e6391028233a3 ; "
+        "@e4353339293459e3e8a393afc1b6a6a869e75b13 ; "
         f"{marker}"
     ) in path_c
     assert "z3-solver>=4.15,<4.15.5" in config["project"]["dependencies"]
