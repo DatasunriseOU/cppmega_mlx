@@ -736,10 +736,6 @@ def _next_page_url(
             candidate = urllib.parse.urljoin(response.url, match.group(1))
             current_url = urllib.parse.urlsplit(response.url)
             next_url = urllib.parse.urlsplit(candidate)
-            current_query = urllib.parse.parse_qsl(
-                current_url.query,
-                keep_blank_values=True,
-            )
             next_query = urllib.parse.parse_qsl(
                 next_url.query,
                 keep_blank_values=True,
@@ -753,14 +749,25 @@ def _next_page_url(
                     current_url.path,
                 )
                 != (next_url.scheme, next_url.netloc, next_url.path)
-                or sorted((key, value) for key, value in current_query if key != "page")
-                != sorted((key, value) for key, value in next_query if key != "page")
                 or next_pages != [str(page + 1)]
             ):
                 raise GitLabIngestError(
                     f"refusing out-of-scope GitLab pagination link: {candidate}"
                 )
-            return candidate
+            # GitLab can append defaults (and normalize timestamp precision) to
+            # Link URLs.  Treat the link only as a same-endpoint page signal and
+            # rebuild the request from the pinned query we originally sent.
+            current_query = urllib.parse.parse_qsl(
+                current_url.query,
+                keep_blank_values=True,
+            )
+            next_query = [
+                (key, value) for key, value in current_query if key != "page"
+            ]
+            next_query.append(("page", str(page + 1)))
+            return urllib.parse.urlunsplit(
+                current_url._replace(query=urllib.parse.urlencode(next_query))
+            )
     raw_next = response.headers.get("x-next-page")
     if raw_next:
         try:

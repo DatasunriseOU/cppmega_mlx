@@ -264,6 +264,35 @@ def test_pagination_prefers_explicit_next_and_stops_at_exact_total() -> None:
         item_count=100,
     ).endswith("page=2")
 
+    normalized = gitlab.APIResponse(
+        url=(
+            "https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?"
+            "state=all&created_before=2026-08-03T23%3A43%3A56.646941Z&page=1"
+        ),
+        status=200,
+        headers={
+            "link": (
+                "<https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?"
+                "created_before=2026-08-03T23%3A43%3A56%2B00%3A00&"
+                "id=a%2Fb&order_by=created_at&page=2&per_page=100&sort=asc&"
+                "state=all&with_labels_details=false>; rel=\"next\""
+            )
+        },
+        body=[],
+        body_sha256="0" * 64,
+        byte_size=2,
+    )
+    next_url = gitlab._next_page_url(
+        normalized,
+        page=1,
+        page_size=100,
+        item_count=100,
+    )
+    assert next_url == (
+        "https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?"
+        "state=all&created_before=2026-08-03T23%3A43%3A56.646941Z&page=2"
+    )
+
     final = gitlab.APIResponse(
         url="https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?page=1",
         status=200,
@@ -286,7 +315,7 @@ def test_pagination_prefers_explicit_next_and_stops_at_exact_total() -> None:
         "https://invent.kde.org/api/v4/projects/a%2Fb/merge_requests?page=2",
         "https://gitlab.com:8443/api/v4/projects/a%2Fb/merge_requests?page=2",
         "https://gitlab.com/api/v4/projects/evil%2Frepo/merge_requests?page=2",
-        "https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?state=closed&page=2",
+        "https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?page=3",
     ):
         unsafe = gitlab.APIResponse(
             **{
