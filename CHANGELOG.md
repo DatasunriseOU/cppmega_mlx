@@ -2,6 +2,22 @@
 
 All notable UI-surface changes since the V7 honest-closure pass.
 
+## Receipt-bound GitLab MR ingestion (2026-08-03)
+
+- Added bounded, resumable GitLab MR inventory for the three declared GitLab
+  project identities, with atomic page journals, immutable per-MR sidecars,
+  exact source/target/merge SHA lineage, and fail-closed credential preflight.
+- Native/build/test/SQL diffs reuse the canonical primary commit-path
+  classifier. Python/JavaScript-only MRs are routed to a physically separate
+  ancillary SQLite store, while excluded and terminal candidates remain
+  sidecar-only.
+- GitLab completion receipts are verified but explicitly not training-ready;
+  CASE5 export dispatches by completion schema and still requires the exact
+  primary-commit membership receipt and artifact.
+- Focused verification covers exact scope, path isolation, pagination,
+  crash-resume immutability, full receipt rebuilding, exporter dispatch, and
+  the retained primary-membership gate.
+
 ## Rerun-safe E2E matrix reports (2026-08-02)
 
 - Matrix aggregation now reads only the artifacts named by

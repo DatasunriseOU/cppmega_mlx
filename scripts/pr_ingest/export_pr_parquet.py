@@ -210,19 +210,56 @@ def _summarize_materialize_stats(entries: list[dict]) -> dict[str, int]:
     return totals
 
 
-def _load_completion_api():
+def _completion_receipt_schema(receipt_path: Path) -> str:
+    max_bytes = 4 * 1024 * 1024
     try:
-        from streaming_reindex_commits import (
-            load_pr_completion_binding,
-            revalidate_pr_completion_binding,
-        )
-    except ModuleNotFoundError as exc:
+        with receipt_path.open("rb") as handle:
+            payload = handle.read(max_bytes + 1)
+    except OSError as exc:
         raise RuntimeError(
-            "PR parquet export requires root scripts/streaming_reindex_commits.py "
-            "to verify cppmega_pr_completion_v2; no unverified fallback is "
-            "permitted"
+            f"cannot read PR completion receipt {receipt_path}: {exc}"
         ) from exc
-    return load_pr_completion_binding, revalidate_pr_completion_binding
+    if len(payload) > max_bytes:
+        raise RuntimeError(
+            f"PR completion receipt exceeds the 4 MiB metadata bound: {receipt_path}"
+        )
+    try:
+        receipt = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid PR completion receipt: {receipt_path}") from exc
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("schema"), str):
+        raise RuntimeError("PR completion receipt lacks a schema discriminator")
+    return str(receipt["schema"])
+
+
+def _load_completion_api(schema: str):
+    if schema == "cppmega_pr_completion_v2":
+        try:
+            from streaming_reindex_commits import (
+                load_pr_completion_binding,
+                revalidate_pr_completion_binding,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "PR parquet export requires root scripts/streaming_reindex_commits.py "
+                "to verify cppmega_pr_completion_v2; no unverified fallback is "
+                "permitted"
+            ) from exc
+        return load_pr_completion_binding, revalidate_pr_completion_binding
+    if schema == "cppmega_gitlab_mr_completion_v1":
+        try:
+            from scripts.pr_ingest.gitlab_mr_stream import (
+                load_gitlab_completion_binding,
+                revalidate_gitlab_completion_binding,
+            )
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "PR parquet export requires scripts/pr_ingest/gitlab_mr_stream.py "
+                "to verify cppmega_gitlab_mr_completion_v1; no unverified fallback "
+                "is permitted"
+            ) from exc
+        return load_gitlab_completion_binding, revalidate_gitlab_completion_binding
+    raise RuntimeError(f"unsupported PR completion schema: {schema!r}")
 
 
 def _load_pr_completion(args: argparse.Namespace) -> dict[str, object]:
@@ -232,9 +269,12 @@ def _load_pr_completion(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--pr-completion-receipt is required")
     if not raw_repo_list:
         raise ValueError("--repo-list is required")
-    load_binding, _revalidate = _load_completion_api()
+    receipt_path = Path(raw_receipt)
+    load_binding, _revalidate = _load_completion_api(
+        _completion_receipt_schema(receipt_path)
+    )
     return load_binding(
-        Path(raw_receipt),
+        receipt_path,
         pr_store=Path(args.store),
         repo_list=Path(raw_repo_list),
     )
@@ -244,7 +284,10 @@ def _revalidate_pr_completion(
     args: argparse.Namespace,
     binding: dict[str, object],
 ) -> None:
-    _load_binding, revalidate = _load_completion_api()
+    schema = binding.get("schema")
+    if not isinstance(schema, str):
+        raise RuntimeError("verified PR completion binding lacks its schema")
+    _load_binding, revalidate = _load_completion_api(schema)
     revalidate(
         binding,
         Path(args.pr_completion_receipt),
@@ -980,7 +1023,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--pr-completion-receipt",
         required=True,
-        help="Verified cppmega_pr_completion_v2 receipt binding the exact scan.",
+        help=(
+            "Verified cppmega_pr_completion_v2 or "
+            "cppmega_gitlab_mr_completion_v1 receipt binding the exact scan."
+        ),
     )
     p.add_argument("--repo-list", default=str(DEFAULT_REPO_LIST))
     p.add_argument(
