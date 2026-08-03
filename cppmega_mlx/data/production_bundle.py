@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import re
+import stat
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import hashlib
-import json
-import os
 from pathlib import Path, PurePosixPath
-import re
-import stat
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -21,6 +21,10 @@ from cppmega_mlx.config.model import (
 )
 from cppmega_mlx.data.dataset_metadata import TokenDatasetMetadata
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
+from cppmega_mlx.data.graph_recipe import (
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_contract,
+)
 from cppmega_mlx.data.nanochat_pipeline.packed_rows_schema import (
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
 )
@@ -28,16 +32,13 @@ from cppmega_mlx.data.tokenizer_contract import (
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     TOKENIZER_CONTRACT_SHA256,
 )
-from cppmega_mlx.data.graph_recipe import (
-    stage1_graph_recipe_binding,
-    validate_stage1_graph_contract,
-)
 
 if TYPE_CHECKING:
     from cppmega_mlx.data.megatron_indexed import MegatronIndexedDataset
 
 
-_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v4"
+_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v5"
+_ROUTED_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v4"
 _LEGACY_BUNDLE_SCHEMA = "cppmega_megatron_bundle_v3"
 _BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 _PREFIX_TOKENIZER_CONTRACT = "megacpp"
@@ -68,6 +69,9 @@ _OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 _OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v2"
 _LEGACY_OBJECTIVE_ARTIFACT_SCHEMA = "cppmega_objective_materialization_artifact_v1"
 _OBJECTIVE_SOURCE_SCHEMA = "cppmega_objective_source_snapshot_v1"
+_OBJECTIVE_SOURCE_POOLS_SCHEMA = "cppmega_objective_source_snapshot_v2"
+_OBJECTIVE_SOURCE_POOL_ORDER = ("primary_ci", "objective_seed")
+_OBJECTIVE_SOURCE_POOL_ALGORITHM = "alternate_primary_seed_v1"
 _LEGACY_SOURCE_SAMPLING_MODE = "deterministic_epoch_shuffle_v1"
 _BOUNDED_SOURCE_SAMPLING_MODE = (
     "deterministic_shard_row_group_record_batch_shuffle_v2"
@@ -103,6 +107,12 @@ _SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
 _SOURCE_ROUTE_SET_SCHEMA = "cppmega_packed_source_primary_routes_v1"
 _SOURCE_ROUTE_SCHEMA = "cppmega_packed_source_route_v2"
 _SOURCE_ROUTE_POLICY = "primary-only-code-and-commit-snapshot"
+_PRODUCTION_OBJECTIVE_TARGET_SHA256 = (
+    "e941ee6503533a867151115822729ba8a62cb66645eec11f080d7920cddd981d"
+)
+_PRODUCTION_OBJECTIVE_TARGET_SCHEMA = (
+    "cppmega_production_objective_materialization_target_v1"
+)
 _GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
 _SOURCE_FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
 _SOURCE_FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
@@ -457,6 +467,13 @@ def open_production_megatron_bundle(
     )
     selected_objective = validated.objectives[bucket]
     selected_prefix = validated.prefixes[bucket]
+    source_snapshot_sha256 = selected_objective.source_summary.get(
+        "artifact_set_sha256"
+    )
+    if source_snapshot_sha256 is None:
+        source_snapshot_sha256 = _canonical_sha256(
+            selected_objective.source_summary
+        )
     metadata = ProductionMegatronDatasetMetadata(
         vocab_size=int(validated.manifest["vocab_size"]),
         tokenizer_contract="megacpp",
@@ -473,9 +490,7 @@ def open_production_megatron_bundle(
         restore_receipt_sha256=validated.restore.receipt_sha256,
         restore_run_id=validated.restore.run_id,
         storage_bucket=validated.restore.storage_bucket,
-        source_snapshot_artifact_set_sha256=str(
-            selected_objective.source_summary["artifact_set_sha256"]
-        ),
+        source_snapshot_artifact_set_sha256=str(source_snapshot_sha256),
         source_manifest_sha256=validated.source_manifest_sha256,
         repaired_source_manifest_sha256=validated.repaired_source_manifest_sha256,
         source_composition_receipt_sha256=(
@@ -529,8 +544,26 @@ def open_production_megatron_bundle(
         metadata=metadata,
     )
     if not isinstance(dataset, MegatronIndexedDataset):
-        raise RuntimeError(
+        raise RuntimeError(  # noqa: TRY004 - validated production contract failure
             "production bundle prefix opened as an unexpected dataset type"
+        )
+    totals = selected_objective.contract["totals"]
+    expected_counts = {
+        "sequences": int(totals["samples"]),
+        "documents": int(totals["samples"]),
+        "samples": int(totals["samples"]),
+        "tokens": int(totals["input_tokens"]) + int(totals["samples"]),
+    }
+    actual_counts = {
+        "sequences": dataset.index_metadata.sequence_count,
+        "documents": dataset.index_metadata.document_count,
+        "samples": dataset.num_samples,
+        "tokens": dataset.index_metadata.token_count,
+    }
+    if actual_counts != expected_counts:
+        raise ValueError(
+            "production MMIDIDX counts do not match objective totals: "
+            f"expected={expected_counts}, actual={actual_counts}"
         )
     _assert_artifacts_unchanged(root, validated.artifact_stats)
     return dataset
@@ -564,14 +597,14 @@ def _validate_bundle(
     )
 
     tokenizer_digest = _validate_tokenizer(root, manifest, artifacts)
-    _validate_data_contracts(root, manifest, artifacts)
+    production_target = _validate_data_contracts(root, manifest, artifacts)
     source_composition = _validate_source_composition(
         root, manifest, artifacts
     )
     source_sha, repaired_sha, repaired_by_bucket = _validate_source_manifests(
         root, manifest, artifacts
     )
-    if manifest.get("schema") == _BUNDLE_SCHEMA:
+    if manifest.get("schema") in {_ROUTED_BUNDLE_SCHEMA, _BUNDLE_SCHEMA}:
         _validate_source_routes(root, manifest, artifacts)
     ci = _validate_ci_production_acquisition(root, manifest, artifacts)
     buckets = [int(value) for value in manifest["buckets"]]
@@ -581,6 +614,7 @@ def _validate_bundle(
         artifacts,
         buckets=buckets,
         repaired_by_bucket=repaired_by_bucket,
+        production_target=production_target,
     )
     prefixes = _validate_bucket_prefixes(
         root,
@@ -622,7 +656,11 @@ def _validate_logical_manifest(
     expected_bundle_id: str,
     bucket: int,
 ) -> dict[str, dict[str, object]]:
-    if manifest.get("schema") not in {_LEGACY_BUNDLE_SCHEMA, _BUNDLE_SCHEMA}:
+    if manifest.get("schema") not in {
+        _LEGACY_BUNDLE_SCHEMA,
+        _ROUTED_BUNDLE_SCHEMA,
+        _BUNDLE_SCHEMA,
+    }:
         raise ValueError(
             f"unsupported production bundle schema: {manifest.get('schema')!r}"
         )
@@ -706,7 +744,7 @@ def _validate_logical_manifest(
     if not expected_bundle_id.endswith(artifact_set_sha256[:16]):
         raise ValueError("expected bundle_id is not bound to the artifact set")
     _validate_source_composition_descriptor(manifest, artifacts)
-    if manifest.get("schema") == _BUNDLE_SCHEMA:
+    if manifest.get("schema") in {_ROUTED_BUNDLE_SCHEMA, _BUNDLE_SCHEMA}:
         _validate_source_routes_descriptor(manifest, artifacts)
     return artifacts
 
@@ -1449,7 +1487,7 @@ def _validate_source_routes(
         "enriched_schema_sha256",
         "symbol_identity_schema_sha256",
     }
-    buckets = set(int(value) for value in manifest["buckets"])
+    buckets = {int(value) for value in manifest["buckets"]}
     for kind in ("code", "commits"):
         staged = _require_mapping(
             staged_routes.get(kind), where=f"{kind} source route"
@@ -1712,7 +1750,9 @@ def _validate_tokenizer(
         raise ValueError("bundle tokenizer descriptor vocab size mismatch")
     tokenizer_relative = descriptor.get("path")
     if not isinstance(tokenizer_relative, str):
-        raise ValueError("bundle tokenizer path must be a string")
+        raise ValueError(  # noqa: TRY004 - malformed external manifest
+            "bundle tokenizer path must be a string"
+        )
     tokenizer_root = _safe_bundle_path(
         root, tokenizer_relative, where="tokenizer", require_file=False
     )
@@ -1757,7 +1797,7 @@ def _validate_data_contracts(
     root: Path,
     manifest: Mapping[str, Any],
     artifacts: Mapping[str, Mapping[str, object]],
-) -> None:
+) -> dict[str, Any] | None:
     descriptors = _require_mapping(
         manifest.get("data_contracts"), where="data_contracts"
     )
@@ -1765,6 +1805,10 @@ def _validate_data_contracts(
         "domain_schema": DOMAIN_SCHEMA_SHA256,
         "tokenizer_contract": TOKENIZER_CONTRACT_SHA256,
     }
+    if manifest.get("schema") == _BUNDLE_SCHEMA:
+        expected["production_objective_target"] = (
+            _PRODUCTION_OBJECTIVE_TARGET_SHA256
+        )
     if set(descriptors) != set(expected):
         raise ValueError("bundle data_contracts descriptor is incomplete")
     for name, expected_sha256 in expected.items():
@@ -1773,7 +1817,9 @@ def _validate_data_contracts(
             raise ValueError(f"bundle data contract {name} descriptor is invalid")
         relative = descriptor.get("path")
         if not isinstance(relative, str):
-            raise ValueError(f"bundle data contract {name} path is invalid")
+            raise ValueError(  # noqa: TRY004 - malformed external manifest
+                f"bundle data contract {name} path is invalid"
+            )
         _safe_bundle_path(root, relative, where=f"data contract {name}")
         expected_record = {
             "path": relative,
@@ -1784,6 +1830,21 @@ def _validate_data_contracts(
             raise ValueError(f"bundle data contract {name} is not artifact-bound")
         if descriptor.get("sha256") != expected_sha256:
             raise ValueError(f"bundle data contract {name} has a stale frozen hash")
+    if manifest.get("schema") != _BUNDLE_SCHEMA:
+        return None
+    target_descriptor = descriptors["production_objective_target"]
+    target_relative = str(target_descriptor["path"])
+    _, target = _load_json_object(
+        _safe_bundle_path(
+            root,
+            target_relative,
+            where="production objective target",
+        ),
+        where="production objective target",
+    )
+    if target.get("schema") != _PRODUCTION_OBJECTIVE_TARGET_SCHEMA:
+        raise ValueError("production objective target schema drifted")
+    return target
 
 
 def _validate_source_manifests(
@@ -1797,7 +1858,9 @@ def _validate_source_manifests(
     source_relative = descriptor.get("manifest")
     repaired_relative = descriptor.get("repaired_manifest")
     if not isinstance(source_relative, str) or not isinstance(repaired_relative, str):
-        raise ValueError("source snapshot manifest paths must be strings")
+        raise ValueError(  # noqa: TRY004 - malformed external manifest
+            "source snapshot manifest paths must be strings"
+        )
     source_record = _require_artifact(
         artifacts, source_relative, where="source manifest"
     )
@@ -1819,7 +1882,9 @@ def _validate_source_manifests(
     source_files = source.get("files")
     repaired_files = repaired.get("files")
     if not isinstance(source_files, list) or not isinstance(repaired_files, list):
-        raise ValueError("source snapshot manifests require files lists")
+        raise ValueError(  # noqa: TRY004 - malformed external manifest
+            "source snapshot manifests require files lists"
+        )
     expected_count = int(descriptor.get("file_count", -1))
     if (
         expected_count < 1
@@ -2206,7 +2271,21 @@ def _validate_objectives(
     *,
     buckets: list[int],
     repaired_by_bucket: Mapping[int, list[dict[str, Any]]],
+    production_target: Mapping[str, Any] | None = None,
 ) -> dict[int, _ObjectiveValidation]:
+    if production_target is not None:
+        sample_targets = _require_mapping(
+            production_target.get("sample_targets"),
+            where="production target samples",
+        )
+        try:
+            target_buckets = [int(value) for value in sample_targets]
+        except (TypeError, ValueError) as error:
+            raise ValueError("production target bucket keys are invalid") from error
+        if buckets != target_buckets:
+            raise ValueError(
+                "production objective buckets do not exactly cover the sealed target"
+            )
     objective_root = _require_mapping(
         manifest.get("objective_materialization"), where="objective_materialization"
     )
@@ -2299,19 +2378,22 @@ def _validate_objectives(
         ):
             raise ValueError(f"objective graph contract drifted for bucket {bucket}")
 
-        source_summary, source_records = _objective_source_summary(
-            contract.get("source_snapshot"), bucket=bucket
+        source_summary, source_records, selected_source_records = (
+            _objective_source_summary(contract.get("source_snapshot"), bucket=bucket)
         )
         if descriptor.get("source_snapshot") != source_summary:
             raise ValueError(f"objective source summary drifted for bucket {bucket}")
-        snapshot_records = repaired_by_bucket.get(bucket, [])
-        snapshot_counter = Counter(
-            (int(record["size"]), str(record["snapshot_sha256"]))
-            for record in snapshot_records
+        _validate_objective_source_binding(
+            source_records=source_records,
+            selected_source_records=selected_source_records,
+            repaired_records=repaired_by_bucket.get(bucket, []),
+            bucket=bucket,
         )
-        if source_records != snapshot_counter:
-            raise ValueError(
-                f"objective source snapshot does not match repaired snapshot for bucket {bucket}"
+        if production_target is not None:
+            _validate_production_objective_contract(
+                contract=contract,
+                bucket=bucket,
+                target=production_target,
             )
 
         artifact_relative = _require_relative_string(
@@ -2358,6 +2440,184 @@ def _validate_objectives(
             descriptor=descriptor,
         )
     return validated
+
+
+def _validate_objective_source_binding(
+    *,
+    source_records: Counter[tuple[int, str]],
+    selected_source_records: list[dict[str, object]] | None,
+    repaired_records: list[dict[str, Any]],
+    bucket: int,
+) -> None:
+    if selected_source_records is None:
+        snapshot_counter = Counter(
+            (int(record["size"]), str(record["snapshot_sha256"]))
+            for record in repaired_records
+        )
+        if source_records != snapshot_counter:
+            raise ValueError(
+                "objective source snapshot does not match repaired snapshot "
+                f"for bucket {bucket}"
+            )
+        return
+
+    selected_paths = {str(record["path"]) for record in selected_source_records}
+    actual_source_records: list[dict[str, object]] = []
+    for record in repaired_records:
+        kind = record.get("kind")
+        snapshot = record.get("snapshot")
+        if kind == "ci":
+            match = (
+                re.fullmatch(
+                    rf"ci/{bucket}/ci-case5-(train|validation|test)-"
+                    rf"{bucket}-[0-9]{{6}}\.parquet",
+                    snapshot,
+                )
+                if isinstance(snapshot, str)
+                else None
+            )
+            if match is None:
+                raise ValueError(
+                    f"repaired CI objective source path is not canonical for bucket {bucket}"
+                )
+            if match.group(1) != "train":
+                continue
+        elif snapshot not in selected_paths:
+            continue
+        actual_source_records.append(
+            {
+                "kind": kind,
+                "bucket": record.get("bucket"),
+                "path": snapshot,
+                "size": record.get("size"),
+                "sha256": record.get("snapshot_sha256"),
+                "rows": _require_positive_int(
+                    record.get("rows"),
+                    where=f"repaired objective source rows for bucket {bucket}",
+                ),
+            }
+        )
+    if sorted(actual_source_records, key=lambda record: str(record["path"])) != (
+        selected_source_records
+    ):
+        raise ValueError(
+            "objective source snapshot does not exactly match repaired snapshot "
+            f"for bucket {bucket}"
+        )
+
+
+def _validate_production_objective_contract(
+    *,
+    contract: Mapping[str, Any],
+    bucket: int,
+    target: Mapping[str, Any],
+) -> None:
+    try:
+        policy = _require_mapping(
+            target.get("materialization"), where="production target materialization"
+        )
+        snapshot = _require_mapping(
+            contract.get("source_snapshot"),
+            where=f"objective {bucket} source snapshot",
+        )
+        if snapshot.get("schema") != _OBJECTIVE_SOURCE_POOLS_SCHEMA:
+            raise ValueError(
+                f"objective {bucket} must bind the two-pool production source snapshot"
+            )
+        pools = _require_mapping(
+            snapshot.get("pools"), where=f"objective {bucket} source pools"
+        )
+        seed_pool = _require_mapping(
+            pools.get("objective_seed"),
+            where=f"objective {bucket} seed source pool",
+        )
+        seed_files = seed_pool.get("files")
+        if not isinstance(seed_files, list) or not seed_files:
+            raise ValueError(f"objective {bucket} seed source pool is empty")
+        seed_kinds: set[str] = set()
+        for raw_record in seed_files:
+            record = _require_mapping(
+                raw_record, where=f"objective {bucket} seed source file"
+            )
+            raw_path = record.get("path")
+            if not isinstance(raw_path, str):
+                raise ValueError(  # noqa: TRY004 - malformed external contract
+                    f"objective {bucket} seed source path is invalid"
+                )
+            path = PurePosixPath(raw_path)
+            if (
+                "\\" in raw_path
+                or path.is_absolute()
+                or len(path.parts) != 3
+                or path.parts[0] not in {"code", "commits", "pr"}
+                or path.parts[1] != str(bucket)
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() != raw_path
+            ):
+                raise ValueError(
+                    f"objective {bucket} seed source path is not canonical: {raw_path!r}"
+                )
+            seed_kinds.add(path.parts[0])
+        totals = _require_mapping(
+            contract.get("totals"), where=f"objective {bucket} totals"
+        )
+        selection = _require_mapping(
+            contract.get("source_selection"),
+            where=f"objective {bucket} source selection",
+        )
+        graph = _require_mapping(
+            contract.get("graph_auxiliary"), where=f"objective {bucket} graph"
+        )
+        sample_targets = _require_mapping(
+            target.get("sample_targets"), where="production target samples"
+        )
+        actual = (
+            _require_positive_int(
+                totals.get("samples"), where=f"objective {bucket} samples"
+            ),
+            _require_int(contract.get("seed"), where=f"objective {bucket} seed"),
+            _require_positive_int(
+                contract.get("quota_window_samples"),
+                where=f"objective {bucket} quota window",
+            ),
+            _require_nonnegative_int(
+                selection.get("quota_lookahead_samples"),
+                where=f"objective {bucket} quota lookahead",
+            ),
+            graph.get("relations"),
+            _require_positive_int(
+                snapshot.get("sequence_length"),
+                where=f"objective {bucket} source sequence length",
+            ),
+            sorted(seed_kinds),
+        )
+        expected = (
+            _require_positive_int(
+                sample_targets[str(bucket)],
+                where=f"production target samples for bucket {bucket}",
+            ),
+            _require_int(policy["seed"], where="production target seed"),
+            _require_positive_int(
+                policy["quota_window_samples"],
+                where="production target quota window",
+            ),
+            _require_nonnegative_int(
+                policy["quota_lookahead_samples"],
+                where="production target quota lookahead",
+            ),
+            policy["graph_relations"],
+            bucket,
+            policy["objective_seed_kinds"],
+        )
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            f"objective {bucket} cannot prove the production target"
+        ) from error
+    if actual != expected:
+        raise ValueError(
+            f"objective {bucket} differs from the approved production target: "
+            f"actual={actual!r} expected={expected!r}"
+        )
 
 
 def _validate_objective_artifact_shape(
@@ -2474,10 +2734,43 @@ def _validate_prefix_manifest(
         raise ValueError(f"bucket {bucket} prefix tokenizer contract drifted")
     if int(sidecar.get("vocab_size", -1)) != _EXPECTED_VOCAB_SIZE:
         raise ValueError(f"bucket {bucket} prefix vocab size drifted")
-    if int(sidecar.get("token_count", -1)) < 1 or int(
-        sidecar.get("document_count", -1)
-    ) != int(objective.contract["totals"]["samples"]):
-        raise ValueError(f"bucket {bucket} prefix token/document counts are invalid")
+    totals = _require_mapping(
+        objective.contract.get("totals"), where=f"objective {bucket} totals"
+    )
+    samples = _require_positive_int(
+        totals.get("samples"), where=f"objective {bucket} samples"
+    )
+    input_tokens = _require_positive_int(
+        totals.get("input_tokens"), where=f"objective {bucket} input tokens"
+    )
+    loss_tokens = _require_positive_int(
+        totals.get("loss_tokens"), where=f"objective {bucket} loss tokens"
+    )
+    token_count = _require_positive_int(
+        sidecar.get("token_count"), where=f"bucket {bucket} prefix token count"
+    )
+    document_count = _require_positive_int(
+        sidecar.get("document_count"), where=f"bucket {bucket} prefix document count"
+    )
+    trained_token_count = _require_positive_int(
+        sidecar.get("trained_token_count"),
+        where=f"bucket {bucket} prefix trained token count",
+    )
+    expected_counts = {
+        "token_count": input_tokens + samples,
+        "document_count": samples,
+        "trained_token_count": loss_tokens,
+    }
+    actual_counts = {
+        "token_count": token_count,
+        "document_count": document_count,
+        "trained_token_count": trained_token_count,
+    }
+    if actual_counts != expected_counts:
+        raise ValueError(
+            f"bucket {bucket} prefix counts drifted: "
+            f"expected={expected_counts}, actual={actual_counts}"
+        )
 
     case5 = _require_mapping(
         sidecar.get(_CASE5_RECEIPT_KEY), where=f"bucket {bucket} CASE5 receipt"
@@ -2657,7 +2950,9 @@ def _validate_restore_receipt(
 
     transport = receipt.get("transport")
     if not isinstance(transport, str):
-        raise ValueError("restore receipt transport must be an S3 URI")
+        raise ValueError(  # noqa: TRY004 - malformed external receipt
+            "restore receipt transport must be an S3 URI"
+        )
     parsed = urlparse(transport)
     expected_suffix = f"/transports/{expected_bundle_id}/transport.json"
     if (
@@ -2717,8 +3012,162 @@ def _validate_restore_receipt(
 
 def _objective_source_summary(
     raw: object, *, bucket: int
-) -> tuple[dict[str, object], Counter[tuple[int, str]]]:
+) -> tuple[
+    dict[str, object],
+    Counter[tuple[int, str]],
+    list[dict[str, object]] | None,
+]:
     source = _require_mapping(raw, where=f"objective {bucket} source snapshot")
+    if source.get("schema") == _OBJECTIVE_SOURCE_POOLS_SCHEMA:
+        expected_fields = {
+            "schema",
+            "sequence_length",
+            "algorithm",
+            "pool_order",
+            "source_pool_manifest",
+            "ci_export_receipt",
+            "pools",
+        }
+        if set(source) != expected_fields:
+            raise ValueError(
+                f"objective source snapshot fields drifted for bucket {bucket}"
+            )
+        if (
+            _require_positive_int(
+                source.get("sequence_length"),
+                where=f"objective {bucket} source sequence length",
+            )
+            != bucket
+            or source.get("algorithm") != _OBJECTIVE_SOURCE_POOL_ALGORITHM
+            or source.get("pool_order") != list(_OBJECTIVE_SOURCE_POOL_ORDER)
+        ):
+            raise ValueError(
+                f"objective source snapshot pool schedule drifted for bucket {bucket}"
+            )
+        descriptor_summaries: dict[str, dict[str, object]] = {}
+        for field, expected_path in (
+            ("source_pool_manifest", "objective_source_pool_manifest.json"),
+            ("ci_export_receipt", "ci_export_receipt.json"),
+        ):
+            descriptor = _require_mapping(
+                source.get(field), where=f"objective {bucket} {field}"
+            )
+            if set(descriptor) != {"path", "size_bytes", "sha256"}:
+                raise ValueError(
+                    f"objective source snapshot {field} fields drifted for bucket {bucket}"
+                )
+            if descriptor.get("path") != expected_path:
+                raise ValueError(
+                    f"objective source snapshot {field} path drifted for bucket {bucket}"
+                )
+            descriptor_summaries[field] = {
+                "path": expected_path,
+                "size_bytes": _require_positive_int(
+                    descriptor.get("size_bytes"),
+                    where=f"objective {bucket} {field} size",
+                ),
+                "sha256": _require_sha256(
+                    descriptor.get("sha256"),
+                    where=f"objective {bucket} {field} hash",
+                ),
+            }
+        pools = _require_mapping(
+            source.get("pools"), where=f"objective {bucket} source pools"
+        )
+        if set(pools) != set(_OBJECTIVE_SOURCE_POOL_ORDER):
+            raise ValueError(
+                f"objective source snapshot pools drifted for bucket {bucket}"
+            )
+        pool_summaries: dict[str, dict[str, object]] = {}
+        source_counter: Counter[tuple[int, str]] = Counter()
+        selected_paths: set[str] = set()
+        selected_records: list[dict[str, object]] = []
+        for name in _OBJECTIVE_SOURCE_POOL_ORDER:
+            pool = _require_mapping(
+                pools[name], where=f"objective {bucket} source pool {name}"
+            )
+            if pool.get("schema") != _OBJECTIVE_SOURCE_SCHEMA:
+                raise ValueError(
+                    f"objective source pool {name} schema drifted for bucket {bucket}"
+                )
+            summary, records, nested_paths = _objective_source_summary(
+                pool, bucket=bucket
+            )
+            if nested_paths is not None:
+                raise ValueError(
+                    f"objective source pool {name} is unexpectedly nested for bucket {bucket}"
+                )
+            pool_summaries[name] = summary
+            source_counter.update(records)
+            raw_files = pool.get("files")
+            if not isinstance(raw_files, list):
+                raise ValueError(  # noqa: TRY004 - malformed external contract
+                    f"objective source pool {name} files drifted for bucket {bucket}"
+                )
+            for raw_record in raw_files:
+                record = _require_mapping(
+                    raw_record,
+                    where=f"objective {bucket} source pool {name} file",
+                )
+                raw_path = record.get("path")
+                if not isinstance(raw_path, str):
+                    raise ValueError(  # noqa: TRY004 - malformed external contract
+                        f"objective source pool {name} path is invalid for bucket {bucket}"
+                    )
+                path = PurePosixPath(raw_path)
+                if name == "primary_ci":
+                    canonical = (
+                        len(path.parts) == 2
+                        and path.parts[0] == str(bucket)
+                        and re.fullmatch(
+                            rf"ci-case5-train-{bucket}-[0-9]{{6}}\.parquet",
+                            path.parts[1],
+                        )
+                        is not None
+                    )
+                    selected = f"ci/{raw_path}"
+                else:
+                    canonical = (
+                        len(path.parts) == 3
+                        and path.parts[0] in {"code", "commits", "pr"}
+                        and path.parts[1] == str(bucket)
+                    )
+                    selected = raw_path
+                if (
+                    "\\" in raw_path
+                    or path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in path.parts)
+                    or path.as_posix() != raw_path
+                    or not canonical
+                    or selected in selected_paths
+                ):
+                    raise ValueError(
+                        f"objective source pool {name} path is not canonical for "
+                        f"bucket {bucket}: {raw_path!r}"
+                    )
+                selected_paths.add(selected)
+                selected_records.append(
+                    {
+                        "kind": "ci" if name == "primary_ci" else path.parts[0],
+                        "bucket": bucket,
+                        "path": selected,
+                        "size": int(record["size_bytes"]),
+                        "sha256": str(record["sha256"]),
+                        "rows": int(record["rows"]),
+                    }
+                )
+        return (
+            {
+                "schema": _OBJECTIVE_SOURCE_POOLS_SCHEMA,
+                "sequence_length": bucket,
+                "algorithm": _OBJECTIVE_SOURCE_POOL_ALGORITHM,
+                "pool_order": list(_OBJECTIVE_SOURCE_POOL_ORDER),
+                **descriptor_summaries,
+                "pools": pool_summaries,
+            },
+            source_counter,
+            sorted(selected_records, key=lambda record: str(record["path"])),
+        )
     expected_fields = {
         "schema",
         "sequence_length",
@@ -2732,10 +3181,10 @@ def _objective_source_summary(
         raise ValueError(
             f"objective source snapshot fields drifted for bucket {bucket}"
         )
-    if (
-        source.get("schema") != _OBJECTIVE_SOURCE_SCHEMA
-        or source.get("sequence_length") != bucket
-    ):
+    if source.get("schema") != _OBJECTIVE_SOURCE_SCHEMA or _require_positive_int(
+        source.get("sequence_length"),
+        where=f"objective {bucket} source sequence length",
+    ) != bucket:
         raise ValueError(
             f"objective source snapshot schema/bucket drifted for {bucket}"
         )
@@ -2772,7 +3221,11 @@ def _objective_source_summary(
         file_row_counts.append(rows)
         source_counter[(size, digest)] += 1
         row_count += rows
-    if source.get("file_count") != len(files) or source.get("row_count") != row_count:
+    if _require_positive_int(
+        source.get("file_count"), where=f"objective source file count for bucket {bucket}"
+    ) != len(files) or _require_positive_int(
+        source.get("row_count"), where=f"objective source row count for bucket {bucket}"
+    ) != row_count:
         raise ValueError(
             f"objective source snapshot counts drifted for bucket {bucket}"
         )
@@ -2797,6 +3250,7 @@ def _objective_source_summary(
             "sampling": dict(sampling),
         },
         source_counter,
+        None,
     )
 
 
@@ -2843,17 +3297,35 @@ def _validate_objective_source_sampling(
 
     seed = sampling.get("seed")
     if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(f"objective source seed must be an integer for bucket {bucket}")
+        raise ValueError(  # noqa: TRY004 - malformed external contract
+            f"objective source seed must be an integer for bucket {bucket}"
+        )
     requested = _require_positive_int(
         sampling.get("requested_samples"),
         where=f"objective requested samples for bucket {bucket}",
     )
     full_passes, tail_rows = divmod(requested, row_count)
     if (
-        sampling.get("full_passes") != full_passes
-        or sampling.get("tail_rows") != tail_rows
-        or sampling.get("min_row_reuse") != full_passes
-        or sampling.get("max_row_reuse") != full_passes + int(tail_rows > 0)
+        _require_nonnegative_int(
+            sampling.get("full_passes"),
+            where=f"objective source full passes for bucket {bucket}",
+        )
+        != full_passes
+        or _require_nonnegative_int(
+            sampling.get("tail_rows"),
+            where=f"objective source tail rows for bucket {bucket}",
+        )
+        != tail_rows
+        or _require_nonnegative_int(
+            sampling.get("min_row_reuse"),
+            where=f"objective source minimum row reuse for bucket {bucket}",
+        )
+        != full_passes
+        or _require_nonnegative_int(
+            sampling.get("max_row_reuse"),
+            where=f"objective source maximum row reuse for bucket {bucket}",
+        )
+        != full_passes + int(tail_rows > 0)
     ):
         raise ValueError(f"objective source sampling drifted for bucket {bucket}")
 
@@ -2874,7 +3346,11 @@ def _validate_objective_source_sampling(
         )
     if (
         producer.get("name") != _BOUNDED_SOURCE_PRODUCER
-        or producer.get("version") != _BOUNDED_SOURCE_PRODUCER_VERSION
+        or _require_positive_int(
+            producer.get("version"),
+            where=f"objective source producer version for bucket {bucket}",
+        )
+        != _BOUNDED_SOURCE_PRODUCER_VERSION
     ):
         raise ValueError(f"objective source producer drifted for bucket {bucket}")
     raw_row_groups = producer.get("row_group_rows")
@@ -3038,7 +3514,9 @@ def _load_json_object(path: Path, *, where: str) -> tuple[bytes, dict[str, Any]]
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
     if not isinstance(payload, dict):
-        raise ValueError(f"{where} must be a JSON object: {path}")
+        raise ValueError(  # noqa: TRY004 - malformed external JSON contract
+            f"{where} must be a JSON object: {path}"
+        )
     return raw, payload
 
 
@@ -3119,7 +3597,9 @@ def _artifact_set_sha256(records: Iterable[Mapping[str, object]]) -> str:
 
 def _require_mapping(value: object, *, where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError(f"{where} must be an object")
+        raise ValueError(  # noqa: TRY004 - trust-boundary validation API
+            f"{where} must be an object"
+        )
     return value
 
 
@@ -3146,8 +3626,24 @@ def _require_relative_string(value: object, *, where: str) -> str:
     return value
 
 
+def _require_int(value: object, *, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(  # noqa: TRY004 - trust-boundary validation API
+            f"{where} must be an integer"
+        )
+    return value
+
+
+def _require_nonnegative_int(value: object, *, where: str) -> int:
+    value = _require_int(value, where=where)
+    if value < 0:
+        raise ValueError(f"{where} must be a non-negative integer")
+    return value
+
+
 def _require_positive_int(value: object, *, where: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+    value = _require_int(value, where=where)
+    if value < 1:
         raise ValueError(f"{where} must be a positive integer")
     return value
 

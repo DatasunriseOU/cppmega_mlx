@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
+import shutil
 import struct
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
-import cppmega_mlx.data.production_bundle as production_bundle
+from cppmega_mlx.data import production_bundle
 from cppmega_mlx.data.domain_schema import DOMAIN_SCHEMA_SHA256
 from cppmega_mlx.data.graph_recipe import (
     stage1_graph_recipe_binding,
@@ -26,7 +27,6 @@ from cppmega_mlx.data.tokenizer_contract import (
     TOKENIZER_CONTRACT_PATH,
     TOKENIZER_CONTRACT_SHA256,
 )
-
 
 _BUCKET = 8
 _STORAGE_BUCKET = "cppmega-production-test"
@@ -539,34 +539,39 @@ def _write_mmididx(prefix: Path, tokens: np.ndarray) -> None:
         np.asarray([0, 1], dtype=np.int64).tofile(handle)
 
 
-def _sidecar_values(name: str) -> np.ndarray:
+def _sidecar_values(name: str, *, token_count: int = _BUCKET) -> np.ndarray:
     if name == "loss_mask":
-        return np.asarray([1, 1, 1, 0, 1, 1, 1, 1], dtype=np.uint8)
+        values = np.ones(token_count, dtype=np.uint8)
+        values[token_count // 2 - 1] = 0
+        values[-1] = 0
+        return values
     if name == "doc_ids":
-        return np.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.uint32)
+        return (np.arange(token_count) >= token_count // 2).astype(np.uint32)
     if name == "token_domain_ids":
-        return np.full(_BUCKET, 3, dtype=np.uint16)
+        return np.full(token_count, 3, dtype=np.uint16)
     if name == "token_role_ids":
-        return np.full(_BUCKET, 2, dtype=np.uint16)
+        return np.full(token_count, 2, dtype=np.uint16)
     if name == "token_source_doc_ids":
-        return np.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.uint32)
+        return (np.arange(token_count) >= token_count // 2).astype(np.uint32)
     if name == "token_source_identity_ids":
-        return np.ones(_BUCKET, dtype=np.uint64)
+        return np.ones(token_count, dtype=np.uint64)
     if name == "token_confidence_ids":
-        return np.ones(_BUCKET, dtype=np.uint8)
+        return np.ones(token_count, dtype=np.uint8)
     if name == "token_structure_ids":
-        return np.arange(1, _BUCKET + 1, dtype=np.uint8)
-    return np.zeros(_BUCKET, dtype=_DTYPES[_TOKEN_SIDECAR_DTYPES[name]])
+        return (np.arange(token_count, dtype=np.uint32) + 1).astype(np.uint8)
+    return np.zeros(token_count, dtype=_DTYPES[_TOKEN_SIDECAR_DTYPES[name]])
 
 
 def _write_token_sidecars(
     prefix: Path,
+    *,
+    token_count: int = _BUCKET,
 ) -> tuple[dict[str, dict[str, str]], dict[str, Path]]:
     specs: dict[str, dict[str, str]] = {}
     paths: dict[str, Path] = {}
     for name, dtype in _TOKEN_SIDECAR_DTYPES.items():
         path = prefix.with_name(f"{prefix.name}_{name}.bin")
-        _sidecar_values(name).tofile(path)
+        _sidecar_values(name, token_count=token_count).tofile(path)
         specs[name] = {"path": path.name, "dtype": dtype}
         paths[name] = path
     return specs, paths
@@ -636,7 +641,10 @@ def _write_graph_sidecars(prefix: Path) -> dict[str, dict[str, object]]:
 
 
 def _build_bundle(
-    tmp_path: Path, *, bounded_source_sampling: bool = False
+    tmp_path: Path,
+    *,
+    bounded_source_sampling: bool = False,
+    prefix_count_overrides: dict[str, int] | None = None,
 ) -> _BundleFixture:
     root = tmp_path / "bundle"
     prefix = root / _PREFIX_RELATIVE
@@ -856,6 +864,7 @@ def _build_bundle(
         "dtype": "int32",
         "token_count": _BUCKET,
         "document_count": 1,
+        "trained_token_count": 6,
         "vocab_size": 65536,
         "tokenizer_contract": "megacpp",
         "symbol_identity_schema_version": 3,
@@ -905,6 +914,8 @@ def _build_bundle(
             "artifact_file_sha256": _sha256(artifact_path),
         },
     }
+    if prefix_count_overrides:
+        sidecar.update(prefix_count_overrides)
     _write_json(prefix.with_suffix(".json"), sidecar)
 
     tokenizer_records = [
@@ -1016,13 +1027,546 @@ def _build_bundle(
     )
 
 
-def _open(fixture: _BundleFixture):
+def _build_v5_bundle(tmp_path: Path) -> _BundleFixture:
+    fixture = _build_bundle(tmp_path)
+    root = fixture.root
+    manifest_path = root / "manifest.json"
+    restore_receipt = root / "restore_receipt.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    restore = json.loads(restore_receipt.read_text(encoding="utf-8"))
+    provenance = root / "provenance"
+    base_contract_path = provenance / "objective_contract_seq8.json"
+    base_artifact_path = provenance / "objective_artifact_seq8.json"
+    base_contract = json.loads(base_contract_path.read_text(encoding="utf-8"))
+    base_artifact = json.loads(base_artifact_path.read_text(encoding="utf-8"))
+    base_sidecar = json.loads(fixture.prefix.with_suffix(".json").read_text())
+
+    target_source = (
+        Path(__file__).resolve().parents[1]
+        / "configs/production_objective_materialization_target.json"
+    )
+    target_path = root / "contracts" / target_source.name
+    target_path.write_bytes(target_source.read_bytes())
+    target = json.loads(target_path.read_text(encoding="utf-8"))
+    sample_targets = target["sample_targets"]
+    buckets = [int(value) for value in sample_targets]
+    source_specs = {
+        (kind, bucket): {
+            "size": len(payload := f"{kind}:{bucket}".encode()),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for bucket in buckets
+        for kind in ("ci", "code", "commits")
+    }
+
+    shutil.rmtree(root / "data")
+    base_contract_path.unlink()
+    base_artifact_path.unlink()
+
+    composition = manifest["source_snapshot"]["source_composition"]
+    composition_receipt_path = root / composition["receipt"]["path"]
+    composition_receipt = json.loads(
+        composition_receipt_path.read_text(encoding="utf-8")
+    )
+    allowlist_counts = {
+        f"{kind}/{bucket}": 1
+        for kind in ("code", "commits")
+        for bucket in buckets
+    }
+    composition_receipt["buckets"] = buckets
+    composition_receipt["coverage"]["allowlist_counts"] = allowlist_counts
+    composition_receipt["runs"][0]["allowlist_counts"] = allowlist_counts
+    _write_json(composition_receipt_path, composition_receipt)
+    composition["receipt"]["sha256"] = _sha256(composition_receipt_path)
+
+    count_keys = (
+        "rows",
+        "valid_tokens",
+        "trained_tokens",
+        "documents",
+        "capacity_tokens",
+    )
+    route_implementation = {
+        "router_sha256": "1" * 64,
+        "packer_sha256": "2" * 64,
+        "packed_schema_sha256": "3" * 64,
+        "enriched_schema_sha256": "4" * 64,
+        "symbol_identity_schema_sha256": "5" * 64,
+    }
+    route_descriptors: dict[str, dict[str, object]] = {}
+    route_bindings: dict[str, dict[str, object]] = {}
+    source_files: list[dict[str, object]] = []
+    routes_root = provenance / "source_routes"
+    routes_root.mkdir()
+    for kind in ("code", "commits"):
+        output_root = Path(f"/immutable-source/{kind}")
+        file_receipts: list[dict[str, object]] = []
+        output_inventory: list[dict[str, str]] = []
+        totals = {
+            name: {key: 0 for key in count_keys}
+            for name in (
+                "source",
+                "primary",
+                "aux_python",
+                "excluded_non_primary",
+            )
+        }
+        input_inventory_sha256 = hashlib.sha256(f"{kind}:input".encode()).hexdigest()
+        for bucket in buckets:
+            spec = source_specs[(kind, bucket)]
+            source_path = f"{bucket}/{kind}.parquet"
+            source_counts = {key: 1 for key in count_keys}
+            empty_counts = {key: 0 for key in count_keys}
+            routes = {
+                "primary": {
+                    "path": f"primary/{source_path}",
+                    "sha256": spec["sha256"],
+                    "size": spec["size"],
+                    **source_counts,
+                },
+                "aux_python": {
+                    "path": f"aux_python/{source_path}",
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "size": 0,
+                    **empty_counts,
+                },
+                "excluded_non_primary": {
+                    "path": f"excluded_non_primary/{source_path}",
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "size": 0,
+                    **empty_counts,
+                },
+            }
+            file_receipts.append(
+                {
+                    "schema": "cppmega_packed_source_route_v2",
+                    "status": "complete",
+                    "unresolved_count": 0,
+                    "implementation": route_implementation,
+                    "input": {"path": source_path, **source_counts},
+                    "routes": routes,
+                }
+            )
+            for name, counts in (("source", source_counts), *routes.items()):
+                for key in count_keys:
+                    totals[name][key] += int(counts[key])
+            output_inventory.extend(
+                {
+                    "route": name,
+                    "path": str(route["path"]),
+                    "sha256": str(route["sha256"]),
+                }
+                for name, route in routes.items()
+            )
+            source_files.append(
+                {
+                    "kind": kind,
+                    "bucket": bucket,
+                    "source": str((output_root / "primary" / source_path).resolve()),
+                    "snapshot": f"{kind}/{bucket}/{kind}.parquet",
+                    "size": spec["size"],
+                    "mtime_ns": 1,
+                    "sha256": spec["sha256"],
+                    "rows": 1,
+                }
+            )
+        output_inventory_sha256 = _canonical_sha256(output_inventory)
+        route_receipt = {
+            "schema": "cppmega_packed_source_route_v2",
+            "status": "complete",
+            "unresolved_count": 0,
+            "implementation": route_implementation,
+            "input_inventory_sha256": input_inventory_sha256,
+            "output_inventory_sha256": output_inventory_sha256,
+            "input_receipt": {
+                "path": "input_receipt.json",
+                "sha256": "6" * 64,
+                "source_inventory_sha256": input_inventory_sha256,
+            },
+            "output_root": str(output_root),
+            "files": file_receipts,
+            "totals": totals,
+        }
+        route_path = routes_root / f"{kind}.json"
+        _write_json(route_path, route_receipt)
+        route_sha256 = _sha256(route_path)
+        route_descriptors[kind] = {
+            "path": route_path.relative_to(root).as_posix(),
+            "sha256": route_sha256,
+            "route_schema": "cppmega_packed_source_route_v2",
+            "input_inventory_sha256": input_inventory_sha256,
+            "output_inventory_sha256": output_inventory_sha256,
+            "primary": totals["primary"],
+        }
+        route_bindings[kind] = {
+            "schema": "cppmega_packed_source_route_v2",
+            "kind": kind,
+            "receipt_sha256": route_sha256,
+            "input_inventory_sha256": input_inventory_sha256,
+            "output_inventory_sha256": output_inventory_sha256,
+            "implementation": route_implementation,
+            "totals": totals,
+        }
+
+    ci_descriptor = manifest["source_snapshot"]["ci_manifest"]
+    ci_path = root / ci_descriptor["path"]
+    ci = json.loads(ci_path.read_text(encoding="utf-8"))
+    ci_artifacts = [
+        {
+            "path": f"{bucket}/ci-case5-train-{bucket}-000000.parquet",
+            "kind": "case5_parquet",
+            "bucket": bucket,
+            "split": "train",
+            "rows": 1,
+            "byte_size": source_specs[("ci", bucket)]["size"],
+            "sha256": source_specs[("ci", bucket)]["sha256"],
+        }
+        for bucket in buckets
+    ]
+    ci["artifacts"] = ci_artifacts + [
+        record for record in ci["artifacts"] if record["kind"] != "case5_parquet"
+    ]
+    ci["case5_contract"]["buckets"] = buckets
+    ci["counts"]["fragments"] = len(buckets)
+    ci["counts"]["valid_tokens"] = sum(bucket - 1 for bucket in buckets)
+    ci["counts"]["trained_tokens"] = ci["counts"]["valid_tokens"]
+    ci["counts"]["capacity_tokens"] = sum(buckets)
+    _write_json(ci_path, ci)
+    ci_descriptor.update(
+        {
+            "sha256": _sha256(ci_path),
+            "fragments": len(buckets),
+            "valid_tokens": ci["counts"]["valid_tokens"],
+        }
+    )
+
+    source_files.extend(
+        {
+            "kind": "ci",
+            "bucket": bucket,
+            "source": (
+                f"/immutable-source/ci/{bucket}/"
+                f"ci-case5-train-{bucket}-000000.parquet"
+            ),
+            "snapshot": f"ci/{bucket}/ci-case5-train-{bucket}-000000.parquet",
+            "size": source_specs[("ci", bucket)]["size"],
+            "mtime_ns": 1,
+            "sha256": source_specs[("ci", bucket)]["sha256"],
+            "rows": 1,
+        }
+        for bucket in buckets
+    )
+    source_files.sort(key=lambda record: (str(record["kind"]), int(record["bucket"])))
+    repaired_files = [
+        {
+            "kind": record["kind"],
+            "bucket": record["bucket"],
+            "snapshot": record["snapshot"],
+            "size": record["size"],
+            "source_sha256": record["sha256"],
+            "snapshot_sha256": record["sha256"],
+            "boundary_repaired": False,
+            "rows": record["rows"],
+        }
+        for record in source_files
+    ]
+    source_manifest_path = provenance / "source_manifest.json"
+    repaired_manifest_path = provenance / "repaired_snapshot_manifest.json"
+    _write_json(
+        source_manifest_path,
+        {
+            "schema": "cppmega_parquet_snapshot_v1",
+            "file_count": len(source_files),
+            "files": source_files,
+            "source_routes": route_bindings,
+        },
+    )
+    _write_json(
+        repaired_manifest_path,
+        {
+            "schema": "cppmega_repaired_parquet_snapshot_v1",
+            "file_count": len(repaired_files),
+            "changed_files": 0,
+            "files": repaired_files,
+        },
+    )
+
+    policy = target["materialization"]
+    objective_descriptors: dict[str, dict[str, object]] = {}
+    bucket_results: list[dict[str, object]] = []
+    prefix_manifest_paths: list[Path] = []
+    selected_sidecar_paths: dict[str, Path] = {}
+    selected_prefix: Path | None = None
+
+    def source_pool(
+        bucket: int, records: list[tuple[str, dict[str, object]]]
+    ) -> dict[str, object]:
+        files = [
+            {
+                "path": path,
+                "size_bytes": spec["size"],
+                "sha256": spec["sha256"],
+                "rows": 1,
+            }
+            for path, spec in records
+        ]
+        row_count = len(files)
+        return {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": bucket,
+            "file_count": len(files),
+            "row_count": row_count,
+            "files": files,
+            "sampling": {
+                "mode": "deterministic_epoch_shuffle_v1",
+                "seed": policy["seed"],
+                "requested_samples": row_count,
+                "full_passes": 1,
+                "tail_rows": 0,
+                "min_row_reuse": 1,
+                "max_row_reuse": 1,
+            },
+            "artifact_set_sha256": _artifact_set_sha256(
+                [
+                    {
+                        "path": record["path"],
+                        "size": record["size_bytes"],
+                        "sha256": record["sha256"],
+                    }
+                    for record in files
+                ]
+            ),
+        }
+
+    for bucket in buckets:
+        source_snapshot = {
+            "schema": "cppmega_objective_source_snapshot_v2",
+            "sequence_length": bucket,
+            "algorithm": "alternate_primary_seed_v1",
+            "pool_order": ["primary_ci", "objective_seed"],
+            "source_pool_manifest": {
+                "path": "objective_source_pool_manifest.json",
+                "size_bytes": 1,
+                "sha256": "a" * 64,
+            },
+            "ci_export_receipt": {
+                "path": "ci_export_receipt.json",
+                "size_bytes": 1,
+                "sha256": "b" * 64,
+            },
+            "pools": {
+                "primary_ci": source_pool(
+                    bucket,
+                    [
+                        (
+                            f"{bucket}/ci-case5-train-{bucket}-000000.parquet",
+                            source_specs[("ci", bucket)],
+                        )
+                    ],
+                ),
+                "objective_seed": source_pool(
+                    bucket,
+                    [
+                        (
+                            f"{kind}/{bucket}/{kind}.parquet",
+                            source_specs[(kind, bucket)],
+                        )
+                        for kind in ("code", "commits")
+                    ],
+                ),
+            },
+        }
+        source_summary, _, _ = production_bundle._objective_source_summary(
+            source_snapshot, bucket=bucket
+        )
+        contract = json.loads(json.dumps(base_contract))
+        samples = int(sample_targets[str(bucket)])
+        contract.update(
+            {
+                "seed": policy["seed"],
+                "quota_window_samples": policy["quota_window_samples"],
+                "source_selection": {
+                    "quota_lookahead_samples": policy["quota_lookahead_samples"]
+                },
+                "totals": {
+                    "samples": samples,
+                    "input_tokens": samples * (bucket - 1),
+                    "loss_tokens": samples * (bucket - 2),
+                },
+                "source_snapshot": source_snapshot,
+            }
+        )
+        contract_path = provenance / f"objective_contract_seq{bucket}.json"
+        _write_json(contract_path, contract)
+        contract_sha256 = _canonical_sha256(contract)
+
+        artifact = json.loads(json.dumps(base_artifact))
+        artifact.pop("artifact_set_sha256")
+        artifact["documents"] = samples
+        artifact["objective_contract"] = {
+            "path": "objective_contract.json",
+            "sha256": contract_sha256,
+            "size_bytes": contract_path.stat().st_size,
+            "file_sha256": _sha256(contract_path),
+        }
+        artifact["artifact_set_sha256"] = _canonical_sha256(artifact)
+        artifact_path = provenance / f"objective_artifact_seq{bucket}.json"
+        _write_json(artifact_path, artifact)
+        objective_descriptors[str(bucket)] = {
+            "artifact_path": artifact_path.relative_to(root).as_posix(),
+            "artifact_schema": "cppmega_objective_materialization_artifact_v2",
+            "artifact_set_sha256": artifact["artifact_set_sha256"],
+            "artifact_file_sha256": _sha256(artifact_path),
+            "contract_path": contract_path.relative_to(root).as_posix(),
+            "contract_schema": "cppmega_pre_materialized_objectives_v1",
+            "contract_sha256": contract_sha256,
+            "contract_file_sha256": _sha256(contract_path),
+            "source_snapshot": source_summary,
+        }
+
+        relative = f"data/seq{bucket}/cppmega_macro_routes_seq{bucket}_train"
+        prefix = root / relative
+        prefix.parent.mkdir(parents=True)
+        _write_mmididx(prefix, np.arange(2, bucket + 2, dtype=np.int32))
+        sidecar_specs, sidecar_paths = _write_token_sidecars(
+            prefix, token_count=bucket
+        )
+        graph_specs = _write_graph_sidecars(prefix)
+        registry_path = prefix.with_name(f"{prefix.name}_source_identity.sqlite")
+        registry_path.write_bytes(b"verified-registry-fixture")
+        objective_ids_path = prefix.with_name(f"{prefix.name}_objective_ids.bin")
+        objective_ids_path.write_bytes(b"\x01")
+        sequence_platform_path = prefix.with_name(
+            f"{prefix.name}_source_platform_sequence_offsets.bin"
+        )
+        document_platform_path = prefix.with_name(
+            f"{prefix.name}_source_platform_document_offsets.bin"
+        )
+        platform_ids_path = prefix.with_name(f"{prefix.name}_source_platform_ids.bin")
+        np.asarray([0, 1], dtype=np.int64).tofile(sequence_platform_path)
+        np.asarray([0, 1], dtype=np.int64).tofile(document_platform_path)
+        np.asarray([1], dtype=np.uint16).tofile(platform_ids_path)
+
+        sidecar = json.loads(json.dumps(base_sidecar))
+        sidecar.update(
+            {
+                "token_count": samples * bucket,
+                "document_count": samples,
+                "trained_token_count": samples * (bucket - 2),
+                "side_channel_paths": sidecar_specs,
+                "graph_sidecar_paths": graph_specs,
+                "objective_contract": {
+                    "schema": "cppmega_pre_materialized_objectives_v1",
+                    "sha256": contract_sha256,
+                    "payload": contract,
+                    "objective_id_sidecar": {
+                        "path": objective_ids_path.name,
+                        "dtype": "uint8",
+                        "document_aligned": True,
+                    },
+                },
+                "objective_materialization": {
+                    **artifact,
+                    "artifact_file_sha256": _sha256(artifact_path),
+                },
+            }
+        )
+        sidecar["source_identity_registry"]["path"] = registry_path.name
+        sidecar["source_platform_sidecar"].update(
+            {
+                "sequence_doc_offsets_path": sequence_platform_path.name,
+                "doc_platform_offsets_path": document_platform_path.name,
+                "platform_ids_path": platform_ids_path.name,
+            }
+        )
+        prefix_manifest_path = prefix.with_suffix(".json")
+        _write_json(prefix_manifest_path, sidecar)
+        prefix_manifest_paths.append(prefix_manifest_path)
+        bucket_results.append(
+            {"bucket": bucket, "prefix": relative, "manifest": sidecar}
+        )
+        if selected_prefix is None:
+            selected_prefix = prefix
+            selected_sidecar_paths = sidecar_paths
+
+    target_relative = target_path.relative_to(root).as_posix()
+    manifest["schema"] = "cppmega_megatron_bundle_v5"
+    manifest["data_contracts"]["production_objective_target"] = {
+        "path": target_relative,
+        "size": target_path.stat().st_size,
+        "sha256": _sha256(target_path),
+    }
+    manifest["objective_materialization"]["buckets"] = objective_descriptors
+    manifest["source_snapshot"].update(
+        {
+            "file_count": len(source_files),
+            "source_composition": composition,
+            "source_routes": {
+                "schema": "cppmega_packed_source_primary_routes_v1",
+                "policy": "primary-only-code-and-commit-snapshot",
+                "routes": route_descriptors,
+            },
+            "ci_manifest": ci_descriptor,
+        }
+    )
+    manifest["buckets"] = buckets
+    manifest["bucket_results"] = bucket_results
+    artifacts = _artifact_records(root)
+    artifact_set_sha256 = _artifact_set_sha256(artifacts)
+    bundle_id = f"fixture-bundle-{artifact_set_sha256[:16]}"
+    manifest.update(
+        {
+            "bundle_id": bundle_id,
+            "artifacts": artifacts,
+            "artifact_set_sha256": artifact_set_sha256,
+            "artifact_count": len(artifacts),
+            "artifact_bytes": sum(int(record["size"]) for record in artifacts),
+        }
+    )
+    _write_json(manifest_path, manifest)
+
+    binding = restore["binding"]
+    binding.update(
+        {
+            "bundle_id": bundle_id,
+            "artifact_set_sha256": artifact_set_sha256,
+            "prefix_manifest_sha256s": {
+                path.relative_to(root).as_posix(): _sha256(path)
+                for path in prefix_manifest_paths
+            },
+        }
+    )
+    restore.update(
+        {
+            "bundle_id": bundle_id,
+            "transport": (
+                f"s3://{_STORAGE_BUCKET}/cppmega/transports/"
+                f"{bundle_id}/transport.json"
+            ),
+            "logical_manifest_sha256": _sha256(manifest_path),
+            "artifact_set_sha256": artifact_set_sha256,
+            "artifact_count": len(artifacts),
+            "artifact_bytes": sum(int(record["size"]) for record in artifacts),
+        }
+    )
+    _write_json(restore_receipt, restore)
+    assert selected_prefix is not None
+    return _BundleFixture(
+        root=root,
+        bundle_id=bundle_id,
+        prefix=selected_prefix,
+        restore_receipt=restore_receipt,
+        sidecar_paths=selected_sidecar_paths,
+    )
+
+
+def _open(fixture: _BundleFixture, *, bucket: int = _BUCKET):
     return open_production_megatron_bundle(
         fixture.root,
-        _BUCKET,
+        bucket,
         fixture.bundle_id,
         restore_receipt=fixture.restore_receipt,
-        seq_len=_BUCKET,
+        seq_len=bucket,
         batch_size=1,
         hash_jobs=2,
     )
@@ -1102,6 +1646,52 @@ def test_open_production_megatron_bundle_records_validated_provenance(
     assert tuple(batch.tokens.shape) == (1, _BUCKET)
     assert batch.document_ids is not None
     assert batch.graph_batch is not None
+
+
+@pytest.mark.mlx_runtime
+def test_open_v5_bundle_rejects_index_count_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_v5_bundle(tmp_path)
+    manifest = json.loads((fixture.root / "manifest.json").read_text(encoding="utf-8"))
+    buckets = [1024, 2048, 4096, 8192, 16384]
+    source_summary = manifest["objective_materialization"]["buckets"]["1024"][
+        "source_snapshot"
+    ]
+
+    assert manifest["schema"] == "cppmega_megatron_bundle_v5"
+    assert manifest["buckets"] == buckets
+    assert source_summary["schema"] == "cppmega_objective_source_snapshot_v2"
+    assert "artifact_set_sha256" not in source_summary
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"production MMIDIDX counts do not match objective totals: "
+            r"expected=\{'sequences': 281580, 'documents': 281580, "
+            r"'samples': 281580, 'tokens': 288337920\}, "
+            r"actual=\{'sequences': 1, 'documents': 1, 'samples': 1, "
+            r"'tokens': 1024\}"
+        ),
+    ):
+        _open(fixture, bucket=1024)
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"token_count": _BUCKET - 1},
+        {"trained_token_count": 5},
+    ],
+)
+def test_open_rejects_prefix_token_accounting_drift(
+    tmp_path: Path,
+    counts: dict[str, int],
+) -> None:
+    fixture = _build_bundle(tmp_path, prefix_count_overrides=counts)
+
+    with pytest.raises(ValueError, match=r"bucket 8 prefix counts drifted"):
+        _open(fixture)
 
 
 def test_ci_ingress_rejects_legacy_fetch_state(tmp_path: Path) -> None:
@@ -1273,6 +1863,343 @@ def test_v4_bundle_without_primary_source_routes_is_rejected(tmp_path: Path) -> 
             manifest,
             expected_bundle_id=fixture.bundle_id,
             bucket=_BUCKET,
+        )
+
+
+def test_v5_data_contracts_bind_the_target_without_changing_v4(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "bundle"
+    contracts = root / "contracts"
+    contracts.mkdir(parents=True)
+    sources = {
+        "domain_schema": (
+            Path(production_bundle.__file__).with_name("domain_schema_v1.json")
+        ),
+        "tokenizer_contract": TOKENIZER_CONTRACT_PATH,
+        "production_objective_target": (
+            Path(__file__).resolve().parents[1]
+            / "configs/production_objective_materialization_target.json"
+        ),
+    }
+    descriptors: dict[str, dict[str, object]] = {}
+    artifacts: dict[str, dict[str, object]] = {}
+    for name, source in sources.items():
+        target = contracts / source.name
+        target.write_bytes(source.read_bytes())
+        relative = target.relative_to(root).as_posix()
+        descriptor = {
+            "path": relative,
+            "size": target.stat().st_size,
+            "sha256": _sha256(target),
+        }
+        descriptors[name] = descriptor
+        artifacts[relative] = descriptor
+
+    manifest = {
+        "schema": "cppmega_megatron_bundle_v4",
+        "data_contracts": {
+            name: descriptor
+            for name, descriptor in descriptors.items()
+            if name != "production_objective_target"
+        },
+    }
+    assert production_bundle._validate_data_contracts(root, manifest, artifacts) is None
+
+    manifest = {
+        "schema": "cppmega_megatron_bundle_v5",
+        "data_contracts": descriptors,
+    }
+    assert production_bundle._validate_data_contracts(root, manifest, artifacts) == (
+        json.loads(sources["production_objective_target"].read_text(encoding="utf-8"))
+    )
+
+    del descriptors["production_objective_target"]
+    with pytest.raises(ValueError, match="data_contracts descriptor is incomplete"):
+        production_bundle._validate_data_contracts(root, manifest, artifacts)
+
+    target_relative = "contracts/production_objective_materialization_target.json"
+    stale = {
+        **artifacts[target_relative],
+        "sha256": "0" * 64,
+    }
+    descriptors["production_objective_target"] = stale
+    artifacts[target_relative] = stale
+    with pytest.raises(ValueError, match="stale frozen hash"):
+        production_bundle._validate_data_contracts(root, manifest, artifacts)
+
+
+def test_two_pool_objective_source_snapshot_selects_only_bound_training_inputs() -> None:
+    def pool(path: str, payload: bytes) -> dict[str, object]:
+        record = {
+            "path": path,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "rows": 1,
+        }
+        return {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": 1024,
+            "file_count": 1,
+            "row_count": 1,
+            "files": [record],
+            "sampling": {
+                "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+                "seed": 17,
+                "requested_samples": 1,
+                "full_passes": 1,
+                "tail_rows": 0,
+                "min_row_reuse": 1,
+                "max_row_reuse": 1,
+                "record_batch_rows": 1,
+                "producer": {
+                    "name": "pyarrow.parquet.ParquetFile.iter_batches",
+                    "version": 1,
+                    "row_group_rows": [[1]],
+                },
+                "ordering": dict(production_bundle._BOUNDED_SOURCE_ORDERING),
+                "cursor_semantics": "last_yielded_row_v1",
+                "final_cursor": {
+                    "epoch": 0,
+                    "shard_position": 0,
+                    "shard_index": 0,
+                    "row_group_position": 0,
+                    "row_group_index": 0,
+                    "record_batch_index": 0,
+                    "row_shuffle_position": 0,
+                    "row_index_in_record_batch": 0,
+                    "source_index": 0,
+                },
+            },
+            "artifact_set_sha256": _artifact_set_sha256(
+                [
+                    {
+                        "path": path,
+                        "size": len(payload),
+                        "sha256": record["sha256"],
+                    }
+                ]
+            ),
+        }
+
+    source = {
+        "schema": "cppmega_objective_source_snapshot_v2",
+        "sequence_length": 1024,
+        "algorithm": "alternate_primary_seed_v1",
+        "pool_order": ["primary_ci", "objective_seed"],
+        "source_pool_manifest": {
+            "path": "objective_source_pool_manifest.json",
+            "size_bytes": 1,
+            "sha256": "a" * 64,
+        },
+        "ci_export_receipt": {
+            "path": "ci_export_receipt.json",
+            "size_bytes": 1,
+            "sha256": "b" * 64,
+        },
+        "pools": {
+            "primary_ci": pool(
+                "1024/ci-case5-train-1024-000000.parquet", b"ci"
+            ),
+            "objective_seed": pool("code/1024/code.parquet", b"code"),
+        },
+    }
+
+    summary, records, selected = production_bundle._objective_source_summary(
+        source, bucket=1024
+    )
+
+    assert summary["schema"] == "cppmega_objective_source_snapshot_v2"
+    assert sum(records.values()) == 2
+    assert selected is not None
+    assert [record["path"] for record in selected] == [
+        "ci/1024/ci-case5-train-1024-000000.parquet",
+        "code/1024/code.parquet",
+    ]
+    for path in (
+        ("sequence_length",),
+        ("pools", "primary_ci", "sequence_length"),
+        ("pools", "primary_ci", "file_count"),
+        ("pools", "primary_ci", "row_count"),
+        ("pools", "primary_ci", "sampling", "full_passes"),
+        ("pools", "primary_ci", "sampling", "tail_rows"),
+        ("pools", "primary_ci", "sampling", "min_row_reuse"),
+        ("pools", "primary_ci", "sampling", "max_row_reuse"),
+        ("pools", "primary_ci", "sampling", "producer", "version"),
+    ):
+        drifted = json.loads(json.dumps(source))
+        parent = drifted
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = float(parent[path[-1]])
+        with pytest.raises(ValueError, match="integer"):
+            production_bundle._objective_source_summary(drifted, bucket=1024)
+    repaired = [
+        {
+            "kind": record["kind"],
+            "bucket": record["bucket"],
+            "snapshot": record["path"],
+            "size": record["size"],
+            "snapshot_sha256": record["sha256"],
+            "rows": record["rows"],
+        }
+        for record in selected
+    ]
+    repaired.append(
+        {
+            "kind": "ci",
+            "bucket": 1024,
+            "snapshot": "ci/1024/ci-case5-validation-1024-000001.parquet",
+            "size": 1,
+            "snapshot_sha256": "c" * 64,
+            "rows": 1,
+        }
+    )
+    production_bundle._validate_objective_source_binding(
+        source_records=records,
+        selected_source_records=selected,
+        repaired_records=repaired,
+        bucket=1024,
+    )
+
+    extra_train = json.loads(json.dumps(repaired))
+    extra_train.append(
+        {
+            "kind": "ci",
+            "bucket": 1024,
+            "snapshot": "ci/1024/ci-case5-train-1024-000001.parquet",
+            "size": 1,
+            "snapshot_sha256": "d" * 64,
+            "rows": 1,
+        }
+    )
+    with pytest.raises(ValueError, match="does not exactly match"):
+        production_bundle._validate_objective_source_binding(
+            source_records=records,
+            selected_source_records=selected,
+            repaired_records=extra_train,
+            bucket=1024,
+        )
+
+    malformed_ci = json.loads(json.dumps(repaired))
+    malformed_ci[-1]["snapshot"] = "ci/1024/unbound.parquet"
+    with pytest.raises(ValueError, match="CI objective source path is not canonical"):
+        production_bundle._validate_objective_source_binding(
+            source_records=records,
+            selected_source_records=selected,
+            repaired_records=malformed_ci,
+            bucket=1024,
+        )
+
+    for field, value in (("kind", "commits"), ("rows", 2)):
+        drifted = json.loads(json.dumps(repaired))
+        drifted[0][field] = value
+        with pytest.raises(ValueError, match="does not exactly match"):
+            production_bundle._validate_objective_source_binding(
+                source_records=records,
+                selected_source_records=selected,
+                repaired_records=drifted,
+                bucket=1024,
+            )
+    with pytest.raises(ValueError, match="does not exactly match"):
+        production_bundle._validate_objective_source_binding(
+            source_records=records,
+            selected_source_records=selected,
+            repaired_records=repaired[1:],
+            bucket=1024,
+        )
+
+
+def test_production_target_semantics_are_checked_by_the_mlx_consumer() -> None:
+    target = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs/production_objective_materialization_target.json"
+        ).read_text(encoding="utf-8")
+    )
+    with pytest.raises(ValueError, match="exactly cover the sealed target"):
+        production_bundle._validate_objectives(
+            Path(),
+            {},
+            {},
+            buckets=[1024],
+            repaired_by_bucket={},
+            production_target=target,
+        )
+    contract = {
+        "seed": 17,
+        "quota_window_samples": 60,
+        "totals": {"samples": 281580},
+        "source_selection": {"quota_lookahead_samples": 180},
+        "graph_auxiliary": {
+            "relations": target["materialization"]["graph_relations"]
+        },
+        "source_snapshot": {
+            "schema": "cppmega_objective_source_snapshot_v2",
+            "sequence_length": 1024,
+            "pools": {
+                "objective_seed": {
+                    "files": [
+                        {"path": "code/1024/code.parquet"},
+                        {"path": "commits/1024/commits.parquet"},
+                    ]
+                }
+            },
+        },
+    }
+
+    production_bundle._validate_production_objective_contract(
+        contract=contract,
+        bucket=1024,
+        target=target,
+    )
+
+    for path in (
+        ("totals", "samples"),
+        ("seed",),
+        ("quota_window_samples",),
+        ("source_selection", "quota_lookahead_samples"),
+        ("source_snapshot", "sequence_length"),
+    ):
+        drifted = json.loads(json.dumps(contract))
+        parent = drifted
+        for name in path[:-1]:
+            parent = parent[name]
+        parent[path[-1]] = float(parent[path[-1]])
+        with pytest.raises(ValueError, match="integer"):
+            production_bundle._validate_production_objective_contract(
+                contract=drifted,
+                bucket=1024,
+                target=target,
+            )
+
+    stale_samples = json.loads(json.dumps(contract))
+    stale_samples["totals"]["samples"] += 1
+    with pytest.raises(ValueError, match="approved production target"):
+        production_bundle._validate_production_objective_contract(
+            contract=stale_samples,
+            bucket=1024,
+            target=target,
+        )
+
+    stale_policy = json.loads(json.dumps(contract))
+    stale_policy["source_selection"]["quota_lookahead_samples"] += 1
+    with pytest.raises(ValueError, match="approved production target"):
+        production_bundle._validate_production_objective_contract(
+            contract=stale_policy,
+            bucket=1024,
+            target=target,
+        )
+
+    stale_seed_kinds = json.loads(json.dumps(contract))
+    stale_seed_kinds["source_snapshot"]["pools"]["objective_seed"]["files"].append(
+        {"path": "pr/1024/pr.parquet"}
+    )
+    with pytest.raises(ValueError, match="approved production target"):
+        production_bundle._validate_production_objective_contract(
+            contract=stale_seed_kinds,
+            bucket=1024,
+            target=target,
         )
 
 
