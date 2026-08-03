@@ -12,6 +12,10 @@ receipt-bound sidecars only.
 The completion receipt deliberately says ``training_ready_without_membership``
 is false.  CASE5 export still requires the independent, exact primary-commit
 membership receipt consumed by ``export_pr_parquet.py``.
+
+Authentication is explicit: every canonical host must be covered exactly once
+by a ``--token-env HOST=ENV_NAME`` declaration or a ``--public-host HOST``
+declaration.
 """
 
 from __future__ import annotations
@@ -358,6 +362,7 @@ class GitLabClient:
         *,
         allowed_hosts: Iterable[str],
         token_env_by_host: Mapping[str, str],
+        public_hosts: Iterable[str] = (),
         max_response_bytes: int,
         max_retries: int,
         timeout_s: float,
@@ -366,6 +371,30 @@ class GitLabClient:
         self.max_response_bytes = max_response_bytes
         self.max_retries = max_retries
         self.timeout_s = timeout_s
+        public_host_values = tuple(public_hosts)
+        if any(not isinstance(host, str) or not host for host in public_host_values):
+            raise GitLabIngestError("public GitLab hosts must be non-empty strings")
+        if len(public_host_values) != len(set(public_host_values)):
+            raise GitLabIngestError("public GitLab hosts must be unique")
+        self.public_hosts = frozenset(public_host_values)
+        token_hosts = set(token_env_by_host)
+        overlap = token_hosts & self.public_hosts
+        if overlap:
+            raise GitLabIngestError(
+                "GitLab host authentication modes overlap: "
+                f"{sorted(overlap)}"
+            )
+        extra_public = self.public_hosts - self.allowed_hosts
+        if extra_public:
+            raise GitLabIngestError(
+                f"public GitLab host is outside the allowed scope: {sorted(extra_public)}"
+            )
+        uncovered = self.allowed_hosts - token_hosts - self.public_hosts
+        if uncovered:
+            raise GitLabIngestError(
+                "GitLab host authentication coverage is incomplete: "
+                f"missing={sorted(uncovered)}"
+            )
         self.tokens: dict[str, str] = {}
         for host, env_name in token_env_by_host.items():
             if host not in self.allowed_hosts:
@@ -433,6 +462,11 @@ class GitLabClient:
             }
             if host in self.tokens:
                 headers["PRIVATE-TOKEN"] = self.tokens[host]
+            elif host not in self.public_hosts:
+                raise GitLabIngestError(
+                    "GitLab request host has no explicit authentication mode: "
+                    f"{host}"
+                )
             request = urllib.request.Request(url, headers=headers, method="GET")
             try:
                 with self.opener.open(request, timeout=self.timeout_s) as response:
@@ -2428,6 +2462,45 @@ def _parse_token_env(values: list[str]) -> dict[str, str]:
     return result
 
 
+def _parse_public_hosts(values: Iterable[str]) -> tuple[str, ...]:
+    hosts = tuple(values)
+    if any(not isinstance(host, str) or not host for host in hosts):
+        raise GitLabIngestError("--public-host values must be non-empty HOST names")
+    if len(hosts) != len(set(hosts)):
+        raise GitLabIngestError("--public-host values must be unique")
+    return hosts
+
+
+def _resolve_host_auth(
+    projects: Iterable[GitLabProject],
+    *,
+    token_env_by_host: Mapping[str, str],
+    public_hosts: Iterable[str],
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Resolve one explicit authentication mode for every canonical host."""
+
+    project_values = tuple(projects)
+    expected_hosts = {project.host for project in project_values}
+
+    token_env = dict(token_env_by_host)
+    public_values = _parse_public_hosts(public_hosts)
+    token_hosts = set(token_env)
+    public_set = set(public_values)
+    overlap = token_hosts & public_set
+    covered = token_hosts | public_set
+    missing = expected_hosts - covered
+    extra = covered - expected_hosts
+    if overlap or missing or extra:
+        raise GitLabIngestError(
+            "GitLab host authentication coverage must cover every canonical host "
+            "exactly once: "
+            f"missing={sorted(missing)} "
+            f"extra={sorted(extra)} "
+            f"overlap={sorted(overlap)}"
+        )
+    return token_env, frozenset(public_set)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     default_root = Path("outputs/pr_ingest/gitlab_mr")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2460,7 +2533,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="HOST=ENV_NAME",
-        help="Required host-specific PRIVATE-TOKEN environment variable; repeat per host.",
+        help="Host-specific PRIVATE-TOKEN environment variable; repeat per token-authenticated host.",
+    )
+    parser.add_argument(
+        "--public-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Explicitly use unauthenticated requests for this public host; repeat per host.",
     )
     return parser
 
@@ -2483,6 +2563,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise GitLabIngestError("--max-retries and --timeout-seconds are out of range")
     repo_list = args.repo_list.expanduser().resolve()
     projects = load_gitlab_repos(repo_list)
+    token_env, public_hosts = _resolve_host_auth(
+        projects,
+        token_env_by_host=_parse_token_env(args.token_env or []),
+        public_hosts=getattr(args, "public_host", []) or [],
+    )
     repo_list_sha = _stable_file_sha256(repo_list, role="GitLab repo list")
     manifest_path = args.manifest.expanduser().resolve()
     primary_store = args.primary_store.expanduser().resolve()
@@ -2529,17 +2614,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "max_detail_pages": int(args.max_detail_pages),
         "max_detail_mib": int(args.max_detail_mib),
     }
-    token_env = _parse_token_env(args.token_env)
-    expected_token_hosts = {project.host for project in projects}
-    if set(token_env) != expected_token_hosts:
-        raise GitLabIngestError(
-            "--token-env must cover every canonical GitLab host exactly: "
-            f"missing={sorted(expected_token_hosts - set(token_env))} "
-            f"extra={sorted(set(token_env) - expected_token_hosts)}"
-        )
     client = GitLabClient(
         allowed_hosts=(project.host for project in projects),
         token_env_by_host=token_env,
+        public_hosts=public_hosts,
         max_response_bytes=int(args.max_response_mib) * 1024 * 1024,
         max_retries=int(args.max_retries),
         timeout_s=timeout_seconds,

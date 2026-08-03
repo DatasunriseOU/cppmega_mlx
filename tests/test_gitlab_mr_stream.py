@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import urllib.parse
+import urllib.request
 
 import pytest
 
@@ -96,6 +97,38 @@ def _empty_completion(
     )
     gitlab._atomic_write_json(receipt_path, receipt)
     return primary_store, receipt_path, repo_list, sidecar_root, manifest
+
+
+def _capture_client_request(
+    client: gitlab.GitLabClient,
+    url: str,
+) -> tuple[gitlab.APIResponse, urllib.request.Request]:
+    class Response:
+        status = 200
+        headers: dict[str, str] = {}
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b"[]"
+
+    captured: list[object] = []
+
+    class Opener:
+        def open(self, request: object, *, timeout: float) -> Response:
+            captured.append(request)
+            return Response()
+
+    client.opener = Opener()
+    response = client.get(url)
+    assert len(captured) == 1
+    request = captured[0]
+    assert isinstance(request, urllib.request.Request)
+    return response, request
 
 
 def test_canonical_gitlab_scope_is_exact_and_duplicate_closed(tmp_path: Path) -> None:
@@ -195,6 +228,110 @@ def test_pagination_prefers_explicit_next_and_stops_at_exact_total() -> None:
         )
         is None
     )
+
+
+def test_host_auth_coverage_requires_exactly_one_mode(tmp_path: Path) -> None:
+    projects = gitlab.load_gitlab_repos(_exact_repo_list(tmp_path))
+    token_env = gitlab._parse_token_env(["gitlab.com=GITLAB_TOKEN"])
+    public_hosts = gitlab._parse_public_hosts(
+        ["gitlab.freedesktop.org", "gitlab.torproject.org"]
+    )
+
+    resolved_tokens, resolved_public = gitlab._resolve_host_auth(
+        projects,
+        token_env_by_host=token_env,
+        public_hosts=public_hosts,
+    )
+    assert resolved_tokens == token_env
+    assert resolved_public == frozenset(public_hosts)
+
+    with pytest.raises(gitlab.GitLabIngestError, match="missing=.*gitlab.torproject.org"):
+        gitlab._resolve_host_auth(
+            projects,
+            token_env_by_host=token_env,
+            public_hosts=["gitlab.freedesktop.org"],
+        )
+
+    with pytest.raises(gitlab.GitLabIngestError, match="overlap=.*gitlab.com"):
+        gitlab._resolve_host_auth(
+            projects,
+            token_env_by_host=token_env,
+            public_hosts=[
+                "gitlab.com",
+                "gitlab.freedesktop.org",
+                "gitlab.torproject.org",
+            ],
+        )
+
+    with pytest.raises(gitlab.GitLabIngestError, match="extra=.*example.invalid"):
+        gitlab._resolve_host_auth(
+            projects,
+            token_env_by_host={},
+            public_hosts=[
+                "gitlab.com",
+                "gitlab.freedesktop.org",
+                "gitlab.torproject.org",
+                "example.invalid",
+            ],
+        )
+
+    with pytest.raises(gitlab.GitLabIngestError, match="unique"):
+        gitlab._parse_public_hosts(["gitlab.com", "gitlab.com"])
+
+
+def test_public_client_omits_private_token_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PUBLIC_HOST_TOKEN", "must-not-be-used")
+    client = gitlab.GitLabClient(
+        allowed_hosts={"gitlab.com"},
+        token_env_by_host={},
+        public_hosts={"gitlab.com"},
+        max_response_bytes=1024,
+        max_retries=0,
+        timeout_s=1,
+    )
+    response, request = _capture_client_request(
+        client,
+        "https://gitlab.com/api/v4/projects/libeigen%2FEigen/merge_requests?page=1",
+    )
+
+    assert response.status == 200
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert "private-token" not in headers
+    assert "authorization" not in headers
+    assert headers["accept"] == "application/json"
+
+
+def test_token_client_still_sends_private_token_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITLAB_TOKEN", "token-value")
+    client = gitlab.GitLabClient(
+        allowed_hosts={"gitlab.com"},
+        token_env_by_host={"gitlab.com": "GITLAB_TOKEN"},
+        max_response_bytes=1024,
+        max_retries=0,
+        timeout_s=1,
+    )
+    _response, request = _capture_client_request(
+        client,
+        "https://gitlab.com/api/v4/projects/libeigen%2FEigen/merge_requests",
+    )
+    headers = {name.lower(): value for name, value in request.header_items()}
+    assert headers["private-token"] == "token-value"
+
+
+def test_token_client_missing_environment_does_not_fall_back_to_public(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MISSING_GITLAB_TOKEN", raising=False)
+    with pytest.raises(gitlab.GitLabIngestError, match="environment variable is empty"):
+        gitlab.GitLabClient(
+            allowed_hosts={"gitlab.com"},
+            token_env_by_host={"gitlab.com": "MISSING_GITLAB_TOKEN"},
+            max_response_bytes=1024,
+            max_retries=0,
+            timeout_s=1,
+        )
 
 
 def test_sidecar_resume_requires_identical_frozen_content(tmp_path: Path) -> None:
