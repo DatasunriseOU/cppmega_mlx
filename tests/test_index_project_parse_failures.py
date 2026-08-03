@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
 import pytest
+
+
+def test_index_jsonl_output_is_gzip_streamable(tmp_path: Path) -> None:
+    from tools.clang_indexer.index_project import _open_jsonl_output
+
+    output = tmp_path / "source.enriched.jsonl.gz"
+    with _open_jsonl_output(output, append=False, compressed=True) as stream:
+        stream.write('{"doc":1}\n')
+    with _open_jsonl_output(output, append=True, compressed=True) as stream:
+        stream.write('{"doc":2}\n')
+
+    with gzip.open(output, "rt", encoding="utf-8") as stream:
+        assert stream.readlines() == ['{"doc":1}\n', '{"doc":2}\n']
 
 
 def _load_indexer():

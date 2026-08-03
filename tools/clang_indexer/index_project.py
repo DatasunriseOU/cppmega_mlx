@@ -29,6 +29,7 @@ import argparse
 from array import array
 import ctypes.util
 import glob
+import gzip
 import importlib
 import json
 import os
@@ -46,7 +47,7 @@ sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TextIO, TypeAlias, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -102,6 +103,24 @@ else:
 class _MissingCursorKind:
     def __getattr__(self, name: str) -> str:
         return f"<missing-clang-cursorkind:{name}>"
+
+
+def _open_jsonl_output(
+    path: Path,
+    *,
+    append: bool,
+    compressed: bool,
+) -> TextIO:
+    mode = "at" if append else "wt"
+    if compressed:
+        return gzip.open(
+            path,
+            mode,
+            compresslevel=1,
+            encoding="utf-8",
+            newline="\n",
+        )
+    return path.open(mode, encoding="utf-8", newline="\n")
 
 
 class _MissingIndex:
@@ -11025,7 +11044,11 @@ def main() -> int:
     with atomic_output_file(final_output) as staged_output:
         if append_mode and final_output.exists():
             shutil.copyfile(final_output, staged_output)
-        with staged_output.open('a' if append_mode else 'w') as out:
+        with _open_jsonl_output(
+            staged_output,
+            append=append_mode,
+            compressed=final_output.suffix == ".gz",
+        ) as out:
             def _write_doc(doc: str | dict[str, object]) -> None:
                 nonlocal total_docs
                 if enriched:

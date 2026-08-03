@@ -18,6 +18,7 @@ from tools.clang_indexer.source_quarantine import (
 PROJECT_ID = "fixture/source-quarantine"
 RELATIVE_XML = "sdk/license.cc"
 RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
+RELATIVE_INDEX_CRASH_FIXTURE = "tools/clang/test/Index/crash-recovery.c"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 
@@ -44,6 +45,20 @@ def _clang_crash_fixture_bytes() -> bytes:
         b"// CHECK: prag\\\n"
         b"// CHECK-NEXT: ma\n"
         b"\n"
+    )
+
+
+def _clang_index_crash_fixture_bytes() -> bytes:
+    return (
+        b"// RUN: not c-index-test -test-load-source all %s 2> %t.err\n"
+        b"// RUN: FileCheck < %t.err -check-prefix=CHECK-LOAD-SOURCE-CRASH %s\n"
+        b"// CHECK-LOAD-SOURCE-CRASH: Unable to load translation unit\n"
+        b"// RUN: env LIBCLANG_DISABLE_CRASH_RECOVERY=1 not --crash "
+        b"c-index-test -test-load-source all %s\n"
+        b"//\n"
+        b"// REQUIRES: crash-recovery\n"
+        b"\n"
+        b"#pragma clang __debug crash\n"
     )
 
 
@@ -232,6 +247,33 @@ def test_exact_quarantine_filters_deliberate_clang_crash_fixture(
     )
 
 
+def test_exact_quarantine_filters_deliberate_clang_index_crash_fixture(
+    tmp_path: Path,
+) -> None:
+    payload = _clang_index_crash_fixture_bytes()
+    candidate = tmp_path / RELATIVE_INDEX_CRASH_FIXTURE
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="deliberate_compiler_crash_fixture",
+        detected_format="clang_debug_crash_pragma",
+        relative_path=RELATIVE_INDEX_CRASH_FIXTURE,
+        reason="fixture deliberately crashes Clang indexer",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["detected_format"] == (
+        "clang_debug_crash_pragma"
+    )
+
+
 def test_exact_quarantine_filters_der_x509_certificate_pair(
     tmp_path: Path,
 ) -> None:
@@ -339,6 +381,7 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
         for item in manifest["entries"]
         if item["project_id"]
         in {"google/filament", "microsoft/DirectXShaderCompiler"}
+        and item["relative_path"].endswith(RELATIVE_CRASH_FIXTURE)
     ]
 
     assert len(payload) == 271
@@ -351,6 +394,31 @@ def test_checked_in_clang_crash_manifest_matches_reference_fixture() -> None:
         assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
         assert entry["classification"] == "deliberate_compiler_crash_fixture"
         assert entry["detected_format"] == "clang_debug_crash_pragma"
+
+
+def test_checked_in_filament_index_crash_manifest_matches_reference_fixture() -> None:
+    payload = _clang_index_crash_fixture_bytes()
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "google/filament"
+        and item["relative_path"].endswith(RELATIVE_INDEX_CRASH_FIXTURE)
+    )
+
+    assert len(payload) == 344
+    assert hashlib.sha256(payload).hexdigest() == (
+        "1dae510e0b173890f77aa3ef905b892614b3b5c7a98add3df7b58a555ccef727"
+    )
+    assert entry["size_bytes"] == len(payload)
+    assert entry["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert entry["classification"] == "deliberate_compiler_crash_fixture"
+    assert entry["detected_format"] == "clang_debug_crash_pragma"
 
 
 def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> None:

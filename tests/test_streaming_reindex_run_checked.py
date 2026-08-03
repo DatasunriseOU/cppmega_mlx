@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import subprocess
@@ -163,9 +164,12 @@ def test_non_github_repo_list_identity_reaches_code_indexer(
     def fake_run_checked(_repo, _stage, cmd, *, log_path, **_kwargs):
         del log_path
         captured.extend(str(value) for value in cmd)
-        (tmp_path / "work" / "aosp-frameworks-av.enriched.jsonl").write_text(
-            "{}\n", encoding="utf-8"
-        )
+        with gzip.open(
+            tmp_path / "work" / "aosp-frameworks-av.enriched.jsonl.gz",
+            "wt",
+            encoding="utf-8",
+        ) as stream:
+            stream.write("{}\n")
 
     monkeypatch.setattr(streaming_reindex, "run_checked", fake_run_checked)
     work = tmp_path / "work"
@@ -186,7 +190,7 @@ def test_non_github_repo_list_identity_reaches_code_indexer(
         "android.googlesource.com/platform%2Fframeworks%2Fav"
     )
     assert "--skip-invalid-domain-inputs" not in captured
-    assert output == work / "aosp-frameworks-av.enriched.jsonl"
+    assert output == work / "aosp-frameworks-av.enriched.jsonl.gz"
 
 
 def test_commit_indexer_receives_canonical_project_identity(
