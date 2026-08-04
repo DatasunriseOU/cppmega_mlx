@@ -162,7 +162,7 @@ def test_large_sql_chunks_are_bounded_deterministic_and_lossless(
     monkeypatch.setattr(
         index_project,
         "detect_build_context",
-        lambda *_args: ({}, [], None),
+        lambda *_args, **_kwargs: ({}, [], None),
     )
     monkeypatch.setattr(index_project, "get_default_compile_args", lambda *_args: [])
     monkeypatch.setattr(index_project, "check_memory_limit", lambda *_args, **_kwargs: None)
@@ -296,7 +296,7 @@ def test_large_configure_chunks_without_aborting_repo_and_preserves_identity(
     monkeypatch.setattr(
         index_project,
         "detect_build_context",
-        lambda *_args: ({}, [], None),
+        lambda *_args, **_kwargs: ({}, [], None),
     )
     monkeypatch.setattr(index_project, "get_default_compile_args", lambda *_args: [])
     monkeypatch.setattr(index_project, "check_memory_limit", lambda *_args, **_kwargs: None)

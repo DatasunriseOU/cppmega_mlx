@@ -418,7 +418,7 @@ def test_process_project_emits_every_discovered_domain_once_with_source_identity
     monkeypatch.setattr(
         index_project,
         "detect_build_context",
-        lambda *_args: ({}, [], None),
+        lambda *_args, **_kwargs: ({}, [], None),
     )
     monkeypatch.setattr(index_project, "get_default_compile_args", lambda *_args: [])
     monkeypatch.setattr(index_project, "check_memory_limit", lambda *_args, **_kwargs: None)
