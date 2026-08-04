@@ -61,15 +61,17 @@ GITLAB_INVENTORY_SCHEMA = "cppmega_gitlab_mr_inventory_v1"
 GITLAB_INVENTORY_PAGE_SCHEMA = "cppmega_gitlab_mr_inventory_page_v1"
 GITLAB_RECORD_SCHEMA = "cppmega_gitlab_mr_record_v1"
 GITLAB_PLATFORM = "gitlab"
-GITLAB_CONTRACT_VERSION = 2
+GITLAB_CONTRACT_VERSION = 3
 _CONTRACT = {
     "version": GITLAB_CONTRACT_VERSION,
     "scope": "repo-list-exact-token-hostname-match-v1",
     "inventory": "project-MRs-created-at-ascending-inclusive-windows-v1",
+    "pagination": "same-host-project-endpoint-next-page-with-pinned-query-v1",
     "candidate": "state-merged-and-merge-commit-sha-present-v1",
     "detail_endpoints": ["merge_request", "diffs"],
     "primary_endpoints": ["discussions", "closes_issues"],
     "preflight": "one-MR-list-credential-check-v1",
+    "auth_denial": "http-401-403-blocks-completion-never-terminal-v1",
     "path_classifier": "cppmega_mlx.data.commit_scope.classify_primary_commit_path",
     "routes": ["primary", "ancillary", "excluded", "terminal"],
     "sidecars": "canonical-json-gzip-mtime-zero-v1",
@@ -79,6 +81,7 @@ GITLAB_CONTRACT_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 _TERMINAL_DETAIL_STATUSES = {404, 410}
+_AUTH_DENIAL_STATUSES = {401, 403}
 _TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_ERRORS = (
     http.client.IncompleteRead,
@@ -103,6 +106,10 @@ class GitLabIngestError(RuntimeError):
 
 class GitLabTransientError(GitLabIngestError):
     """A bounded transport/rate-limit retry budget was exhausted."""
+
+
+class GitLabAuthenticationError(GitLabIngestError):
+    """A host credential is required or lacks access to a mandatory endpoint."""
 
 
 @dataclass(frozen=True)
@@ -653,6 +660,32 @@ class GitLabClient:
             return min(60.0, delay)
         return min(30.0, float(2 ** min(attempt, 5)))
 
+    def _authentication_error(
+        self,
+        *,
+        host: str,
+        status: int,
+        url: str,
+    ) -> GitLabAuthenticationError:
+        # Do not include the URL query or response body: either could carry data
+        # that does not belong in a retry/watchdog diagnostic.
+        endpoint = urllib.parse.urlsplit(url).path
+        if host in self.public_hosts:
+            guidance = (
+                f"replace --public-host {host} with --token-env "
+                f"{host}=ENV_NAME using a host-scoped token with read_api access"
+            )
+        else:
+            guidance = (
+                f"replace or reauthorize the configured host-scoped token for {host} "
+                "with read_api access"
+            )
+        return GitLabAuthenticationError(
+            f"GitLab HTTP {status} authentication/authorization denied for "
+            f"host {host} endpoint {endpoint}; {guidance}. "
+            "No completion receipt will be published."
+        )
+
     def get(
         self, url: str, *, terminal_statuses: set[int] | None = None
     ) -> APIResponse:
@@ -703,6 +736,8 @@ class GitLabClient:
                     )
                 time.sleep(self._delay(response_headers, attempt - 1))
                 continue
+            if status in _AUTH_DENIAL_STATUSES:
+                raise self._authentication_error(host=host, status=status, url=url)
             if status not in {200, *terminal_statuses}:
                 preview = body_bytes[:1000].decode("utf-8", errors="replace")
                 raise GitLabIngestError(f"GitLab HTTP {status} for {url}: {preview}")
@@ -733,11 +768,26 @@ def _next_page_url(
     page_size: int,
     item_count: int,
 ) -> str | None:
+    raw_next = response.headers.get("x-next-page")
+    header_next_page: int | None = None
+    if raw_next:
+        try:
+            header_next_page = int(raw_next)
+        except ValueError as exc:
+            raise GitLabIngestError(
+                f"invalid X-Next-Page header: {raw_next!r}"
+            ) from exc
+        if header_next_page != page + 1:
+            raise GitLabIngestError(
+                f"non-consecutive X-Next-Page header: {raw_next!r} after page {page}"
+            )
     link = response.headers.get("link")
     if link:
-        match = _LINK_NEXT_RE.search(link)
-        if match:
-            candidate = urllib.parse.urljoin(response.url, match.group(1))
+        matches = _LINK_NEXT_RE.findall(link)
+        if len(matches) > 1:
+            raise GitLabIngestError("ambiguous GitLab pagination Link header")
+        if matches:
+            candidate = urllib.parse.urljoin(response.url, matches[0])
             current_url = urllib.parse.urlsplit(response.url)
             next_url = urllib.parse.urlsplit(candidate)
             next_query = urllib.parse.parse_qsl(
@@ -772,21 +822,10 @@ def _next_page_url(
             return urllib.parse.urlunsplit(
                 current_url._replace(query=urllib.parse.urlencode(next_query))
             )
-    raw_next = response.headers.get("x-next-page")
-    if raw_next:
-        try:
-            next_page = int(raw_next)
-        except ValueError as exc:
-            raise GitLabIngestError(
-                f"invalid X-Next-Page header: {raw_next!r}"
-            ) from exc
-        if next_page != page + 1:
-            raise GitLabIngestError(
-                f"non-consecutive X-Next-Page header: {raw_next!r} after page {page}"
-            )
+    if header_next_page is not None:
         parsed = urllib.parse.urlsplit(response.url)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        query["page"] = [str(next_page)]
+        query["page"] = [str(header_next_page)]
         return urllib.parse.urlunsplit(
             parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
         )
@@ -910,9 +949,13 @@ class Manifest:
         expected_config = dict(config)
         if path.exists():
             self.data = _read_json_object(path, role="GitLab MR manifest")
+            if self.data.get("contract_sha256") != GITLAB_CONTRACT_SHA256:
+                raise GitLabIngestError(
+                    "existing GitLab MR manifest uses a superseded contract; "
+                    "preserve it for audit and use a new immutable output root"
+                )
             if (
                 self.data.get("schema") != GITLAB_MANIFEST_SCHEMA
-                or self.data.get("contract_sha256") != GITLAB_CONTRACT_SHA256
                 or self.data.get("repo_list")
                 != {"path": str(repo_list.resolve()), "sha256": repo_list_sha256}
                 or self.data.get("expected_hosts") != list(expected_hosts)
@@ -2604,9 +2647,14 @@ def load_gitlab_completion_binding(
         receipt.get("schema") != GITLAB_COMPLETION_SCHEMA
         or receipt.get("status") != "verified"
         or receipt.get("platform") != GITLAB_PLATFORM
-        or receipt.get("contract_sha256") != GITLAB_CONTRACT_SHA256
     ):
         raise GitLabIngestError("GitLab MR completion receipt contract is unsupported")
+    if receipt.get("contract_sha256") != GITLAB_CONTRACT_SHA256:
+        raise GitLabIngestError(
+            "GitLab MR completion receipt uses a superseded contract; it is not "
+            "complete under current rules. Preserve it for audit and use a new "
+            "immutable output root."
+        )
     canonical = _canonical_bytes(receipt, pretty=True)
     if receipt_path.read_bytes() != canonical:
         raise GitLabIngestError("GitLab MR completion receipt is not canonical JSON")
@@ -3175,6 +3223,9 @@ def main(argv: list[str] | None = None) -> int:
     except GitLabTransientError as exc:
         print(f"GITLAB_MR_INGEST_RETRYABLE: {exc}", file=sys.stderr)
         return 75
+    except GitLabAuthenticationError as exc:
+        print(f"GITLAB_MR_INGEST_AUTH_REQUIRED: {exc}", file=sys.stderr)
+        return 2
     except GitLabIngestError as exc:
         print(f"GITLAB_MR_INGEST_FAILED: {exc}", file=sys.stderr)
         return 2

@@ -275,7 +275,7 @@ def test_pagination_prefers_explicit_next_and_stops_at_exact_total() -> None:
                 "<https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?"
                 "created_before=2026-08-03T23%3A43%3A56%2B00%3A00&"
                 "id=a%2Fb&order_by=created_at&page=2&per_page=100&sort=asc&"
-                "state=all&with_labels_details=false>; rel=\"next\""
+                "state=closed&with_labels_details=false>; rel=\"next\""
             )
         },
         body=[],
@@ -292,6 +292,44 @@ def test_pagination_prefers_explicit_next_and_stops_at_exact_total() -> None:
         "https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?"
         "state=all&created_before=2026-08-03T23%3A43%3A56.646941Z&page=2"
     )
+
+    conflicting_headers = gitlab.APIResponse(
+        **{
+            **linked.__dict__,
+            "headers": {
+                **linked.headers,
+                "x-next-page": "3",
+            },
+        }
+    )
+    with pytest.raises(gitlab.GitLabIngestError, match="non-consecutive"):
+        gitlab._next_page_url(
+            conflicting_headers,
+            page=1,
+            page_size=100,
+            item_count=100,
+        )
+
+    ambiguous = gitlab.APIResponse(
+        **{
+            **linked.__dict__,
+            "headers": {
+                "link": (
+                    "<https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?page=2>; "
+                    'rel="next", '
+                    "<https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?page=2>; "
+                    'rel="next"'
+                )
+            },
+        }
+    )
+    with pytest.raises(gitlab.GitLabIngestError, match="ambiguous"):
+        gitlab._next_page_url(
+            ambiguous,
+            page=1,
+            page_size=100,
+            item_count=100,
+        )
 
     final = gitlab.APIResponse(
         url="https://gitlab.com/api/v4/projects/a%2Fb/merge_requests?page=1",
@@ -457,6 +495,44 @@ def test_token_client_missing_environment_does_not_fall_back_to_public(
         )
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_auth_denial_is_visible_without_echoing_response_data(status: int) -> None:
+    sentinel = "response-body-must-not-appear"
+
+    class Opener:
+        def open(self, request: urllib.request.Request, *, timeout: float) -> object:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                "denied",
+                {"Content-Type": "application/json"},
+                io.BytesIO(f'{{"message":"{sentinel}"}}'.encode("utf-8")),
+            )
+
+    client = gitlab.GitLabClient(
+        allowed_hosts={"gitlab.com"},
+        token_env_by_host={},
+        public_hosts={"gitlab.com"},
+        max_response_bytes=1024,
+        max_retries=0,
+        timeout_s=1,
+    )
+    client.opener = Opener()
+    with pytest.raises(gitlab.GitLabAuthenticationError) as exc_info:
+        client.get(
+            "https://gitlab.com/api/v4/projects/libeigen%2FEigen/"
+            f"merge_requests/175/discussions?opaque={sentinel}",
+            terminal_statuses={401, 404, 410},
+        )
+
+    message = str(exc_info.value)
+    assert f"HTTP {status}" in message
+    assert "gitlab.com" in message
+    assert "/merge_requests/175/discussions" in message
+    assert "--token-env gitlab.com=ENV_NAME" in message
+    assert sentinel not in message
+
+
 def test_transient_retry_exhaustion_is_resumable(monkeypatch: pytest.MonkeyPatch) -> None:
     class Opener:
         def open(self, *_args: object, **_kwargs: object) -> object:
@@ -488,6 +564,13 @@ def test_main_maps_transient_and_contract_failures_to_lane_exit_codes(
     monkeypatch.setattr(gitlab, "run", transient)
     assert gitlab.main([]) == 75
     assert "GITLAB_MR_INGEST_RETRYABLE" in capsys.readouterr().err
+
+    def auth_required(_args: argparse.Namespace) -> dict[str, object]:
+        raise gitlab.GitLabAuthenticationError("host token is required")
+
+    monkeypatch.setattr(gitlab, "run", auth_required)
+    assert gitlab.main([]) == 2
+    assert "GITLAB_MR_INGEST_AUTH_REQUIRED" in capsys.readouterr().err
 
     def contract(_args: argparse.Namespace) -> dict[str, object]:
         raise gitlab.GitLabIngestError("credential scope is invalid")
@@ -967,6 +1050,27 @@ def test_gitlab_completion_dispatch_is_verified_but_not_training_ready(
     loose = _sidecar_root / "loose.json.gz"
     gitlab._atomic_write_gzip_json(loose, {"unexpected": True})
     with pytest.raises(gitlab.GitLabIngestError, match="unexpected artifact"):
+        gitlab.load_gitlab_completion_binding(
+            receipt_path,
+            pr_store=primary_store,
+            repo_list=repo_list,
+        )
+
+
+def test_v2_completion_receipts_are_rejected_after_auth_contract_upgrade(
+    tmp_path: Path,
+) -> None:
+    primary_store, receipt_path, repo_list, _sidecar_root, _manifest = _empty_completion(
+        tmp_path
+    )
+    legacy_contract_sha = "91570073a6228f1687d33990e4ca858582065d8176c32bcdc9c0d61dc7ae6459"
+    assert gitlab.GITLAB_CONTRACT_VERSION == 3
+    assert legacy_contract_sha != gitlab.GITLAB_CONTRACT_SHA256
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["contract_sha256"] = legacy_contract_sha
+    gitlab._atomic_write_json(receipt_path, receipt)
+
+    with pytest.raises(gitlab.GitLabIngestError, match="superseded contract"):
         gitlab.load_gitlab_completion_binding(
             receipt_path,
             pr_store=primary_store,
