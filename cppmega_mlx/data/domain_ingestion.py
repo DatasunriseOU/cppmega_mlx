@@ -340,6 +340,18 @@ def _trailing_nul_bytes(
     return width if stream.read(width) == b"\0" * width else 0
 
 
+def _path_declared_codec(path: Path) -> tuple[str, str] | None:
+    if tuple(part.casefold() for part in path.parts[-5:]) == (
+        "src",
+        "test",
+        "mb",
+        "sql",
+        "mule_internal.sql",
+    ):
+        return "latin-1", "mule-internal"
+    return None
+
+
 def _validate_domain_stream(
     stream: BinaryIO,
     *,
@@ -459,6 +471,25 @@ def _validate_domain_stream(
             trailing_nul_bytes=trailing_nul_bytes,
         )
     except UnicodeDecodeError as utf8_exc:
+        declared_codec = _path_declared_codec(path)
+        if declared_codec is not None:
+            codec, source_encoding = declared_codec
+            try:
+                return _scan_domain_stream(
+                    stream,
+                    path=path,
+                    expected_size=expected_size,
+                    codec=codec,
+                    source_encoding=source_encoding,
+                    reject_raw_nul=True,
+                    trailing_nul_bytes=trailing_nul_bytes,
+                )
+            except UnicodeDecodeError as declared_exc:
+                raise ValueError(
+                    f"invalid UTF-8 or filename-declared {source_encoding} "
+                    f"domain input {path}: utf-8={utf8_exc}; "
+                    f"{source_encoding}={declared_exc}"
+                ) from declared_exc
         try:
             return _scan_domain_stream(
                 stream,
@@ -749,7 +780,7 @@ def _decodable_prefix_at_or_before(
     cut = min(int(limit), len(data))
     if codec == "utf-8":
         return _utf8_boundary_at_or_before(data, cut)
-    if codec == "cp1252":
+    if codec in {"cp1252", "latin-1"}:
         return cut
     if codec not in {"utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"}:
         raise ValueError(f"unsupported domain source codec {codec!r}")
@@ -805,6 +836,20 @@ def decode_domain_prefix(
                 final=False,
             )
         except UnicodeDecodeError as utf8_exc:
+            declared_codec = _path_declared_codec(path_obj)
+            if declared_codec is not None:
+                codec, source_encoding = declared_codec
+                try:
+                    return codecs.getincrementaldecoder(codec)("strict").decode(
+                        payload_bytes,
+                        final=False,
+                    )
+                except UnicodeDecodeError as declared_exc:
+                    raise ValueError(
+                        f"invalid UTF-8 or filename-declared {source_encoding} "
+                        f"domain input {path_obj}: utf-8={utf8_exc}; "
+                        f"{source_encoding}={declared_exc}"
+                    ) from declared_exc
             try:
                 return codecs.getincrementaldecoder("cp1252")("strict").decode(
                     payload_bytes,
@@ -916,10 +961,11 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
-    UTF-8, BOM-marked UTF-16/32, and strict Windows-1252 are decoded without
-    replacement. SQL prefers statement boundaries; build, shell, and diagnostic
-    text prefers line boundaries. Every emitted chunk has an explicit hard byte
-    cap and exact byte/character provenance into the original encoded file.
+    UTF-8, BOM-marked UTF-16/32, strict Windows-1252, and exact
+    filename-declared legacy inputs are decoded without replacement. SQL prefers
+    statement boundaries; build, shell, and diagnostic text prefers line
+    boundaries. Every emitted chunk has an explicit hard byte cap and exact
+    byte/character provenance into the original encoded file.
     """
 
     if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:

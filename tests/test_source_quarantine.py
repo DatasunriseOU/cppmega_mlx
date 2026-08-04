@@ -21,6 +21,7 @@ RELATIVE_CRASH_FIXTURE = "tools/clang/test/Parser/crash-report.c"
 RELATIVE_INDEX_CRASH_FIXTURE = "tools/clang/test/Index/crash-recovery.c"
 RELATIVE_CERTIFICATE_PAIR = "vectors/certpairs/reverseCertificatePair.cp"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
+RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
 
 
 def _xml_bytes() -> bytes:
@@ -322,6 +323,55 @@ def test_exact_quarantine_filters_mixed_utf16_generated_binary_blob(
 
     assert kept == []
     assert receipt["entries"][0]["classification"] == "generated_binary_blob"
+
+
+def test_exact_quarantine_filters_nul_ff_binary_blob(tmp_path: Path) -> None:
+    payload = b"\0\xff" * 386 + b"\0"
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    kept, receipt = policy.filter_candidates(tmp_path, [str(candidate)])
+
+    assert kept == []
+    assert receipt["quarantined_count"] == 1
+    assert receipt["entries"][0]["detected_format"] == "nul_ff_binary_blob"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"", b"\0" * 4, b"\xff" * 4, b"\0\xff\x01"],
+)
+def test_nul_ff_binary_blob_requires_both_values_and_no_others(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    candidate = tmp_path / RELATIVE_NUL_FF_BLOB
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(payload)
+    manifest = tmp_path / "quarantine.json"
+    _write_manifest(
+        manifest,
+        payload,
+        classification="mislabeled_non_cpp",
+        detected_format="nul_ff_binary_blob",
+        relative_path=RELATIVE_NUL_FF_BLOB,
+        reason="binary 0x00/0xff payload stored under a header suffix",
+    )
+
+    policy = ProjectSourceQuarantine.load(manifest, project_id=PROJECT_ID)
+    with pytest.raises(SourceQuarantineError, match="only 0x00 and 0xff"):
+        policy.filter_candidates(tmp_path, [str(candidate)])
 
 
 def test_generated_binary_blob_quarantine_rejects_small_c_array(

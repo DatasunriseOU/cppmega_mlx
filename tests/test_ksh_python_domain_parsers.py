@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cppmega_mlx.data.domain_schema import (
     DomainEdgeKind,
     DomainKind,
@@ -139,6 +141,65 @@ def test_domain_dispatch_and_discovery_cover_ksh_and_python(tmp_path: Path) -> N
         "run": DomainKind.PYTHON,
         "script.ksh": DomainKind.KSH,
     }
+
+
+def test_postgres_mule_internal_fixture_round_trips_byte_exactly(
+    tmp_path: Path,
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import (
+        decode_domain_prefix,
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    encoded = (
+        b"-- MULE \x92 internal encoding fixture\n"
+        b"SELECT '\x81' AS byte_value;\n"
+    )
+    path = tmp_path / "src/test/mb/sql/mule_internal.sql"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    discovered = discover_project_domain_files(tmp_path)
+    decoded_prefix = decode_domain_prefix(encoded, path=path)
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=17))
+
+    assert [item.path for item in discovered] == [path]
+    assert decoded_prefix.encode("latin-1") == encoded
+    assert {chunk.source_encoding for chunk in chunks} == {"mule-internal"}
+    assert b"".join(chunk.text.encode("latin-1") for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 17 for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "error"),
+    [
+        (
+            "src/test/mb/sql/not_mule_internal.sql",
+            b"-- near miss \x92\nSELECT '\x81';\n",
+            "invalid UTF-8 or Windows-1252",
+        ),
+        (
+            "src/test/mb/sql/mule_internal.sql",
+            b"-- MULE \x92\nSELECT '\x81\x00';\n",
+            "NUL byte",
+        ),
+    ],
+)
+def test_postgres_mule_internal_contract_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
+    error: str,
+) -> None:
+    from cppmega_mlx.data.domain_ingestion import iter_domain_file_chunks
+
+    path = tmp_path / relative_path
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+
+    with pytest.raises(ValueError, match=error):
+        list(iter_domain_file_chunks(path))
 
 
 class _Encoding:
