@@ -340,7 +340,14 @@ def _trailing_nul_bytes(
     return width if stream.read(width) == b"\0" * width else 0
 
 
-def _path_declared_codec(path: Path) -> tuple[str, str] | None:
+_MULE_INTERNAL_SIGNATURE = b"-- MULE \x92"
+
+
+def _path_declared_codec(
+    path: Path,
+    *,
+    source_prefix: bytes = b"",
+) -> tuple[str, str] | None:
     if tuple(part.casefold() for part in path.parts[-5:]) == (
         "src",
         "test",
@@ -348,7 +355,9 @@ def _path_declared_codec(path: Path) -> tuple[str, str] | None:
         "sql",
         "mule_internal.sql",
     ):
-        return "latin-1", "mule-internal"
+        if source_prefix.startswith(_MULE_INTERNAL_SIGNATURE):
+            return "latin-1", "mule-internal"
+        return None
     return None
 
 
@@ -471,7 +480,12 @@ def _validate_domain_stream(
             trailing_nul_bytes=trailing_nul_bytes,
         )
     except UnicodeDecodeError as utf8_exc:
-        declared_codec = _path_declared_codec(path)
+        stream.seek(0)
+        declared_codec = _path_declared_codec(
+            path,
+            source_prefix=stream.read(len(_MULE_INTERNAL_SIGNATURE)),
+        )
+        stream.seek(0)
         if declared_codec is not None:
             codec, source_encoding = declared_codec
             try:
@@ -836,7 +850,10 @@ def decode_domain_prefix(
                 final=False,
             )
         except UnicodeDecodeError as utf8_exc:
-            declared_codec = _path_declared_codec(path_obj)
+            declared_codec = _path_declared_codec(
+                path_obj,
+                source_prefix=payload_bytes,
+            )
             if declared_codec is not None:
                 codec, source_encoding = declared_codec
                 try:
