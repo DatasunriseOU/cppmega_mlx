@@ -67,9 +67,35 @@ def _load_local_symbol_identity() -> ModuleType:
     return module
 
 
+def _load_local_build_context() -> ModuleType:
+    module_path = (
+        _MODULE_ROOT
+        / "cppmega_mlx"
+        / "data"
+        / "nanochat_pipeline"
+        / "build_context.py"
+    )
+    module = importlib.import_module(
+        "cppmega_mlx.data.nanochat_pipeline.build_context"
+    )
+    loaded_path = Path(getattr(module, "__file__", "")).resolve()
+    if loaded_path != module_path.resolve():
+        raise ImportError(
+            "cppmega_mlx.data.nanochat_pipeline.build_context resolved outside "
+            f"this checkout: loaded={loaded_path} expected={module_path}"
+        )
+    return module
+
+
 _symbol_identity = _load_local_symbol_identity()
 SymbolIdentityError = _symbol_identity.SymbolIdentityError
 require_project_identity = _symbol_identity.require_project_identity
+_build_context = _load_local_build_context()
+BuildContextEvidenceError = _build_context.BuildContextEvidenceError
+normalize_macos_sdk_path_argument = (
+    _build_context.normalize_macos_sdk_path_argument
+)
+validate_macos_sdk_path = _build_context.validate_macos_sdk_path
 
 # --------------------------------------------------------------------------- #
 # Fixed environment contract (verified by the task brief).
@@ -1833,6 +1859,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--macos-sdk",
+        type=normalize_macos_sdk_path_argument,
         default=None,
         help="Explicit macOS SDK root passed to every code indexer. It is used "
              "only when bounded project xcconfig evidence requires macOS.",
@@ -1899,12 +1926,15 @@ def main(argv: list[str]) -> int:
         else None
     )
     macos_sdk = (
-        Path(args.macos_sdk).expanduser().resolve()
+        Path(args.macos_sdk)
         if args.macos_sdk
         else None
     )
-    if macos_sdk is not None and not macos_sdk.is_dir():
-        raise SystemExit(f"--macos-sdk is not a directory: {macos_sdk}")
+    if macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(macos_sdk)
+        except BuildContextEvidenceError as exc:
+            raise SystemExit(str(exc)) from exc
     if (
         source_quarantine_manifest is not None
         and not source_quarantine_manifest.is_file()

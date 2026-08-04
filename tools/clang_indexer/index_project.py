@@ -56,9 +56,12 @@ if str(_REPO_ROOT) not in sys.path:
 
 from cppmega_mlx.data.nanochat_pipeline.language_info import detect_language_info
 from cppmega_mlx.data.nanochat_pipeline.build_context import (
+    BuildContextEvidenceError,
     detect_build_context,
     find_compile_commands_file,
     load_compile_commands_file,
+    normalize_macos_sdk_path_argument,
+    validate_macos_sdk_path,
 )
 from cppmega_mlx.data.symbol_identity import (
     EXTERNAL_PROVIDER_PROJECTS,
@@ -10916,7 +10919,7 @@ def main() -> int:
     )
     parser.add_argument(
         '--macos-sdk',
-        type=str,
+        type=normalize_macos_sdk_path_argument,
         default=None,
         help='Explicit macOS SDK root used only for projects whose bounded '
              '.xcconfig evidence requires a macOS build context. No ambient '
@@ -10958,6 +10961,11 @@ def main() -> int:
                              'unchanged when absent.')
 
     args = parser.parse_args()
+    if args.macos_sdk is not None:
+        try:
+            validate_macos_sdk_path(args.macos_sdk)
+        except BuildContextEvidenceError as exc:
+            parser.error(str(exc))
     start_memory_guard(args.memory_limit_gb, label="index_project")
 
     try:
