@@ -224,6 +224,13 @@ def test_open_watcom_plusplus_c_path_forces_cpp_without_c_standard(
     )
     assert translation_unit.spelling == str(source)
 
+    fallback_adapted = ip._adapt_args_for_file(
+        ["-std=c11", "-fsyntax-only", "-Wno-everything"],
+        str(source),
+    )
+    assert fallback_adapted[:3] == ["-x", "c++", "-std=c++17"]
+    assert "-std=c11" not in fallback_adapted
+
     ordinary_c = tmp_path / "src" / "ordinary.c"
     ordinary_c.parent.mkdir(parents=True)
     ordinary_c.write_text("int ordinary(void) { return 0; }\n", encoding="utf-8")

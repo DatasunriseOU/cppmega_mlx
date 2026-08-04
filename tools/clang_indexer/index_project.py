@@ -5324,8 +5324,13 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
         )
         force_cpp_path = _is_legacy_cpp_c_path(filepath)
         use_cpp_mode = explicit_language in {'c++', 'c++-cpp', 'objective-c++'}
-        if explicit_language is None and has_cpp_standard:
-            use_cpp_mode = force_cpp_path or _source_looks_like_cpp(filepath)
+        if explicit_language is None:
+            # The Open Watcom path is an explicit dialect declaration, unlike
+            # the content heuristic below, so it must not depend on a prior
+            # C++ standard flag being present in the compile context.
+            use_cpp_mode = force_cpp_path or (
+                has_cpp_standard and _source_looks_like_cpp(filepath)
+            )
         if use_cpp_mode:
             adapted: list[str] = []
             skip_next = False
