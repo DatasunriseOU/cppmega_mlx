@@ -197,6 +197,42 @@ def test_per_file_context_matches_adapted_args_and_preserves_legacy_cpp_c(
     assert compile_db_build_info["standard"] == "c99"
 
 
+def test_open_watcom_plusplus_c_path_forces_cpp_without_c_standard(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "bld" / "plusplus" / "bugs" / "zcc02.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "char *foo( void )\n"
+        "{\n"
+        "    return( ::new char[10] ( 'a', 'b', 'c', '\\0' ) );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    adapted = ip._adapt_args_for_file(
+        ["-std=c11", "-std=c++20", "-fsyntax-only", "-Wno-everything"],
+        str(source),
+    )
+
+    assert adapted[:3] == ["-x", "c++", "-std=c++20"]
+    assert "-std=c11" not in adapted
+    translation_unit = ip._load_translation_unit(
+        str(source),
+        _clang_index(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(source)
+
+    ordinary_c = tmp_path / "src" / "ordinary.c"
+    ordinary_c.parent.mkdir(parents=True)
+    ordinary_c.write_text("int ordinary(void) { return 0; }\n", encoding="utf-8")
+    assert ip._adapt_args_for_file(
+        ["-std=c++20", "-Wno-everything"],
+        str(ordinary_c),
+    )[:3] == ["-x", "c", "-std=c11"]
+
+
 def test_emitted_function_sidecar_matches_per_file_adapted_args(
     tmp_path: Path,
 ) -> None:

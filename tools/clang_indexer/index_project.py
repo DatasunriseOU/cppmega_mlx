@@ -5223,15 +5223,32 @@ def _harmonize_build_info_with_compile_args(
     return harmonized
 
 
-def get_default_compile_args(project_dir: str) -> list[str]:
+def get_default_compile_args(
+    project_dir: str,
+    *,
+    macos_sdk_path: str | None = None,
+) -> list[str]:
     """Generate default compile args for projects without compile_commands.json."""
-    platform_info, args, _compile_index = detect_build_context(project_dir)
+    platform_info, args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     result, _build_info = _resolve_default_compile_context(
         project_dir,
         platform_info,
         args,
     )
     return result
+
+
+def _is_legacy_cpp_c_path(filepath: str) -> bool:
+    """Return whether an upstream path explicitly declares a .c file as C++."""
+
+    parts = tuple(part.casefold() for part in Path(filepath).parts)
+    return any(
+        parts[index : index + 2] == ("bld", "plusplus")
+        for index in range(len(parts) - 1)
+    )
 
 
 def _source_looks_like_cpp(filepath: str) -> bool:
@@ -5302,12 +5319,14 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
             standard_family == 'c++'
             for _raw, standard_family, _canonical in standard_contexts
         )
+        force_cpp_path = _is_legacy_cpp_c_path(filepath)
         use_cpp_mode = explicit_language in {'c++', 'c++-cpp', 'objective-c++'}
         if explicit_language is None and has_cpp_standard:
-            use_cpp_mode = _source_looks_like_cpp(filepath)
+            use_cpp_mode = force_cpp_path or _source_looks_like_cpp(filepath)
         if use_cpp_mode:
             adapted: list[str] = []
             skip_next = False
+            has_cpp_standard = False
             for arg in args:
                 if skip_next:
                     skip_next = False
@@ -5317,8 +5336,24 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                     continue
                 if arg.startswith('-x') and arg != '-x':
                     continue
+                standard_context = (
+                    _standard_flag_context(arg)
+                    if any(
+                        arg.startswith(prefix)
+                        for prefix in _STANDARD_FLAG_PREFIXES
+                    )
+                    else None
+                )
+                if standard_context is not None:
+                    if standard_context[1] == 'c++':
+                        adapted.append(arg)
+                        has_cpp_standard = True
+                    continue
                 adapted.append(arg)
-            return ['-x', 'c++'] + adapted
+            prefix = ['-x', 'c++']
+            if force_cpp_path and not has_cpp_standard:
+                prefix.append('-std=c++17')
+            return prefix + adapted
 
         adapted = []
         skip_next = False
@@ -10449,6 +10484,7 @@ def process_project(
     skip_invalid_domain_inputs: bool = False,
     source_quarantine_manifest: str | None = None,
     source_quarantine_receipt: str | None = None,
+    macos_sdk_path: str | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -10573,7 +10609,10 @@ def process_project(
     # Load or derive build context. Done unconditionally so build-only repos
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
-    _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
+    _platform_info, _raw_args, _compile_index = detect_build_context(
+        project_dir,
+        macos_sdk_path=macos_sdk_path,
+    )
     default_args, default_build_info = _resolve_default_compile_context(
         project_dir,
         _platform_info,
@@ -10875,6 +10914,14 @@ def main() -> int:
         help='Atomic verification receipt for --source-quarantine-manifest. '
              'Single-project mode only.',
     )
+    parser.add_argument(
+        '--macos-sdk',
+        type=str,
+        default=None,
+        help='Explicit macOS SDK root used only for projects whose bounded '
+             '.xcconfig evidence requires a macOS build context. No ambient '
+             'SDK lookup is performed.',
+    )
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
     parser.add_argument('--dedup-db', type=str, default=None,
@@ -11114,6 +11161,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -11143,6 +11191,7 @@ def main() -> int:
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                             source_quarantine_manifest=args.source_quarantine_manifest,
                             source_quarantine_receipt=args.source_quarantine_receipt,
+                            macos_sdk_path=args.macos_sdk,
                         )
                         for doc in docs:
                             _write_doc(doc)

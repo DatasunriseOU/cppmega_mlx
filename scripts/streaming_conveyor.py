@@ -3004,6 +3004,7 @@ def run_code_half(
     recompressor: BackgroundRecompressor | None = None,
     revision_guard: CodeRevisionGuard | None = None,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> dict:
     """index+route+pack the repo's source via the EXISTING code stage, zstd-max.
 
@@ -3031,6 +3032,7 @@ def run_code_half(
                 project_id=project_id,
                 promote_dedup_on_success=False,
                 source_quarantine_manifest=source_quarantine_manifest,
+                macos_sdk=macos_sdk,
             )
         except RepoFailure as exc:
             _raise_if_revision_subprocess_failure(exc)
@@ -3214,6 +3216,7 @@ def run_code_half_adaptive(
     recompressor: BackgroundRecompressor | None = None,
     revision_guard: CodeRevisionGuard | None = None,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> dict:
     """Run the code half, retrying index_project peaks/stalls with one parser.
 
@@ -3246,6 +3249,7 @@ def run_code_half_adaptive(
                 *args,
                 revision_guard=revision_guard,
                 source_quarantine_manifest=source_quarantine_manifest,
+                macos_sdk=macos_sdk,
             )
         return active_runner(*args)
 
@@ -4168,6 +4172,7 @@ def process_one_repo(
     revision_guard: CodeRevisionGuard | None = None,
     pr_scan_id: str | None = None,
     source_quarantine_manifest: Path | None = None,
+    macos_sdk: Path | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -4300,6 +4305,7 @@ def process_one_repo(
                             source_quarantine_manifest=(
                                 source_quarantine_manifest
                             ),
+                            macos_sdk=macos_sdk,
                         )
                         if cinfo.get("skipped"):
                             with manifest_lock:
@@ -4615,6 +4621,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Exact path+size+SHA manifest for verified non-C++ files stored "
              "under C/C++ suffixes. Passed to every CODE indexer; "
              f"default {sr.DEFAULT_SOURCE_QUARANTINE_MANIFEST}.",
+    )
+    p.add_argument(
+        "--macos-sdk",
+        default=None,
+        help="Explicit macOS SDK root passed to every CODE indexer. It is used "
+             "only when bounded project xcconfig evidence requires macOS.",
     )
     p.add_argument(
         "--pr-completion-receipt",
@@ -4951,6 +4963,13 @@ def main(argv: list[str]) -> int:
         if args.source_quarantine_manifest
         else None
     )
+    macos_sdk = (
+        Path(args.macos_sdk).expanduser().resolve()
+        if args.macos_sdk
+        else None
+    )
+    if macos_sdk is not None and not macos_sdk.is_dir():
+        raise SystemExit(f"--macos-sdk is not a directory: {macos_sdk}")
     if (
         source_quarantine_manifest is not None
         and not source_quarantine_manifest.is_file()
@@ -5447,6 +5466,7 @@ def main(argv: list[str]) -> int:
                     revision_guard=revision_guard,
                     pr_scan_id=pr_scan_id,
                     source_quarantine_manifest=source_quarantine_manifest,
+                    macos_sdk=macos_sdk,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -5564,6 +5584,7 @@ def main(argv: list[str]) -> int:
                     revision_guard=revision_guard,
                     pr_scan_id=pr_scan_id,
                     source_quarantine_manifest=source_quarantine_manifest,
+                    macos_sdk=macos_sdk,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
