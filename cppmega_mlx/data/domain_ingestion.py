@@ -486,7 +486,7 @@ def _validate_domain_stream(
                 )
             except UnicodeDecodeError as declared_exc:
                 raise ValueError(
-                    f"invalid UTF-8 or filename-declared {source_encoding} "
+                    f"invalid UTF-8 or path-declared {source_encoding} "
                     f"domain input {path}: utf-8={utf8_exc}; "
                     f"{source_encoding}={declared_exc}"
                 ) from declared_exc
@@ -846,7 +846,7 @@ def decode_domain_prefix(
                     )
                 except UnicodeDecodeError as declared_exc:
                     raise ValueError(
-                        f"invalid UTF-8 or filename-declared {source_encoding} "
+                        f"invalid UTF-8 or path-declared {source_encoding} "
                         f"domain input {path_obj}: utf-8={utf8_exc}; "
                         f"{source_encoding}={declared_exc}"
                     ) from declared_exc
@@ -962,7 +962,7 @@ def iter_domain_file_chunks(
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
     UTF-8, BOM-marked UTF-16/32, strict Windows-1252, and exact
-    filename-declared legacy inputs are decoded without replacement. SQL prefers
+    path-declared legacy inputs are decoded without replacement. SQL prefers
     statement boundaries; build, shell, and diagnostic text prefers line
     boundaries. Every emitted chunk has an explicit hard byte cap and exact
     byte/character provenance into the original encoded file.
