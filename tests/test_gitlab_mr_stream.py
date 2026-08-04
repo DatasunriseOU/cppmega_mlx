@@ -457,6 +457,46 @@ def test_token_client_missing_environment_does_not_fall_back_to_public(
         )
 
 
+def test_transient_retry_exhaustion_is_resumable(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Opener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            raise TimeoutError("simulated timeout")
+
+    client = gitlab.GitLabClient(
+        allowed_hosts={"gitlab.com"},
+        token_env_by_host={},
+        public_hosts={"gitlab.com"},
+        max_response_bytes=1024,
+        max_retries=0,
+        timeout_s=1,
+    )
+    client.opener = Opener()
+    monkeypatch.setattr(gitlab.time, "sleep", lambda _delay: None)
+    with pytest.raises(gitlab.GitLabTransientError, match="retry budget exhausted"):
+        client.get(
+            "https://gitlab.com/api/v4/projects/libeigen%2FEigen/merge_requests"
+        )
+
+
+def test_main_maps_transient_and_contract_failures_to_lane_exit_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def transient(_args: argparse.Namespace) -> dict[str, object]:
+        raise gitlab.GitLabTransientError("429 retry budget exhausted")
+
+    monkeypatch.setattr(gitlab, "run", transient)
+    assert gitlab.main([]) == 75
+    assert "GITLAB_MR_INGEST_RETRYABLE" in capsys.readouterr().err
+
+    def contract(_args: argparse.Namespace) -> dict[str, object]:
+        raise gitlab.GitLabIngestError("credential scope is invalid")
+
+    monkeypatch.setattr(gitlab, "run", contract)
+    assert gitlab.main([]) == 2
+    assert "GITLAB_MR_INGEST_FAILED" in capsys.readouterr().err
+
+
 def test_sidecar_is_deterministic_gzip_and_resume_requires_frozen_content(
     tmp_path: Path,
 ) -> None:
@@ -717,27 +757,12 @@ def test_primary_sidecar_replay_materializes_exact_shas_without_fake_reviews(
         ancillary_conn.close()
 
 
-def test_primary_child_auth_statuses_are_terminal_only_for_public_hosts() -> None:
-    project = gitlab._parse_project_identity("gitlab.com/libeigen%2FEigen")
-
-    class Client:
-        def __init__(self, public_hosts: set[str]):
-            self.public_hosts = frozenset(public_hosts)
-
-    assert gitlab._primary_child_terminal_statuses(
-        Client({project.host}),  # type: ignore[arg-type]
-        project,
-    ) == {401, 403, 404, 410}
-    assert gitlab._primary_child_terminal_statuses(
-        Client(set()),  # type: ignore[arg-type]
-        project,
-    ) == {404, 410}
-
-
 @pytest.mark.parametrize("status", [401, 403])
-def test_public_primary_discussion_auth_is_terminal_and_resumable(
+@pytest.mark.parametrize("endpoint", ["discussions", "closes_issues"])
+def test_primary_child_auth_fails_loudly_without_terminal_sidecar(
     tmp_path: Path,
     status: int,
+    endpoint: str,
 ) -> None:
     repo_list = _exact_repo_list(tmp_path)
     projects = gitlab.load_gitlab_repos(
@@ -809,12 +834,9 @@ def test_public_primary_discussion_auth_is_terminal_and_resumable(
             byte_size=len(payload),
         )
 
-    class PublicClient:
-        public_hosts = frozenset({project.host})
-
+    class Client:
         def __init__(self) -> None:
             self.calls: list[str] = []
-            self.discussion_response: gitlab.APIResponse | None = None
 
         def get(
             self,
@@ -823,18 +845,24 @@ def test_public_primary_discussion_auth_is_terminal_and_resumable(
             terminal_statuses: set[int] | None = None,
         ) -> gitlab.APIResponse:
             self.calls.append(url)
-            endpoint = url.split("?", 1)[0]
-            if endpoint.endswith(f"/merge_requests/{iid}"):
+            request_path = url.split("?", 1)[0]
+            if request_path.endswith(f"/merge_requests/{iid}"):
                 current = response(url, 200, detail)
-            elif endpoint.endswith("/diffs"):
+            elif request_path.endswith("/diffs"):
                 current = response(url, 200, [diff], headers={"x-total": "1"})
-            elif endpoint.endswith("/discussions"):
-                current = response(
-                    url,
-                    status,
-                    {"message": f"{status} Unauthorized"},
+            elif request_path.endswith("/discussions"):
+                if endpoint == "discussions":
+                    assert terminal_statuses == {404, 410}
+                    raise gitlab.GitLabIngestError(
+                        f"GitLab HTTP {status} for {url}: Unauthorized"
+                    )
+                current = response(url, 200, [], headers={"x-total": "0"})
+            elif request_path.endswith("/closes_issues"):
+                assert endpoint == "closes_issues"
+                assert terminal_statuses == {404, 410}
+                raise gitlab.GitLabIngestError(
+                    f"GitLab HTTP {status} for {url}: Unauthorized"
                 )
-                self.discussion_response = current
             else:
                 raise AssertionError(f"unexpected GitLab endpoint: {url}")
             if current.status not in {200, *(terminal_statuses or set())}:
@@ -843,17 +871,11 @@ def test_public_primary_discussion_auth_is_terminal_and_resumable(
                 )
             return current
 
-    class NoNetworkClient:
-        public_hosts = frozenset({project.host})
-
-        def get(self, *_args: object, **_kwargs: object) -> gitlab.APIResponse:
-            raise AssertionError("terminal sidecar resume must not refetch")
-
     primary_conn = pr_store.connect(str(primary_store), create=True)
     ancillary_conn = pr_store.connect(str(ancillary_store), create=True)
     try:
-        client = PublicClient()
-        assert (
+        client = Client()
+        with pytest.raises(gitlab.GitLabIngestError, match=rf"GitLab HTTP {status}"):
             gitlab._process_candidate(
                 client,  # type: ignore[arg-type]
                 manifest,
@@ -866,52 +888,25 @@ def test_public_primary_discussion_auth_is_terminal_and_resumable(
                 max_detail_pages=10,
                 max_detail_bytes=4 * 1024 * 1024,
             )
-            == "terminal"
-        )
-        assert client.discussion_response is not None
-        assert [url.split("?", 1)[0].rsplit("/", 1)[-1] for url in client.calls] == [
+        expected_calls = [
             str(iid),
             "diffs",
             "discussions",
         ]
+        if endpoint == "closes_issues":
+            expected_calls.append("closes_issues")
+        assert [
+            url.split("?", 1)[0].rsplit("/", 1)[-1] for url in client.calls
+        ] == expected_calls
         terminal_path = gitlab._sidecar_path(
             sidecar_root,
             "records/terminal",
             project,
             iid,
         )
-        terminal = gitlab._read_gzip_json_object(
-            terminal_path,
-            role="terminal sidecar",
-            max_compressed_bytes=4 * 1024 * 1024,
-            max_decompressed_bytes=8 * 1024 * 1024,
-        )
-        assert terminal["route"] == "terminal"
-        assert terminal["terminal_reason"] == f"primary_discussions_http_{status}"
-        assert "discussions" not in terminal
-        assert "linked_issues" not in terminal
-        assert terminal["lineage"][-1] == {
-            **client.discussion_response.lineage("discussions", page=1),
-        }
-        assert [item["status"] for item in terminal["lineage"]] == [200, 200, status]
+        assert not terminal_path.exists()
         assert primary_conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 0
         assert ancillary_conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 0
-
-        assert (
-            gitlab._process_candidate(
-                NoNetworkClient(),  # type: ignore[arg-type]
-                manifest,
-                project,
-                metadata,
-                sidecar_root=sidecar_root,
-                primary_conn=primary_conn,
-                ancillary_conn=ancillary_conn,
-                page_size=100,
-                max_detail_pages=10,
-                max_detail_bytes=4 * 1024 * 1024,
-            )
-            == "terminal"
-        )
     finally:
         primary_conn.close()
         ancillary_conn.close()

@@ -79,7 +79,6 @@ GITLAB_CONTRACT_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 _TERMINAL_DETAIL_STATUSES = {404, 410}
-_PUBLIC_PRIMARY_CHILD_AUTH_STATUSES = {401, 403}
 _TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_ERRORS = (
     http.client.IncompleteRead,
@@ -100,6 +99,10 @@ _ANCILLARY_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".ts
 
 class GitLabIngestError(RuntimeError):
     """The scan cannot continue without weakening its exactness contract."""
+
+
+class GitLabTransientError(GitLabIngestError):
+    """A bounded transport/rate-limit retry budget was exhausted."""
 
 
 @dataclass(frozen=True)
@@ -686,7 +689,7 @@ class GitLabClient:
             except _TRANSIENT_ERRORS as exc:
                 attempt += 1
                 if attempt > self.max_retries:
-                    raise GitLabIngestError(
+                    raise GitLabTransientError(
                         f"GitLab transport retry budget exhausted for {url}: {exc}"
                     ) from exc
                 time.sleep(min(30.0, float(2 ** min(attempt - 1, 5))))
@@ -695,7 +698,7 @@ class GitLabClient:
             if status in _TRANSIENT_STATUSES:
                 attempt += 1
                 if attempt > self.max_retries:
-                    raise GitLabIngestError(
+                    raise GitLabTransientError(
                         f"GitLab HTTP retry budget exhausted at status {status}: {url}"
                     )
                 time.sleep(self._delay(response_headers, attempt - 1))
@@ -717,25 +720,6 @@ class GitLabClient:
                 body_sha256=hashlib.sha256(body_bytes).hexdigest(),
                 byte_size=len(body_bytes),
             )
-
-
-def _primary_child_terminal_statuses(
-    client: GitLabClient,
-    project: GitLabProject,
-) -> set[int]:
-    """Return endpoint statuses that prove this candidate cannot be complete.
-
-    Public GitLab projects can expose MR metadata and diffs while refusing the
-    mandatory discussions or linked-issues endpoint.  That is a per-record
-    terminal condition, not evidence that either child collection is empty.
-    An authenticated host returning 401/403 remains a hard error because it
-    indicates a credential or scope failure rather than a known public route.
-    """
-
-    statuses = set(_TERMINAL_DETAIL_STATUSES)
-    if project.host in client.public_hosts:
-        statuses.update(_PUBLIC_PRIMARY_CHILD_AUTH_STATUSES)
-    return statuses
 
 
 def _url_with_query(url: str, **params: object) -> str:
@@ -1969,10 +1953,6 @@ def _process_candidate(
     discussions: list[dict] = []
     linked_issues: list[dict] = []
     if route == "primary":
-        primary_child_terminal_statuses = _primary_child_terminal_statuses(
-            client,
-            project,
-        )
         discussions, discussion_lineage, _, discussion_bytes = _paged_get(
             client,
             f"{project.api_root}/merge_requests/{iid}/discussions",
@@ -1980,14 +1960,14 @@ def _process_candidate(
             page_size=page_size,
             max_pages=max_detail_pages,
             max_total_bytes=max_detail_bytes - diff_bytes,
-            terminal_statuses=primary_child_terminal_statuses,
+            terminal_statuses=_TERMINAL_DETAIL_STATUSES,
         )
         lineage.extend(discussion_lineage)
         discussion_terminal_status = next(
             (
                 item["status"]
                 for item in discussion_lineage
-                if item["status"] in primary_child_terminal_statuses
+                if item["status"] in _TERMINAL_DETAIL_STATUSES
             ),
             None,
         )
@@ -2016,14 +1996,14 @@ def _process_candidate(
             page_size=page_size,
             max_pages=max_detail_pages,
             max_total_bytes=max_detail_bytes - diff_bytes - discussion_bytes,
-            terminal_statuses=primary_child_terminal_statuses,
+            terminal_statuses=_TERMINAL_DETAIL_STATUSES,
         )
         lineage.extend(issue_lineage)
         issue_terminal_status = next(
             (
                 item["status"]
                 for item in issue_lineage
-                if item["status"] in primary_child_terminal_statuses
+                if item["status"] in _TERMINAL_DETAIL_STATUSES
             ),
             None,
         )
@@ -3192,8 +3172,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         result = run(args)
+    except GitLabTransientError as exc:
+        print(f"GITLAB_MR_INGEST_RETRYABLE: {exc}", file=sys.stderr)
+        return 75
     except GitLabIngestError as exc:
-        raise SystemExit(f"GITLAB_MR_INGEST_FAILED: {exc}") from exc
+        print(f"GITLAB_MR_INGEST_FAILED: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
