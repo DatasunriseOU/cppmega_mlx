@@ -79,6 +79,7 @@ GITLAB_CONTRACT_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 _TERMINAL_DETAIL_STATUSES = {404, 410}
+_PUBLIC_PRIMARY_CHILD_AUTH_STATUSES = {401, 403}
 _TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_ERRORS = (
     http.client.IncompleteRead,
@@ -716,6 +717,25 @@ class GitLabClient:
                 body_sha256=hashlib.sha256(body_bytes).hexdigest(),
                 byte_size=len(body_bytes),
             )
+
+
+def _primary_child_terminal_statuses(
+    client: GitLabClient,
+    project: GitLabProject,
+) -> set[int]:
+    """Return endpoint statuses that prove this candidate cannot be complete.
+
+    Public GitLab projects can expose MR metadata and diffs while refusing the
+    mandatory discussions or linked-issues endpoint.  That is a per-record
+    terminal condition, not evidence that either child collection is empty.
+    An authenticated host returning 401/403 remains a hard error because it
+    indicates a credential or scope failure rather than a known public route.
+    """
+
+    statuses = set(_TERMINAL_DETAIL_STATUSES)
+    if project.host in client.public_hosts:
+        statuses.update(_PUBLIC_PRIMARY_CHILD_AUTH_STATUSES)
+    return statuses
 
 
 def _url_with_query(url: str, **params: object) -> str:
@@ -1949,6 +1969,10 @@ def _process_candidate(
     discussions: list[dict] = []
     linked_issues: list[dict] = []
     if route == "primary":
+        primary_child_terminal_statuses = _primary_child_terminal_statuses(
+            client,
+            project,
+        )
         discussions, discussion_lineage, _, discussion_bytes = _paged_get(
             client,
             f"{project.api_root}/merge_requests/{iid}/discussions",
@@ -1956,18 +1980,24 @@ def _process_candidate(
             page_size=page_size,
             max_pages=max_detail_pages,
             max_total_bytes=max_detail_bytes - diff_bytes,
-            terminal_statuses=_TERMINAL_DETAIL_STATUSES,
+            terminal_statuses=primary_child_terminal_statuses,
         )
         lineage.extend(discussion_lineage)
-        if any(
-            item["status"] in _TERMINAL_DETAIL_STATUSES for item in discussion_lineage
-        ):
+        discussion_terminal_status = next(
+            (
+                item["status"]
+                for item in discussion_lineage
+                if item["status"] in primary_child_terminal_statuses
+            ),
+            None,
+        )
+        if discussion_terminal_status is not None:
             terminal = _terminal_record(
                 manifest,
                 project,
                 iid,
                 metadata,
-                reason="primary_discussions_endpoint_terminal",
+                reason=f"primary_discussions_http_{discussion_terminal_status}",
                 lineage=lineage,
             )
             terminal["merge_request"] = detail
@@ -1986,16 +2016,24 @@ def _process_candidate(
             page_size=page_size,
             max_pages=max_detail_pages,
             max_total_bytes=max_detail_bytes - diff_bytes - discussion_bytes,
-            terminal_statuses=_TERMINAL_DETAIL_STATUSES,
+            terminal_statuses=primary_child_terminal_statuses,
         )
         lineage.extend(issue_lineage)
-        if any(item["status"] in _TERMINAL_DETAIL_STATUSES for item in issue_lineage):
+        issue_terminal_status = next(
+            (
+                item["status"]
+                for item in issue_lineage
+                if item["status"] in primary_child_terminal_statuses
+            ),
+            None,
+        )
+        if issue_terminal_status is not None:
             terminal = _terminal_record(
                 manifest,
                 project,
                 iid,
                 metadata,
-                reason="primary_linked_issues_endpoint_terminal",
+                reason=f"primary_linked_issues_http_{issue_terminal_status}",
                 lineage=lineage,
             )
             terminal["merge_request"] = detail

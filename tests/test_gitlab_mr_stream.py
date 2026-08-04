@@ -717,6 +717,206 @@ def test_primary_sidecar_replay_materializes_exact_shas_without_fake_reviews(
         ancillary_conn.close()
 
 
+def test_primary_child_auth_statuses_are_terminal_only_for_public_hosts() -> None:
+    project = gitlab._parse_project_identity("gitlab.com/libeigen%2FEigen")
+
+    class Client:
+        def __init__(self, public_hosts: set[str]):
+            self.public_hosts = frozenset(public_hosts)
+
+    assert gitlab._primary_child_terminal_statuses(
+        Client({project.host}),  # type: ignore[arg-type]
+        project,
+    ) == {401, 403, 404, 410}
+    assert gitlab._primary_child_terminal_statuses(
+        Client(set()),  # type: ignore[arg-type]
+        project,
+    ) == {404, 410}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_public_primary_discussion_auth_is_terminal_and_resumable(
+    tmp_path: Path,
+    status: int,
+) -> None:
+    repo_list = _exact_repo_list(tmp_path)
+    projects = gitlab.load_gitlab_repos(
+        repo_list,
+        expected_hosts=_EXPECTED_HOSTS,
+    )
+    project = next(item for item in projects if item.host == "gitlab.com")
+    primary_store = tmp_path / "primary.sqlite"
+    ancillary_store = tmp_path / "ancillary.sqlite"
+    sidecar_root = tmp_path / "sidecars"
+    manifest = gitlab.Manifest(
+        tmp_path / "manifest.json",
+        repo_list=repo_list,
+        repo_list_sha256=gitlab._stable_file_sha256(repo_list, role="test repo list"),
+        projects=projects,
+        expected_hosts=_EXPECTED_HOSTS,
+        config={"max_detail_mib": 4, "max_response_mib": 2},
+    )
+    source_sha = "1" * 40
+    target_sha = "2" * 40
+    base_sha = "3" * 40
+    merge_sha = "4" * 40
+    iid = 175
+    metadata = {
+        "id": 7001,
+        "iid": iid,
+        "project_id": 101,
+        "state": "merged",
+        "title": "Native fix",
+        "created_at": "2026-08-03T08:00:00.000000Z",
+        "merge_commit_sha": merge_sha,
+    }
+    detail = {
+        **metadata,
+        "target_project_id": 101,
+        "description": "Keep the native path exact",
+        "merged_at": "2026-08-03T09:00:00.000000Z",
+        "sha": source_sha,
+        "diff_refs": {
+            "head_sha": source_sha,
+            "start_sha": target_sha,
+            "base_sha": base_sha,
+        },
+        "squash_commit_sha": None,
+        "author": {"username": "alice"},
+        "reviewers": [],
+        "changes_count": "1",
+    }
+    diff = {"old_path": "src/fix.cpp", "new_path": "src/fix.cpp"}
+
+    def response(
+        url: str,
+        response_status: int,
+        body: object,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> gitlab.APIResponse:
+        payload = json.dumps(
+            body,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return gitlab.APIResponse(
+            url=url,
+            status=response_status,
+            headers=headers or {},
+            body=body,
+            body_sha256=hashlib.sha256(payload).hexdigest(),
+            byte_size=len(payload),
+        )
+
+    class PublicClient:
+        public_hosts = frozenset({project.host})
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.discussion_response: gitlab.APIResponse | None = None
+
+        def get(
+            self,
+            url: str,
+            *,
+            terminal_statuses: set[int] | None = None,
+        ) -> gitlab.APIResponse:
+            self.calls.append(url)
+            endpoint = url.split("?", 1)[0]
+            if endpoint.endswith(f"/merge_requests/{iid}"):
+                current = response(url, 200, detail)
+            elif endpoint.endswith("/diffs"):
+                current = response(url, 200, [diff], headers={"x-total": "1"})
+            elif endpoint.endswith("/discussions"):
+                current = response(
+                    url,
+                    status,
+                    {"message": f"{status} Unauthorized"},
+                )
+                self.discussion_response = current
+            else:
+                raise AssertionError(f"unexpected GitLab endpoint: {url}")
+            if current.status not in {200, *(terminal_statuses or set())}:
+                raise gitlab.GitLabIngestError(
+                    f"unexpected status {current.status} for {url}"
+                )
+            return current
+
+    class NoNetworkClient:
+        public_hosts = frozenset({project.host})
+
+        def get(self, *_args: object, **_kwargs: object) -> gitlab.APIResponse:
+            raise AssertionError("terminal sidecar resume must not refetch")
+
+    primary_conn = pr_store.connect(str(primary_store), create=True)
+    ancillary_conn = pr_store.connect(str(ancillary_store), create=True)
+    try:
+        client = PublicClient()
+        assert (
+            gitlab._process_candidate(
+                client,  # type: ignore[arg-type]
+                manifest,
+                project,
+                metadata,
+                sidecar_root=sidecar_root,
+                primary_conn=primary_conn,
+                ancillary_conn=ancillary_conn,
+                page_size=100,
+                max_detail_pages=10,
+                max_detail_bytes=4 * 1024 * 1024,
+            )
+            == "terminal"
+        )
+        assert client.discussion_response is not None
+        assert [url.split("?", 1)[0].rsplit("/", 1)[-1] for url in client.calls] == [
+            str(iid),
+            "diffs",
+            "discussions",
+        ]
+        terminal_path = gitlab._sidecar_path(
+            sidecar_root,
+            "records/terminal",
+            project,
+            iid,
+        )
+        terminal = gitlab._read_gzip_json_object(
+            terminal_path,
+            role="terminal sidecar",
+            max_compressed_bytes=4 * 1024 * 1024,
+            max_decompressed_bytes=8 * 1024 * 1024,
+        )
+        assert terminal["route"] == "terminal"
+        assert terminal["terminal_reason"] == f"primary_discussions_http_{status}"
+        assert "discussions" not in terminal
+        assert "linked_issues" not in terminal
+        assert terminal["lineage"][-1] == {
+            **client.discussion_response.lineage("discussions", page=1),
+        }
+        assert [item["status"] for item in terminal["lineage"]] == [200, 200, status]
+        assert primary_conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 0
+        assert ancillary_conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 0
+
+        assert (
+            gitlab._process_candidate(
+                NoNetworkClient(),  # type: ignore[arg-type]
+                manifest,
+                project,
+                metadata,
+                sidecar_root=sidecar_root,
+                primary_conn=primary_conn,
+                ancillary_conn=ancillary_conn,
+                page_size=100,
+                max_detail_pages=10,
+                max_detail_bytes=4 * 1024 * 1024,
+            )
+            == "terminal"
+        )
+    finally:
+        primary_conn.close()
+        ancillary_conn.close()
+
+
 def test_gitlab_completion_dispatch_is_verified_but_not_training_ready(
     tmp_path: Path,
 ) -> None:
