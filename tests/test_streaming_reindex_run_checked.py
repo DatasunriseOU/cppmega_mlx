@@ -12,7 +12,7 @@ import pytest
 
 
 def test_run_checked_times_out_fail_loud(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     log_path = tmp_path / "sleep.log"
     try:
@@ -38,7 +38,7 @@ def test_run_checked_times_out_fail_loud(tmp_path) -> None:
 
 
 def test_run_checked_stall_watchdog_fail_loud(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     log_path = tmp_path / "stall.log"
     try:
@@ -65,7 +65,7 @@ def test_run_checked_stall_watchdog_fail_loud(tmp_path) -> None:
 
 
 def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     log_path = tmp_path / "cpu-progress.log"
     with pytest.raises(streaming_reindex.RepoFailure) as caught:
@@ -94,7 +94,7 @@ def test_run_checked_stall_watchdog_stops_cpu_spin_without_log_progress(tmp_path
 
 
 def test_materialize_command_uses_canonical_project_identity(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     enriched = tmp_path / "cjson.enriched.jsonl"
     output = tmp_path / "cjson.tok.parquet"
@@ -120,7 +120,7 @@ def test_materialize_command_uses_canonical_project_identity(tmp_path) -> None:
 
 
 def test_materialize_command_rejects_bare_project_identity(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     output = tmp_path / "cjson.tok.parquet"
     with pytest.raises(
@@ -141,7 +141,7 @@ def test_materialize_command_rejects_bare_project_identity(tmp_path) -> None:
 def test_non_github_repo_list_identity_reaches_code_indexer(
     monkeypatch, tmp_path
 ) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     repo_list = tmp_path / "repo_list.json"
     repo_list.write_text(
@@ -252,7 +252,7 @@ def test_commit_extractor_receives_canonical_project_identity(
 def test_project_identity_map_rejects_duplicate_bare_name_collision(
     tmp_path,
 ) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     repo_list = tmp_path / "repo_list.json"
     repo_list.write_text(
@@ -362,7 +362,7 @@ def test_commit_range_requires_frozen_project_identity(tmp_path) -> None:
 
 
 def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     cache = tmp_path / "cache"
     repo_dir = cache / "repo" / "src"
@@ -388,7 +388,7 @@ def test_stream_repo_subtrees_source_cache_only(tmp_path) -> None:
 def test_stream_repo_subtrees_source_cache_skips_bare_but_keeps_source_dumps(
     tmp_path,
 ) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     cache = tmp_path / "cache"
     bare = cache / "repo.bare"
@@ -419,7 +419,7 @@ def test_stream_repo_subtrees_source_cache_skips_bare_but_keeps_source_dumps(
 
 
 def test_stream_repo_dirs_yields_extracted_src_without_tar(tmp_path) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     root = tmp_path / "root"
     (root / "repo" / "_src").mkdir(parents=True)
@@ -441,7 +441,7 @@ def test_stream_repo_subtrees_skips_legacy_file_directory_conflict(
     monkeypatch,
     capsys,
 ) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     tar_path = tmp_path / "source.tar"
     zst_path = tmp_path / "source.tar.zst"
@@ -481,7 +481,7 @@ def test_stream_repo_subtrees_skips_legacy_file_directory_conflict(
 
 
 def test_populate_source_cache_only_materializes_cache(tmp_path, monkeypatch) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     cache = tmp_path / "cache"
     calls = []
@@ -516,7 +516,7 @@ def test_source_cache_populate_rejects_commit_source_before_processing(
     tmp_path,
     monkeypatch,
 ) -> None:
-    import streaming_reindex
+    from scripts import streaming_reindex
 
     commit_source = tmp_path / "commits.jsonl"
     commit_source.write_text("{}\n", encoding="utf-8")

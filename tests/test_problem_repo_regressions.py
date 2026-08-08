@@ -72,23 +72,27 @@ def test_empty_index_log_classifies_dedup_exhausted() -> None:
     assert reason == "dedup_exhausted"
 
 
-def test_process_one_repo_fails_for_empty_training_docs(tmp_path: Path) -> None:
+def test_process_one_repo_skips_empty_training_docs(tmp_path: Path) -> None:
     from scripts import streaming_reindex
 
     repo_dir = tmp_path / "src"
     repo_dir.mkdir()
 
-    with pytest.raises(streaming_reindex.RepoFailure, match="no training docs"):
-        streaming_reindex.process_one_repo(
-            "repo",
-            repo_dir,
-            (1024,),
-            tmp_path / "work",
-            dedup_db=None,
-            dedup_near=True,
-            parse_workers=1,
-            project_id="tests/problem-fixture",
-        )
+    result = streaming_reindex.process_one_repo(
+        "repo",
+        repo_dir,
+        (1024,),
+        tmp_path / "work",
+        dedup_db=None,
+        dedup_near=True,
+        parse_workers=1,
+        project_id="tests/problem-fixture",
+    )
+
+    assert result["skipped"] is True
+    assert result["skip_reason"] == "no_training_documents"
+    assert result["lengths"] == {}
+    assert result["materialize_stats"]["docs_out"] == 0
 
 
 def test_run_commits_half_fails_for_no_commit_records(tmp_path: Path) -> None:
