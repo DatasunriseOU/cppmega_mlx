@@ -1,47 +1,59 @@
 #!/usr/bin/env python3
 """Resumable GitLab merge-request inventory and primary-domain routing.
 
-The canonical mixed ``repo_list.json`` currently contains exactly three GitLab
-projects.  This scanner freezes a ``created_at`` upper bound, inventories every
-MR in stable ascending time windows, and only expands merged candidates.  Diff
-paths are classified with the same primary commit-scope helper used by the
-source conveyor.  Primary records use the existing PRStore schema; Python/JS-
-only records go to a physically separate store, and all other records remain
-receipt-bound sidecars only.
+The configured ``--token-env`` and ``--public-host`` declarations select every
+exact-host match from the canonical mixed ``repo_list.json``.  This scanner
+freezes a ``created_at`` upper bound, inventories every MR in stable ascending
+time windows, and only expands merged candidates.  Diff paths are classified
+with the same primary commit-scope helper used by the source conveyor.  Primary
+records use the existing PRStore schema; Python/JS-only records go to a
+physically separate store, and all other records remain receipt-bound sidecars
+only.
 
 The completion receipt deliberately says ``training_ready_without_membership``
 is false.  CASE5 export still requires the independent, exact primary-commit
 membership receipt consumed by ``export_pr_parquet.py``.
+
+Authentication is explicit: every canonical host must be covered exactly once
+by a ``--token-env HOST=ENV_NAME`` declaration or a ``--public-host HOST``
+declaration.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 import fcntl
+import gzip
 import hashlib
 import http.client
+import io
 import json
 import os
-from pathlib import Path
 import re
 import sqlite3
 import sys
 import time
-from typing import Any, Iterable, Mapping
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     _REPO_ROOT = Path(__file__).resolve().parents[2]
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
 
-from cppmega_mlx.data.commit_scope import classify_primary_commit_path  # noqa: E402
-from scripts.pr_ingest import pr_store  # noqa: E402
+from cppmega_mlx.data.commit_scope import classify_primary_commit_path
+from cppmega_mlx.data.symbol_identity import (
+    SymbolIdentityError,
+    resolve_remote_project_identity,
+)
+from scripts.pr_ingest import pr_store
 
 GITLAB_COMPLETION_SCHEMA = "cppmega_gitlab_mr_completion_v1"
 GITLAB_MANIFEST_SCHEMA = "cppmega_gitlab_mr_stream_manifest_v1"
@@ -49,27 +61,27 @@ GITLAB_INVENTORY_SCHEMA = "cppmega_gitlab_mr_inventory_v1"
 GITLAB_INVENTORY_PAGE_SCHEMA = "cppmega_gitlab_mr_inventory_page_v1"
 GITLAB_RECORD_SCHEMA = "cppmega_gitlab_mr_record_v1"
 GITLAB_PLATFORM = "gitlab"
-GITLAB_CONTRACT_VERSION = 1
+GITLAB_CONTRACT_VERSION = 3
 _CONTRACT = {
     "version": GITLAB_CONTRACT_VERSION,
+    "scope": "repo-list-exact-token-hostname-match-v1",
     "inventory": "project-MRs-created-at-ascending-inclusive-windows-v1",
+    "pagination": "same-host-project-endpoint-next-page-with-pinned-query-v1",
     "candidate": "state-merged-and-merge-commit-sha-present-v1",
     "detail_endpoints": ["merge_request", "diffs"],
     "primary_endpoints": ["discussions", "closes_issues"],
     "preflight": "one-MR-list-credential-check-v1",
+    "auth_denial": "http-401-403-blocks-completion-never-terminal-v1",
     "path_classifier": "cppmega_mlx.data.commit_scope.classify_primary_commit_path",
     "routes": ["primary", "ancillary", "excluded", "terminal"],
+    "sidecars": "canonical-json-gzip-mtime-zero-v1",
 }
 GITLAB_CONTRACT_SHA256 = hashlib.sha256(
     json.dumps(_CONTRACT, separators=(",", ":"), sort_keys=True).encode("utf-8")
 ).hexdigest()
 
-_EXPECTED_GITLAB_REPOS = (
-    "gitlab.com/libeigen%2FEigen",
-    "gitlab.freedesktop.org/mesa%2Fmesa",
-    "gitlab.torproject.org/tpo%2Fcore%2Ftor",
-)
 _TERMINAL_DETAIL_STATUSES = {404, 410}
+_AUTH_DENIAL_STATUSES = {401, 403}
 _TRANSIENT_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 _TRANSIENT_ERRORS = (
     http.client.IncompleteRead,
@@ -79,12 +91,25 @@ _TRANSIENT_ERRORS = (
     urllib.error.URLError,
 )
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_HOST_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
 _LINK_NEXT_RE = re.compile(r'(?:^|,)\s*<([^>]+)>\s*;\s*rel="next"')
+_SIDECAR_TEMP_RE = re.compile(r"^\.\d{12}\.json\.gz\.tmp(?:\.\d+)?$")
 _ANCILLARY_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
 
 
 class GitLabIngestError(RuntimeError):
     """The scan cannot continue without weakening its exactness contract."""
+
+
+class GitLabTransientError(GitLabIngestError):
+    """A bounded transport/rate-limit retry budget was exhausted."""
+
+
+class GitLabAuthenticationError(GitLabIngestError):
+    """A host credential is required or lacks access to a mandatory endpoint."""
 
 
 @dataclass(frozen=True)
@@ -167,26 +192,26 @@ def _sha256_file(path: Path, *, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _stat_identity(stat: os.stat_result) -> tuple[int, int, int, int]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 def _stable_file_sha256(path: Path, *, role: str) -> str:
     before = path.stat()
     digest = _sha256_file(path)
     after = path.stat()
-    identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-    if identity(before) != identity(after):
+    if _stat_identity(before) != _stat_identity(after):
         raise GitLabIngestError(f"{role} changed while hashing: {path}")
     return digest
 
 
-def _atomic_write_json(path: Path, value: object) -> None:
+def _atomic_write_bytes(path: Path, payload: bytes, *, role: str) -> None:
     if path.is_symlink():
-        raise GitLabIngestError(f"refusing to replace symlinked JSON artifact: {path}")
+        raise GitLabIngestError(f"refusing to replace symlinked {role}: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = _canonical_bytes(value, pretty=True)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    temporary = path.with_name(f".{path.name}.tmp")
     if temporary.is_symlink():
-        raise GitLabIngestError(
-            f"refusing symlinked JSON staging artifact: {temporary}"
-        )
+        raise GitLabIngestError(f"refusing symlinked {role} staging file: {temporary}")
     try:
         with temporary.open("wb") as handle:
             handle.write(payload)
@@ -203,6 +228,52 @@ def _atomic_write_json(path: Path, value: object) -> None:
             temporary.unlink()
 
 
+def _atomic_write_json(path: Path, value: object) -> None:
+    _atomic_write_bytes(
+        path,
+        _canonical_bytes(value, pretty=True),
+        role="JSON artifact",
+    )
+
+
+def _require_gzip_sidecar_path(path: Path) -> None:
+    if not path.name.endswith(".json.gz"):
+        raise GitLabIngestError(f"GitLab MR sidecar must end in .json.gz: {path}")
+
+
+def _gzip_physical_bound(logical_bound: int) -> int:
+    return logical_bound + logical_bound // 1000 + 1024
+
+
+def _canonical_gzip_bytes(value: object) -> bytes:
+    buffer = io.BytesIO()
+    with gzip.GzipFile(
+        filename="",
+        mode="wb",
+        compresslevel=9,
+        fileobj=buffer,
+        mtime=0,
+    ) as handle:
+        handle.write(_canonical_bytes(value, pretty=True))
+    return buffer.getvalue()
+
+
+def _atomic_write_gzip_json(
+    path: Path,
+    value: object,
+    *,
+    max_compressed_bytes: int | None = None,
+) -> None:
+    _require_gzip_sidecar_path(path)
+    payload = _canonical_gzip_bytes(value)
+    if max_compressed_bytes is not None and len(payload) > max_compressed_bytes:
+        raise GitLabIngestError(
+            f"GitLab MR sidecar exceeds the {max_compressed_bytes}-byte physical "
+            f"bound: {path}"
+        )
+    _atomic_write_bytes(path, payload, role="gzip JSON sidecar")
+
+
 def _read_json_object(
     path: Path, *, role: str, max_bytes: int = 32 * 1024 * 1024
 ) -> dict:
@@ -217,8 +288,7 @@ def _read_json_object(
     except OSError as exc:
         raise GitLabIngestError(f"{role} cannot be read: {path}: {exc}") from exc
     after = path.stat()
-    identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
-    if len(payload) != size or identity(before) != identity(after):
+    if len(payload) != size or _stat_identity(before) != _stat_identity(after):
         raise GitLabIngestError(f"{role} changed while reading: {path}")
     try:
         value = json.loads(payload)
@@ -229,12 +299,90 @@ def _read_json_object(
     return value
 
 
+def _read_gzip_json_object(
+    path: Path,
+    *,
+    role: str,
+    max_compressed_bytes: int,
+    max_decompressed_bytes: int,
+) -> dict:
+    _require_gzip_sidecar_path(path)
+    if not path.is_file() or path.is_symlink():
+        raise GitLabIngestError(f"{role} is missing or symlinked: {path}")
+    before = path.stat()
+    if before.st_size < 1 or before.st_size > max_compressed_bytes:
+        raise GitLabIngestError(
+            f"{role} has invalid compressed byte size {before.st_size}: {path}"
+        )
+    try:
+        compressed = path.read_bytes()
+        header = compressed[:8]
+        if (
+            header[:3] != b"\x1f\x8b\x08"
+            or len(header) != 8
+            or int.from_bytes(header[4:8], "little") != 0
+        ):
+            raise GitLabIngestError(f"{role} lacks deterministic gzip mtime=0: {path}")
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as handle:
+            payload = handle.read(max_decompressed_bytes + 1)
+    except (EOFError, gzip.BadGzipFile, OSError) as exc:
+        raise GitLabIngestError(f"{role} is invalid gzip: {path}: {exc}") from exc
+    after = path.stat()
+    if len(compressed) != before.st_size or _stat_identity(before) != _stat_identity(
+        after
+    ):
+        raise GitLabIngestError(f"{role} changed while reading: {path}")
+    if len(payload) > max_decompressed_bytes:
+        raise GitLabIngestError(
+            f"{role} exceeds the {max_decompressed_bytes}-byte decompression bound: "
+            f"{path}"
+        )
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GitLabIngestError(f"{role} is invalid JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise GitLabIngestError(f"{role} must be a JSON object: {path}")
+    if payload != _canonical_bytes(value, pretty=True):
+        raise GitLabIngestError(f"{role} is not canonical JSON: {path}")
+    if compressed != _canonical_gzip_bytes(value):
+        raise GitLabIngestError(f"{role} is not deterministic canonical gzip: {path}")
+    return value
+
+
+def _discard_stale_sidecar_temporaries(sidecar_root: Path) -> None:
+    if not sidecar_root.exists():
+        return
+    if sidecar_root.is_symlink() or not sidecar_root.is_dir():
+        raise GitLabIngestError(
+            f"GitLab MR sidecar root is not a safe directory: {sidecar_root}"
+        )
+    for artifact in sidecar_root.rglob("*"):
+        if not _SIDECAR_TEMP_RE.fullmatch(artifact.name):
+            continue
+        if artifact.is_symlink() or not artifact.is_file():
+            raise GitLabIngestError(
+                f"GitLab MR stale sidecar staging path is unsafe: {artifact}"
+            )
+        artifact.unlink()
+
+
+def _sidecar_binding(path: Path, value: object) -> dict[str, object]:
+    _require_gzip_sidecar_path(path)
+    logical = _canonical_bytes(value, pretty=True)
+    return {
+        "physical_sha256": _stable_file_sha256(
+            path,
+            role="GitLab MR compressed sidecar",
+        ),
+        "physical_byte_size": path.stat().st_size,
+        "logical_sha256": hashlib.sha256(logical).hexdigest(),
+        "logical_byte_size": len(logical),
+    }
+
+
 def _utc_now() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _parse_time(value: object, *, field: str) -> datetime:
@@ -247,14 +395,12 @@ def _parse_time(value: object, *, field: str) -> datetime:
         raise GitLabIngestError(f"{field} is not ISO-8601: {value!r}") from exc
     if parsed.tzinfo is None:
         raise GitLabIngestError(f"{field} must include a timezone: {value!r}")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _format_time(value: datetime) -> str:
     return (
-        value.astimezone(timezone.utc)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
+        value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     )
 
 
@@ -270,22 +416,53 @@ def _require_sha(value: object, *, field: str) -> str:
     return value.lower()
 
 
-def _parse_project_identity(identity: str) -> GitLabProject:
+def _canonical_expected_hosts(hosts: Iterable[str]) -> tuple[str, ...]:
+    raw_values = tuple(hosts)
+    if not raw_values:
+        raise GitLabIngestError("at least one GitLab hostname is required")
+    if any(not isinstance(host, str) for host in raw_values):
+        raise GitLabIngestError("GitLab hostnames must be strings")
+    values = tuple(sorted(raw_values))
+    if len(values) != len(set(values)):
+        raise GitLabIngestError("GitLab hostnames must be unique")
+    for host in values:
+        if not isinstance(host, str) or _HOST_RE.fullmatch(host) is None:
+            raise GitLabIngestError(
+                f"GitLab hostname must be canonical lowercase DNS: {host!r}"
+            )
+    return values
+
+
+def _parse_project_identity(
+    identity: str,
+    *,
+    expected_host: str | None = None,
+) -> GitLabProject:
     if identity.count("/") != 1:
         raise GitLabIngestError(f"invalid GitLab project identity: {identity!r}")
     host, encoded_path = identity.split("/", 1)
     decoded = urllib.parse.unquote(encoded_path)
     normalized = urllib.parse.quote(decoded, safe="")
     if (
-        not host.startswith("gitlab")
+        _HOST_RE.fullmatch(host) is None
         or "/" not in decoded
         or normalized != encoded_path
     ):
         raise GitLabIngestError(f"non-canonical GitLab project identity: {identity!r}")
+    if expected_host is not None and host != expected_host:
+        raise GitLabIngestError(
+            "GitLab host/identity mismatch: "
+            f"configured={expected_host!r} identity={identity!r}"
+        )
     return GitLabProject(identity=identity, host=host, encoded_path=encoded_path)
 
 
-def load_gitlab_repos(repo_list: Path) -> tuple[GitLabProject, ...]:
+def load_gitlab_repos(
+    repo_list: Path,
+    *,
+    expected_hosts: Iterable[str],
+) -> tuple[GitLabProject, ...]:
+    hosts = _canonical_expected_hosts(expected_hosts)
     document = _read_json_object(repo_list, role="GitLab repo list")
     if document.get("schema_version") != 2 or document.get("unresolved") != []:
         raise GitLabIngestError("GitLab repo list must be resolved schema_version 2")
@@ -297,23 +474,49 @@ def load_gitlab_repos(repo_list: Path) -> tuple[GitLabProject, ...]:
         if not isinstance(row, dict):
             raise GitLabIngestError(f"repo_list repos[{index}] must be an object")
         identity = row.get("project_identity")
-        if isinstance(identity, str) and identity.startswith("gitlab"):
-            if row.get("owner_repo") is not None:
-                raise GitLabIngestError(
-                    f"GitLab repo_list row must not masquerade as GitHub: {identity}"
+        if not isinstance(identity, str):
+            raise GitLabIngestError(
+                f"repo_list repos[{index}].project_identity must be a string"
+            )
+        identity_host, separator, _encoded_path = identity.partition("/")
+        if not separator or identity_host not in hosts:
+            continue
+        project = _parse_project_identity(identity, expected_host=identity_host)
+        if row.get("owner_repo") is not None:
+            raise GitLabIngestError(
+                f"GitLab repo_list row must not masquerade as GitHub: {identity}"
+            )
+        for field in ("remote_url", "url"):
+            remote = row.get(field)
+            if remote is None:
+                continue
+            try:
+                resolved = resolve_remote_project_identity(
+                    remote,
+                    source=f"repo_list repos[{index}].{field}",
                 )
-            identities.append(identity)
+            except SymbolIdentityError as exc:
+                raise GitLabIngestError(str(exc)) from exc
+            if resolved.project_identity != project.identity:
+                raise GitLabIngestError(
+                    "GitLab host/identity mismatch: "
+                    f"identity={project.identity!r} {field}={remote!r} "
+                    f"resolved={resolved.project_identity!r}"
+                )
+        identities.append(project.identity)
     if len(identities) != len(set(identities)):
         raise GitLabIngestError("canonical GitLab repo scope contains duplicates")
-    observed = tuple(sorted(identities))
-    expected = tuple(sorted(_EXPECTED_GITLAB_REPOS))
-    if observed != expected:
+    projects = tuple(
+        _parse_project_identity(identity) for identity in sorted(identities)
+    )
+    observed_hosts = {project.host for project in projects}
+    if observed_hosts != set(hosts):
         raise GitLabIngestError(
-            "canonical GitLab repo scope drifted: "
-            f"missing={sorted(set(expected) - set(observed))} "
-            f"extra={sorted(set(observed) - set(expected))}"
+            "GitLab host/repo-list scope mismatch: "
+            f"missing_hosts={sorted(set(hosts) - observed_hosts)} "
+            f"extra_hosts={sorted(observed_hosts - set(hosts))}"
         )
-    return tuple(_parse_project_identity(identity) for identity in observed)
+    return projects
 
 
 def classify_diff_paths(diffs: Iterable[Mapping[str, object]]) -> dict[str, list[dict]]:
@@ -348,7 +551,7 @@ def _candidate(metadata: Mapping[str, object]) -> bool:
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
@@ -358,6 +561,7 @@ class GitLabClient:
         *,
         allowed_hosts: Iterable[str],
         token_env_by_host: Mapping[str, str],
+        public_hosts: Iterable[str] = (),
         max_response_bytes: int,
         max_retries: int,
         timeout_s: float,
@@ -366,6 +570,35 @@ class GitLabClient:
         self.max_response_bytes = max_response_bytes
         self.max_retries = max_retries
         self.timeout_s = timeout_s
+        public_host_values = tuple(public_hosts)
+        if any(
+            not isinstance(host, str) or _HOST_RE.fullmatch(host) is None
+            for host in public_host_values
+        ):
+            raise GitLabIngestError(
+                "public GitLab hosts must be canonical lowercase DNS names"
+            )
+        if len(public_host_values) != len(set(public_host_values)):
+            raise GitLabIngestError("public GitLab hosts must be unique")
+        self.public_hosts = frozenset(public_host_values)
+        token_hosts = set(token_env_by_host)
+        overlap = token_hosts & self.public_hosts
+        if overlap:
+            raise GitLabIngestError(
+                "GitLab host authentication modes overlap: "
+                f"{sorted(overlap)}"
+            )
+        extra_public = self.public_hosts - self.allowed_hosts
+        if extra_public:
+            raise GitLabIngestError(
+                f"public GitLab host is outside the allowed scope: {sorted(extra_public)}"
+            )
+        uncovered = self.allowed_hosts - token_hosts - self.public_hosts
+        if uncovered:
+            raise GitLabIngestError(
+                "GitLab host authentication coverage is incomplete: "
+                f"missing={sorted(uncovered)}"
+            )
         self.tokens: dict[str, str] = {}
         for host, env_name in token_env_by_host.items():
             if host not in self.allowed_hosts:
@@ -382,17 +615,25 @@ class GitLabClient:
 
     def _validate_url(self, url: str) -> str:
         parsed = urllib.parse.urlsplit(url)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise GitLabIngestError(
+                f"refusing malformed GitLab API URL: {url}"
+            ) from exc
         if (
             parsed.scheme != "https"
             or parsed.hostname not in self.allowed_hosts
+            or port not in (None, 443)
             or parsed.username is not None
             or parsed.password is not None
             or not parsed.path.startswith("/api/v4/projects/")
+            or parsed.fragment
         ):
             raise GitLabIngestError(f"refusing out-of-contract GitLab API URL: {url}")
         return str(parsed.hostname)
 
-    def _read(self, handle, *, url: str) -> bytes:  # noqa: ANN001
+    def _read(self, handle, *, url: str) -> bytes:
         body = handle.read(self.max_response_bytes + 1)
         if len(body) > self.max_response_bytes:
             raise GitLabIngestError(
@@ -419,6 +660,32 @@ class GitLabClient:
             return min(60.0, delay)
         return min(30.0, float(2 ** min(attempt, 5)))
 
+    def _authentication_error(
+        self,
+        *,
+        host: str,
+        status: int,
+        url: str,
+    ) -> GitLabAuthenticationError:
+        # Do not include the URL query or response body: either could carry data
+        # that does not belong in a retry/watchdog diagnostic.
+        endpoint = urllib.parse.urlsplit(url).path
+        if host in self.public_hosts:
+            guidance = (
+                f"replace --public-host {host} with --token-env "
+                f"{host}=ENV_NAME using a host-scoped token with read_api access"
+            )
+        else:
+            guidance = (
+                f"replace or reauthorize the configured host-scoped token for {host} "
+                "with read_api access"
+            )
+        return GitLabAuthenticationError(
+            f"GitLab HTTP {status} authentication/authorization denied for "
+            f"host {host} endpoint {endpoint}; {guidance}. "
+            "No completion receipt will be published."
+        )
+
     def get(
         self, url: str, *, terminal_statuses: set[int] | None = None
     ) -> APIResponse:
@@ -433,6 +700,11 @@ class GitLabClient:
             }
             if host in self.tokens:
                 headers["PRIVATE-TOKEN"] = self.tokens[host]
+            elif host not in self.public_hosts:
+                raise GitLabIngestError(
+                    "GitLab request host has no explicit authentication mode: "
+                    f"{host}"
+                )
             request = urllib.request.Request(url, headers=headers, method="GET")
             try:
                 with self.opener.open(request, timeout=self.timeout_s) as response:
@@ -450,7 +722,7 @@ class GitLabClient:
             except _TRANSIENT_ERRORS as exc:
                 attempt += 1
                 if attempt > self.max_retries:
-                    raise GitLabIngestError(
+                    raise GitLabTransientError(
                         f"GitLab transport retry budget exhausted for {url}: {exc}"
                     ) from exc
                 time.sleep(min(30.0, float(2 ** min(attempt - 1, 5))))
@@ -459,11 +731,13 @@ class GitLabClient:
             if status in _TRANSIENT_STATUSES:
                 attempt += 1
                 if attempt > self.max_retries:
-                    raise GitLabIngestError(
+                    raise GitLabTransientError(
                         f"GitLab HTTP retry budget exhausted at status {status}: {url}"
                     )
                 time.sleep(self._delay(response_headers, attempt - 1))
                 continue
+            if status in _AUTH_DENIAL_STATUSES:
+                raise self._authentication_error(host=host, status=status, url=url)
             if status not in {200, *terminal_statuses}:
                 preview = body_bytes[:1000].decode("utf-8", errors="replace")
                 raise GitLabIngestError(f"GitLab HTTP {status} for {url}: {preview}")
@@ -494,26 +768,64 @@ def _next_page_url(
     page_size: int,
     item_count: int,
 ) -> str | None:
-    link = response.headers.get("link")
-    if link:
-        match = _LINK_NEXT_RE.search(link)
-        if match:
-            return urllib.parse.urljoin(response.url, match.group(1))
     raw_next = response.headers.get("x-next-page")
+    header_next_page: int | None = None
     if raw_next:
         try:
-            next_page = int(raw_next)
+            header_next_page = int(raw_next)
         except ValueError as exc:
             raise GitLabIngestError(
                 f"invalid X-Next-Page header: {raw_next!r}"
             ) from exc
-        if next_page <= page:
+        if header_next_page != page + 1:
             raise GitLabIngestError(
-                f"non-advancing X-Next-Page header: {raw_next!r} after page {page}"
+                f"non-consecutive X-Next-Page header: {raw_next!r} after page {page}"
             )
+    link = response.headers.get("link")
+    if link:
+        matches = _LINK_NEXT_RE.findall(link)
+        if len(matches) > 1:
+            raise GitLabIngestError("ambiguous GitLab pagination Link header")
+        if matches:
+            candidate = urllib.parse.urljoin(response.url, matches[0])
+            current_url = urllib.parse.urlsplit(response.url)
+            next_url = urllib.parse.urlsplit(candidate)
+            next_query = urllib.parse.parse_qsl(
+                next_url.query,
+                keep_blank_values=True,
+            )
+            next_pages = [value for key, value in next_query if key == "page"]
+            if (
+                next_url.fragment
+                or (
+                    current_url.scheme,
+                    current_url.netloc,
+                    current_url.path,
+                )
+                != (next_url.scheme, next_url.netloc, next_url.path)
+                or next_pages != [str(page + 1)]
+            ):
+                raise GitLabIngestError(
+                    f"refusing out-of-scope GitLab pagination link: {candidate}"
+                )
+            # GitLab can append defaults (and normalize timestamp precision) to
+            # Link URLs.  Treat the link only as a same-endpoint page signal and
+            # rebuild the request from the pinned query we originally sent.
+            current_query = urllib.parse.parse_qsl(
+                current_url.query,
+                keep_blank_values=True,
+            )
+            next_query = [
+                (key, value) for key, value in current_query if key != "page"
+            ]
+            next_query.append(("page", str(page + 1)))
+            return urllib.parse.urlunsplit(
+                current_url._replace(query=urllib.parse.urlencode(next_query))
+            )
+    if header_next_page is not None:
         parsed = urllib.parse.urlsplit(response.url)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        query["page"] = [str(next_page)]
+        query["page"] = [str(header_next_page)]
         return urllib.parse.urlunsplit(
             parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
         )
@@ -629,17 +941,24 @@ class Manifest:
         repo_list: Path,
         repo_list_sha256: str,
         projects: tuple[GitLabProject, ...],
+        expected_hosts: tuple[str, ...],
         config: Mapping[str, object],
     ):
         self.path = path
+        expected_hosts = _canonical_expected_hosts(expected_hosts)
         expected_config = dict(config)
         if path.exists():
             self.data = _read_json_object(path, role="GitLab MR manifest")
+            if self.data.get("contract_sha256") != GITLAB_CONTRACT_SHA256:
+                raise GitLabIngestError(
+                    "existing GitLab MR manifest uses a superseded contract; "
+                    "preserve it for audit and use a new immutable output root"
+                )
             if (
                 self.data.get("schema") != GITLAB_MANIFEST_SCHEMA
-                or self.data.get("contract_sha256") != GITLAB_CONTRACT_SHA256
                 or self.data.get("repo_list")
                 != {"path": str(repo_list.resolve()), "sha256": repo_list_sha256}
+                or self.data.get("expected_hosts") != list(expected_hosts)
                 or self.data.get("config") != expected_config
                 or set(self.data.get("projects", {}))
                 != {item.identity for item in projects}
@@ -650,7 +969,7 @@ class Manifest:
         else:
             started = _utc_now()
             scan_id = hashlib.sha256(
-                f"{GITLAB_CONTRACT_SHA256}:{started}:{os.getpid()}".encode("utf-8")
+                f"{GITLAB_CONTRACT_SHA256}:{started}:{os.getpid()}".encode()
             ).hexdigest()
             self.data = {
                 "schema": GITLAB_MANIFEST_SCHEMA,
@@ -661,6 +980,7 @@ class Manifest:
                     "path": str(repo_list.resolve()),
                     "sha256": repo_list_sha256,
                 },
+                "expected_hosts": list(expected_hosts),
                 "config": expected_config,
                 "projects": {
                     project.identity: {
@@ -736,17 +1056,31 @@ class RunLock:
 
 
 def _sidecar_path(root: Path, section: str, project: GitLabProject, iid: int) -> Path:
-    return root / section / project.sidecar_key / f"{iid:012d}.json"
+    return root / section / project.sidecar_key / f"{iid:012d}.json.gz"
 
 
-def _write_bound_sidecar(path: Path, value: dict, *, scan_id: str) -> None:
+def _write_bound_sidecar(
+    path: Path,
+    value: dict,
+    *,
+    scan_id: str,
+    max_decompressed_bytes: int = 256 * 1024 * 1024,
+) -> None:
+    _require_gzip_sidecar_path(path)
     if path.is_symlink():
         raise GitLabIngestError(f"GitLab MR sidecar is symlinked: {path}")
+    logical_size = len(_canonical_bytes(value, pretty=True))
+    if logical_size > max_decompressed_bytes:
+        raise GitLabIngestError(
+            f"GitLab MR sidecar exceeds the {max_decompressed_bytes}-byte logical "
+            f"bound: {path}"
+        )
     if path.exists():
-        existing = _read_json_object(
+        existing = _read_gzip_json_object(
             path,
             role="GitLab MR sidecar",
-            max_bytes=256 * 1024 * 1024,
+            max_compressed_bytes=_gzip_physical_bound(max_decompressed_bytes),
+            max_decompressed_bytes=max_decompressed_bytes,
         )
         if (
             existing.get("scan_id") != scan_id
@@ -759,7 +1093,11 @@ def _write_bound_sidecar(path: Path, value: dict, *, scan_id: str) -> None:
         if existing != value:
             raise GitLabIngestError(f"sidecar content drifted on resume: {path}")
         return
-    _atomic_write_json(path, value)
+    _atomic_write_gzip_json(
+        path,
+        value,
+        max_compressed_bytes=_gzip_physical_bound(max_decompressed_bytes),
+    )
 
 
 def _inventory_page_journal_path(manifest: Manifest) -> Path:
@@ -1227,7 +1565,7 @@ def _record_for_store(
     comments: list[dict[str, object]],
     linked_issues: list[dict[str, object]],
     sidecar_path: Path,
-    sidecar_sha256: str,
+    sidecar_binding: Mapping[str, object],
     scan_id: str,
     fetched_at: str,
 ) -> dict[str, object]:
@@ -1262,7 +1600,7 @@ def _record_for_store(
             "merge_commit_sha": detail["merge_commit_sha"],
             "record_sidecar": {
                 "path": str(sidecar_path.resolve()),
-                "sha256": sidecar_sha256,
+                **sidecar_binding,
             },
         },
     }
@@ -1363,10 +1701,12 @@ def _existing_record_sidecar(
     if not existing:
         return None
     path = existing[0]
-    record = _read_json_object(
+    max_bytes = _record_sidecar_max_bytes(manifest)
+    record = _read_gzip_json_object(
         path,
         role="GitLab MR routed sidecar",
-        max_bytes=_record_sidecar_max_bytes(manifest),
+        max_compressed_bytes=_gzip_physical_bound(max_bytes),
+        max_decompressed_bytes=max_bytes,
     )
     expected_route = path.parent.parent.name
     if (
@@ -1409,7 +1749,9 @@ def _validate_routed_diffs(record: Mapping[str, object], *, route: str) -> None:
     expected_route = (
         "primary"
         if groups["primary"]
-        else "ancillary" if groups["ancillary"] else "excluded"
+        else "ancillary"
+        if groups["ancillary"]
+        else "excluded"
     )
     if route != expected_route:
         raise GitLabIngestError(
@@ -1486,9 +1828,7 @@ def _materialize_record_sidecar(
         comments=comments,
         linked_issues=normalized_issues,
         sidecar_path=record_path,
-        sidecar_sha256=_stable_file_sha256(
-            record_path, role="GitLab MR routed sidecar"
-        ),
+        sidecar_binding=_sidecar_binding(record_path, record),
         scan_id=manifest.scan_id,
         fetched_at=str(fetched_at),
     )
@@ -1522,6 +1862,7 @@ def _process_candidate(
     max_detail_bytes: int,
 ) -> str:
     iid = _require_int(metadata.get("iid"), field="metadata.iid", minimum=1)
+    record_max_bytes = _record_sidecar_max_bytes(manifest)
     existing = _existing_record_sidecar(
         manifest,
         project,
@@ -1562,6 +1903,7 @@ def _process_candidate(
             _sidecar_path(sidecar_root, "records/terminal", project, iid),
             record,
             scan_id=manifest.scan_id,
+            max_decompressed_bytes=record_max_bytes,
         )
         return "terminal"
     if not isinstance(detail_response.body, dict):
@@ -1609,6 +1951,7 @@ def _process_candidate(
             _sidecar_path(sidecar_root, "records/terminal", project, iid),
             record,
             scan_id=manifest.scan_id,
+            max_decompressed_bytes=record_max_bytes,
         )
         return "terminal"
     changes_count = detail.get("changes_count")
@@ -1638,6 +1981,7 @@ def _process_candidate(
             _sidecar_path(sidecar_root, "records/terminal", project, iid),
             record,
             scan_id=manifest.scan_id,
+            max_decompressed_bytes=record_max_bytes,
         )
         return "terminal"
 
@@ -1645,7 +1989,9 @@ def _process_candidate(
     route = (
         "primary"
         if routed["primary"]
-        else "ancillary" if routed["ancillary"] else "excluded"
+        else "ancillary"
+        if routed["ancillary"]
+        else "excluded"
     )
     discussions: list[dict] = []
     linked_issues: list[dict] = []
@@ -1660,15 +2006,21 @@ def _process_candidate(
             terminal_statuses=_TERMINAL_DETAIL_STATUSES,
         )
         lineage.extend(discussion_lineage)
-        if any(
-            item["status"] in _TERMINAL_DETAIL_STATUSES for item in discussion_lineage
-        ):
+        discussion_terminal_status = next(
+            (
+                item["status"]
+                for item in discussion_lineage
+                if item["status"] in _TERMINAL_DETAIL_STATUSES
+            ),
+            None,
+        )
+        if discussion_terminal_status is not None:
             terminal = _terminal_record(
                 manifest,
                 project,
                 iid,
                 metadata,
-                reason="primary_discussions_endpoint_terminal",
+                reason=f"primary_discussions_http_{discussion_terminal_status}",
                 lineage=lineage,
             )
             terminal["merge_request"] = detail
@@ -1677,6 +2029,7 @@ def _process_candidate(
                 _sidecar_path(sidecar_root, "records/terminal", project, iid),
                 terminal,
                 scan_id=manifest.scan_id,
+                max_decompressed_bytes=record_max_bytes,
             )
             return "terminal"
         linked_issues, issue_lineage, _, _issue_bytes = _paged_get(
@@ -1689,13 +2042,21 @@ def _process_candidate(
             terminal_statuses=_TERMINAL_DETAIL_STATUSES,
         )
         lineage.extend(issue_lineage)
-        if any(item["status"] in _TERMINAL_DETAIL_STATUSES for item in issue_lineage):
+        issue_terminal_status = next(
+            (
+                item["status"]
+                for item in issue_lineage
+                if item["status"] in _TERMINAL_DETAIL_STATUSES
+            ),
+            None,
+        )
+        if issue_terminal_status is not None:
             terminal = _terminal_record(
                 manifest,
                 project,
                 iid,
                 metadata,
-                reason="primary_linked_issues_endpoint_terminal",
+                reason=f"primary_linked_issues_http_{issue_terminal_status}",
                 lineage=lineage,
             )
             terminal["merge_request"] = detail
@@ -1705,6 +2066,7 @@ def _process_candidate(
                 _sidecar_path(sidecar_root, "records/terminal", project, iid),
                 terminal,
                 scan_id=manifest.scan_id,
+                max_decompressed_bytes=record_max_bytes,
             )
             return "terminal"
 
@@ -1734,7 +2096,12 @@ def _process_candidate(
         "lineage": lineage,
     }
     record_path = _sidecar_path(sidecar_root, f"records/{route}", project, iid)
-    _write_bound_sidecar(record_path, record, scan_id=manifest.scan_id)
+    _write_bound_sidecar(
+        record_path,
+        record,
+        scan_id=manifest.scan_id,
+        max_decompressed_bytes=record_max_bytes,
+    )
     return _materialize_record_sidecar(
         record,
         record_path,
@@ -1775,10 +2142,11 @@ def _details_project(
                 f"GitLab MR inventory sidecar is symlinked: {inventory_path}"
             )
         if inventory_path.exists():
-            inventory = _read_json_object(
+            inventory = _read_gzip_json_object(
                 inventory_path,
                 role="GitLab MR inventory sidecar",
-                max_bytes=256 * 1024 * 1024,
+                max_compressed_bytes=_gzip_physical_bound(256 * 1024 * 1024),
+                max_decompressed_bytes=256 * 1024 * 1024,
             )
             if (
                 inventory.get("schema") != GITLAB_INVENTORY_SCHEMA
@@ -1832,10 +2200,14 @@ def _hash_sidecars(
     manifest: Manifest,
     projects: tuple[GitLabProject, ...],
     sidecar_root: Path,
-) -> tuple[str, int, int]:
-    digest = hashlib.sha256()
+) -> tuple[str, str, int, int, int]:
+    physical_digest = hashlib.sha256()
+    logical_digest = hashlib.sha256()
+    seen: set[Path] = set()
     files = 0
-    byte_size = 0
+    physical_bytes = 0
+    logical_bytes = 0
+    record_max_bytes = _record_sidecar_max_bytes(manifest)
     for project in projects:
         state = manifest.project(project.identity)
         max_iid = _require_int(state["inventory"]["max_iid"], field="max_iid")
@@ -1854,15 +2226,52 @@ def _hash_sidecars(
                     raise GitLabIngestError(
                         f"GitLab MR sidecar is not a regular file: {path}"
                     )
+                max_bytes = (
+                    256 * 1024 * 1024
+                    if path.relative_to(sidecar_root).parts[0] == "inventory"
+                    else record_max_bytes
+                )
+                value = _read_gzip_json_object(
+                    path,
+                    role="GitLab MR sidecar",
+                    max_compressed_bytes=_gzip_physical_bound(max_bytes),
+                    max_decompressed_bytes=max_bytes,
+                )
                 relative = path.relative_to(sidecar_root).as_posix()
-                sha = _stable_file_sha256(path, role="GitLab MR sidecar")
-                size = path.stat().st_size
-                encoded = f"{relative}\0{size}\0{sha}".encode("utf-8")
-                digest.update(len(encoded).to_bytes(8, "big"))
-                digest.update(encoded)
+                binding = _sidecar_binding(path, value)
+                physical = (
+                    f"{relative}\0{binding['physical_byte_size']}\0"
+                    f"{binding['physical_sha256']}"
+                ).encode()
+                logical = (
+                    f"{relative}\0{binding['logical_byte_size']}\0"
+                    f"{binding['logical_sha256']}"
+                ).encode()
+                physical_digest.update(len(physical).to_bytes(8, "big"))
+                physical_digest.update(physical)
+                logical_digest.update(len(logical).to_bytes(8, "big"))
+                logical_digest.update(logical)
+                seen.add(path)
                 files += 1
-                byte_size += size
-    return digest.hexdigest(), files, byte_size
+                physical_bytes += int(binding["physical_byte_size"])
+                logical_bytes += int(binding["logical_byte_size"])
+    if sidecar_root.exists():
+        for artifact in sidecar_root.rglob("*"):
+            if artifact.is_symlink():
+                raise GitLabIngestError(
+                    f"GitLab MR sidecar tree contains a symlink: {artifact}"
+                )
+            if artifact.is_file() and artifact not in seen:
+                raise GitLabIngestError(
+                    f"GitLab MR sidecar tree contains an unexpected artifact: {artifact}"
+                )
+    return (
+        physical_digest.hexdigest(),
+        logical_digest.hexdigest(),
+        files,
+        physical_bytes,
+        logical_bytes,
+    )
 
 
 def _store_counts(path: Path, scan_id: str) -> tuple[int, int, dict[str, int]]:
@@ -1891,7 +2300,7 @@ def _store_counts(path: Path, scan_id: str) -> tuple[int, int, dict[str, int]]:
 
 
 def _update_membership_digest(digest: Any, repo: str, iid: int) -> None:
-    encoded = f"{repo}\0{iid}".encode("utf-8")
+    encoded = f"{repo}\0{iid}".encode()
     digest.update(len(encoded).to_bytes(8, "big"))
     digest.update(encoded)
 
@@ -2093,9 +2502,13 @@ def _build_completion_receipt(
             raise GitLabIngestError(
                 f"GitLab {route} store membership differs from routed sidecars"
             )
-    sidecar_sha, sidecar_files, sidecar_bytes = _hash_sidecars(
-        manifest, projects, sidecar_root
-    )
+    (
+        sidecar_physical_sha,
+        sidecar_logical_sha,
+        sidecar_files,
+        sidecar_physical_bytes,
+        sidecar_logical_bytes,
+    ) = _hash_sidecars(manifest, projects, sidecar_root)
     inventory_count = sum(
         _require_int(
             manifest.project(project.identity)["inventory"]["count"],
@@ -2130,6 +2543,9 @@ def _build_completion_receipt(
             f"files={sidecar_files} inventory={inventory_count} "
             f"candidates={candidate_count}"
         )
+    expected_hosts = sorted({project.host for project in projects})
+    if manifest.data.get("expected_hosts") != expected_hosts:
+        raise GitLabIngestError("GitLab manifest expected host scope drifted")
     return {
         "schema": GITLAB_COMPLETION_SCHEMA,
         "status": "verified",
@@ -2151,10 +2567,17 @@ def _build_completion_receipt(
         },
         "sidecars": {
             "root": str(sidecar_root.resolve()),
-            "logical_set_sha256": sidecar_sha,
+            "format": "canonical-json-gzip",
+            "gzip_mtime": 0,
+            "physical_set_sha256": sidecar_physical_sha,
+            "logical_set_sha256": sidecar_logical_sha,
             "files": sidecar_files,
-            "byte_size": sidecar_bytes,
+            "physical_byte_size": sidecar_physical_bytes,
+            "logical_byte_size": sidecar_logical_bytes,
         },
+        "expected_host_count": len(expected_hosts),
+        "expected_hosts": expected_hosts,
+        "expected_hosts_sha256": _canonical_sha256(expected_hosts),
         "expected_repo_count": len(expected_repos),
         "expected_repos": expected_repos,
         "expected_repos_sha256": _canonical_sha256(expected_repos),
@@ -2174,6 +2597,7 @@ def _build_completion_receipt(
             "primary_ancillary_physical_separation": True,
             "store_counts_match_manifest": True,
             "immutable_artifact_hashes": True,
+            "deterministic_gzip_sidecars": True,
             "terminal_http_statuses_preserved": True,
             "exact_primary_membership_verified": False,
         },
@@ -2184,6 +2608,25 @@ def _require_checkpointed_store(path: Path) -> None:
     wal = Path(f"{path}-wal")
     if wal.exists() and wal.stat().st_size:
         raise GitLabIngestError(f"GitLab completion store has a nonempty WAL: {wal}")
+
+
+def _receipt_expected_hosts(receipt: Mapping[str, object]) -> tuple[str, ...]:
+    raw_hosts = receipt.get("expected_hosts")
+    if not isinstance(raw_hosts, list):
+        raise GitLabIngestError("GitLab MR completion expected_hosts is malformed")
+    hosts = _canonical_expected_hosts(raw_hosts)
+    if (
+        raw_hosts != list(hosts)
+        or _require_int(
+            receipt.get("expected_host_count"),
+            field="expected_host_count",
+            minimum=1,
+        )
+        != len(hosts)
+        or receipt.get("expected_hosts_sha256") != _canonical_sha256(list(hosts))
+    ):
+        raise GitLabIngestError("GitLab MR completion host scope drifted")
+    return hosts
 
 
 def load_gitlab_completion_binding(
@@ -2204,9 +2647,14 @@ def load_gitlab_completion_binding(
         receipt.get("schema") != GITLAB_COMPLETION_SCHEMA
         or receipt.get("status") != "verified"
         or receipt.get("platform") != GITLAB_PLATFORM
-        or receipt.get("contract_sha256") != GITLAB_CONTRACT_SHA256
     ):
         raise GitLabIngestError("GitLab MR completion receipt contract is unsupported")
+    if receipt.get("contract_sha256") != GITLAB_CONTRACT_SHA256:
+        raise GitLabIngestError(
+            "GitLab MR completion receipt uses a superseded contract; it is not "
+            "complete under current rules. Preserve it for audit and use a new "
+            "immutable output root."
+        )
     canonical = _canonical_bytes(receipt, pretty=True)
     if receipt_path.read_bytes() != canonical:
         raise GitLabIngestError("GitLab MR completion receipt is not canonical JSON")
@@ -2225,6 +2673,7 @@ def load_gitlab_completion_binding(
         "primary_ancillary_physical_separation": True,
         "store_counts_match_manifest": True,
         "immutable_artifact_hashes": True,
+        "deterministic_gzip_sidecars": True,
         "terminal_http_statuses_preserved": True,
         "exact_primary_membership_verified": False,
     }:
@@ -2267,7 +2716,49 @@ def load_gitlab_completion_binding(
     if declared_count != candidate_count + noncandidate_count:
         raise GitLabIngestError("GitLab MR completion inventory conservation drifted")
     _parse_time(receipt.get("scan_started_at"), field="scan_started_at")
-    projects = load_gitlab_repos(repo_list)
+    expected_hosts = _receipt_expected_hosts(receipt)
+    sidecars = receipt.get("sidecars")
+    if (
+        not isinstance(sidecars, dict)
+        or set(sidecars)
+        != {
+            "root",
+            "format",
+            "gzip_mtime",
+            "physical_set_sha256",
+            "logical_set_sha256",
+            "files",
+            "physical_byte_size",
+            "logical_byte_size",
+        }
+        or sidecars.get("format") != "canonical-json-gzip"
+        or sidecars.get("gzip_mtime") != 0
+        or not isinstance(sidecars.get("root"), str)
+        or not sidecars.get("root")
+        or re.fullmatch(r"[0-9a-f]{64}", str(sidecars.get("physical_set_sha256") or ""))
+        is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(sidecars.get("logical_set_sha256") or ""))
+        is None
+    ):
+        raise GitLabIngestError("GitLab MR completion sidecar binding is malformed")
+    _require_int(sidecars.get("files"), field="sidecars.files")
+    _require_int(
+        sidecars.get("physical_byte_size"),
+        field="sidecars.physical_byte_size",
+    )
+    _require_int(
+        sidecars.get("logical_byte_size"),
+        field="sidecars.logical_byte_size",
+    )
+    raw_sidecar_root = Path(str(sidecars["root"])).expanduser()
+    if raw_sidecar_root.is_symlink():
+        raise GitLabIngestError(
+            f"GitLab completion sidecar root is symlinked: {raw_sidecar_root}"
+        )
+    sidecar_root = raw_sidecar_root.resolve()
+    if str(sidecars["root"]) != str(sidecar_root):
+        raise GitLabIngestError("GitLab completion sidecar root is not canonical")
+    projects = load_gitlab_repos(repo_list, expected_hosts=expected_hosts)
     expected_repos = [project.identity for project in projects]
     if (
         receipt.get("expected_repos") != expected_repos
@@ -2294,6 +2785,58 @@ def load_gitlab_completion_binding(
             expected_path, role=f"GitLab completion {field}"
         ):
             raise GitLabIngestError(f"GitLab completion {field} hash mismatch")
+    manifest_descriptor = receipt.get("manifest")
+    if not isinstance(manifest_descriptor, dict):
+        raise GitLabIngestError("GitLab completion lacks manifest binding")
+    raw_manifest_path = manifest_descriptor.get("path")
+    if not isinstance(raw_manifest_path, str) or not raw_manifest_path:
+        raise GitLabIngestError("GitLab completion manifest path is malformed")
+    manifest_path = Path(raw_manifest_path).expanduser()
+    if manifest_path.is_symlink():
+        raise GitLabIngestError(
+            f"GitLab completion manifest path is symlinked: {manifest_path}"
+        )
+    manifest_path = manifest_path.resolve()
+    if manifest_descriptor.get("sha256") != _stable_file_sha256(
+        manifest_path,
+        role="GitLab completion manifest",
+    ):
+        raise GitLabIngestError("GitLab completion manifest hash mismatch")
+    manifest_document = _read_json_object(
+        manifest_path,
+        role="GitLab MR manifest",
+    )
+    manifest_projects = manifest_document.get("projects")
+    manifest_config = manifest_document.get("config")
+    if (
+        manifest_document.get("schema") != GITLAB_MANIFEST_SCHEMA
+        or manifest_document.get("contract_sha256") != GITLAB_CONTRACT_SHA256
+        or manifest_document.get("expected_hosts") != list(expected_hosts)
+        or not isinstance(manifest_projects, dict)
+        or not isinstance(manifest_config, dict)
+        or sorted(manifest_projects) != expected_repos
+        or manifest_document.get("repo_list") != receipt.get("repo_list")
+        or manifest_config.get("sidecar_root") != str(sidecar_root)
+    ):
+        raise GitLabIngestError("GitLab completion manifest scope binding drifted")
+    manifest = Manifest(
+        manifest_path,
+        repo_list=repo_list,
+        repo_list_sha256=_stable_file_sha256(repo_list, role="GitLab repo list"),
+        projects=projects,
+        expected_hosts=expected_hosts,
+        config=manifest_config,
+    )
+    actual_sidecars = _hash_sidecars(manifest, projects, sidecar_root)
+    expected_sidecars = (
+        sidecars["physical_set_sha256"],
+        sidecars["logical_set_sha256"],
+        sidecars["files"],
+        sidecars["physical_byte_size"],
+        sidecars["logical_byte_size"],
+    )
+    if actual_sidecars != expected_sidecars:
+        raise GitLabIngestError("GitLab completion sidecar binding drifted")
     scan_id = receipt.get("scan_id")
     if not isinstance(scan_id, str) or re.fullmatch(r"[0-9a-f]{64}", scan_id) is None:
         raise GitLabIngestError("GitLab completion scan_id is invalid")
@@ -2317,8 +2860,10 @@ def load_gitlab_completion_binding(
         ),
         "pr_store_sha256": str(receipt["pr_store"]["sha256"]),
         "repo_list_sha256": str(receipt["repo_list"]["sha256"]),
+        "expected_hosts_sha256": str(receipt["expected_hosts_sha256"]),
         "expected_repos_sha256": str(receipt["expected_repos_sha256"]),
         "scan_id": scan_id,
+        "expected_host_count": len(expected_hosts),
         "expected_repo_count": len(expected_repos),
         "stored_pr_count": current,
         "unverified_store_pr_count": total - current,
@@ -2372,12 +2917,14 @@ def verify_gitlab_completion_receipt(
     config = manifest_document.get("config")
     if not isinstance(config, dict):
         raise GitLabIngestError("GitLab completion manifest config is malformed")
-    projects = load_gitlab_repos(repo_list)
+    expected_hosts = _receipt_expected_hosts(receipt)
+    projects = load_gitlab_repos(repo_list, expected_hosts=expected_hosts)
     manifest = Manifest(
         manifest_path,
         repo_list=repo_list,
         repo_list_sha256=_stable_file_sha256(repo_list, role="GitLab repo list"),
         projects=projects,
+        expected_hosts=expected_hosts,
         config=config,
     )
     rebuilt = _build_completion_receipt(
@@ -2417,7 +2964,7 @@ def _parse_token_env(values: list[str]) -> dict[str, str]:
         host, separator, env_name = value.partition("=")
         if (
             not separator
-            or not host
+            or _HOST_RE.fullmatch(host) is None
             or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name) is None
             or host in result
         ):
@@ -2426,6 +2973,50 @@ def _parse_token_env(values: list[str]) -> dict[str, str]:
             )
         result[host] = env_name
     return result
+
+
+def _parse_public_hosts(values: Iterable[str]) -> tuple[str, ...]:
+    hosts = tuple(values)
+    if any(
+        not isinstance(host, str) or _HOST_RE.fullmatch(host) is None
+        for host in hosts
+    ):
+        raise GitLabIngestError(
+            "--public-host values must be canonical lowercase DNS HOST names"
+        )
+    if len(hosts) != len(set(hosts)):
+        raise GitLabIngestError("--public-host values must be unique")
+    return hosts
+
+
+def _resolve_host_auth(
+    projects: Iterable[GitLabProject],
+    *,
+    token_env_by_host: Mapping[str, str],
+    public_hosts: Iterable[str],
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Resolve one explicit authentication mode for every canonical host."""
+
+    project_values = tuple(projects)
+    expected_hosts = {project.host for project in project_values}
+
+    token_env = dict(token_env_by_host)
+    public_values = _parse_public_hosts(public_hosts)
+    token_hosts = set(token_env)
+    public_set = set(public_values)
+    overlap = token_hosts & public_set
+    covered = token_hosts | public_set
+    missing = expected_hosts - covered
+    extra = covered - expected_hosts
+    if overlap or missing or extra:
+        raise GitLabIngestError(
+            "GitLab host authentication coverage must cover every canonical host "
+            "exactly once: "
+            f"missing={sorted(missing)} "
+            f"extra={sorted(extra)} "
+            f"overlap={sorted(overlap)}"
+        )
+    return token_env, frozenset(public_set)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2460,7 +3051,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="HOST=ENV_NAME",
-        help="Required host-specific PRIVATE-TOKEN environment variable; repeat per host.",
+        help=(
+            "Host-specific PRIVATE-TOKEN environment variable; every exact matching "
+            "repo-list identity is scanned. Repeat per token-authenticated host."
+        ),
+    )
+    parser.add_argument(
+        "--public-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=(
+            "Explicitly use unauthenticated requests for this public host; "
+            "repeat per host."
+        ),
     )
     return parser
 
@@ -2482,7 +3086,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if int(args.max_retries) < 0 or not 0 < timeout_seconds < float("inf"):
         raise GitLabIngestError("--max-retries and --timeout-seconds are out of range")
     repo_list = args.repo_list.expanduser().resolve()
-    projects = load_gitlab_repos(repo_list)
+    token_env = _parse_token_env(args.token_env or [])
+    public_host_values = _parse_public_hosts(getattr(args, "public_host", []) or [])
+    expected_hosts = _canonical_expected_hosts(
+        set(token_env) | set(public_host_values)
+    )
+    projects = load_gitlab_repos(repo_list, expected_hosts=expected_hosts)
+    token_env, public_hosts = _resolve_host_auth(
+        projects,
+        token_env_by_host=token_env,
+        public_hosts=public_host_values,
+    )
     repo_list_sha = _stable_file_sha256(repo_list, role="GitLab repo list")
     manifest_path = args.manifest.expanduser().resolve()
     primary_store = args.primary_store.expanduser().resolve()
@@ -2515,6 +3129,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             pr_store=primary_store,
             repo_list=repo_list,
         )
+        if binding.get("expected_hosts_sha256") != _canonical_sha256(
+            list(expected_hosts)
+        ):
+            raise GitLabIngestError(
+                "configured host authentication scope differs from completed scan"
+            )
         return {"status": "already_complete", "binding": binding}
 
     config = {
@@ -2529,17 +3149,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "max_detail_pages": int(args.max_detail_pages),
         "max_detail_mib": int(args.max_detail_mib),
     }
-    token_env = _parse_token_env(args.token_env)
-    expected_token_hosts = {project.host for project in projects}
-    if set(token_env) != expected_token_hosts:
-        raise GitLabIngestError(
-            "--token-env must cover every canonical GitLab host exactly: "
-            f"missing={sorted(expected_token_hosts - set(token_env))} "
-            f"extra={sorted(set(token_env) - expected_token_hosts)}"
-        )
     client = GitLabClient(
-        allowed_hosts=(project.host for project in projects),
+        allowed_hosts=expected_hosts,
         token_env_by_host=token_env,
+        public_hosts=public_hosts,
         max_response_bytes=int(args.max_response_mib) * 1024 * 1024,
         max_retries=int(args.max_retries),
         timeout_s=timeout_seconds,
@@ -2547,11 +3160,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     for project in projects:
         _preflight_project_access(client, project)
     with RunLock(manifest_path):
+        _discard_stale_sidecar_temporaries(sidecar_root)
         manifest = Manifest(
             manifest_path,
             repo_list=repo_list,
             repo_list_sha256=repo_list_sha,
             projects=projects,
+            expected_hosts=expected_hosts,
             config=config,
         )
         primary_conn = pr_store.connect(str(primary_store), create=True)
@@ -2605,8 +3220,15 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         result = run(args)
+    except GitLabTransientError as exc:
+        print(f"GITLAB_MR_INGEST_RETRYABLE: {exc}", file=sys.stderr)
+        return 75
+    except GitLabAuthenticationError as exc:
+        print(f"GITLAB_MR_INGEST_AUTH_REQUIRED: {exc}", file=sys.stderr)
+        return 2
     except GitLabIngestError as exc:
-        raise SystemExit(f"GITLAB_MR_INGEST_FAILED: {exc}") from exc
+        print(f"GITLAB_MR_INGEST_FAILED: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
