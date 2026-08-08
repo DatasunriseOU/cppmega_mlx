@@ -10504,10 +10504,13 @@ def emit_cpp_lexical_fallback_documents(
                 f"{canonical_path} expected={expected_compile_args_binding} "
                 f"actual={actual_compile_args_binding}"
             )
-        emitted_bytes = bytearray()
+        emitted_sha256 = hashlib.sha256()
+        emitted_size_bytes = 0
         chunk_count = 0
         for text, source_span in _iter_cpp_lexical_fallback_chunks(absolute_path):
-            emitted_bytes.extend(text.encode(source_encoding, errors="strict"))
+            encoded_text = text.encode(source_encoding, errors="strict")
+            emitted_sha256.update(encoded_text)
+            emitted_size_bytes += len(encoded_text)
             if enriched:
                 chunk_name = os.path.basename(canonical_path)
                 if source_span["chunk_index"]:
@@ -10564,7 +10567,10 @@ def emit_cpp_lexical_fallback_documents(
                 emit_doc(output)
             chunk_count += 1
 
-        if bytes(emitted_bytes) != source_bytes:
+        if (
+            emitted_size_bytes != len(source_bytes)
+            or emitted_sha256.hexdigest() != actual_binding[2]
+        ):
             raise RuntimeError(
                 f"C/C++ lexical fallback emission was not lossless: {canonical_path}"
             )
