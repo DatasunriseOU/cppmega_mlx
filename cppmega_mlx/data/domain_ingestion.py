@@ -358,7 +358,157 @@ def _path_declared_codec(
         if source_prefix.startswith(_MULE_INTERNAL_SIGNATURE):
             return "latin-1", "mule-internal"
         return None
+    if path.suffix.casefold() in {".bat", ".cmd"} and any(
+        part.casefold() == "jpn" for part in path.parts
+    ):
+        return "shift_jis", "shift-jis"
     return None
+
+
+def _is_dialog_8bit_fixture_path(path: Path) -> bool:
+    return tuple(part.casefold() for part in path.parts[-4:]) == (
+        "contrib",
+        "dialog",
+        "samples",
+        "testdata-8bit",
+    )
+
+
+def _dialog_8bit_shell_fixture_is_byte_preserving(
+    payload: bytes,
+    *,
+    path: Path,
+) -> bool:
+    """Recognize dialog's extensionless C0/C1/Latin-1 shell test fixture."""
+
+    if (
+        not _is_dialog_8bit_fixture_path(path)
+        or not payload.startswith(b"#!/bin/sh\n")
+        or b"\0" in payload
+        or b"# C1 controls" not in payload
+        or b"# Latin-1" not in payload
+    ):
+        return False
+
+    found_raw_fixture_byte = False
+    for raw_line in payload.split(b"\n"):
+        unsafe_offsets = [
+            index
+            for index, byte in enumerate(raw_line)
+            if byte >= 0x80 or (byte < 0x20 and byte != 0x09)
+        ]
+        if not unsafe_offsets:
+            try:
+                raw_line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            continue
+
+        match = re.fullmatch(rb'\t?SAMPLE="([^"\x00]*)"', raw_line)
+        if match is None:
+            return False
+        value_start, value_end = match.span(1)
+        if any(not value_start <= offset < value_end for offset in unsafe_offsets):
+            return False
+        found_raw_fixture_byte = True
+
+    return found_raw_fixture_byte
+
+
+def _shift_jis_expected_output_heredoc_is_byte_preserving(
+    payload: bytes,
+    *,
+    path: Path,
+) -> bool:
+    """Recognize glibc's mixed UTF-8/Shift-JIS expected-output heredoc."""
+
+    path_tail = tuple(part.casefold() for part in path.parts[-2:])
+    if (
+        path_tail != ("catgets", "test-gencat.sh")
+        or not payload.startswith((b"#!/bin/sh\n", b"#! /bin/sh\n"))
+        or b"\0" in payload
+        or b"LC_ALL=ja_JP.SJIS" not in payload
+    ):
+        return False
+
+    in_expected_output = False
+    found_shift_jis_line = False
+    heredoc_count = 0
+    for line in payload.splitlines(keepends=True):
+        content = line.rstrip(b"\r\n")
+        if not in_expected_output:
+            try:
+                line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                return False
+            if re.search(rb"\bcmp\b.*<<(?:\\?\"?EOF\"?)$", content):
+                heredoc_count += 1
+                if heredoc_count > 8:
+                    return False
+                in_expected_output = True
+            continue
+
+        if content == b"EOF":
+            in_expected_output = False
+            continue
+        try:
+            line.decode("utf-8", errors="strict")
+            continue
+        except UnicodeDecodeError:
+            pass
+        try:
+            decoded = line.decode("shift_jis", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        if decoded.encode("shift_jis", errors="strict") != line:
+            return False
+        found_shift_jis_line = True
+
+    return found_shift_jis_line and not in_expected_output
+
+
+def _validate_byte_preserving_domain_stream(
+    stream: BinaryIO,
+    *,
+    path: Path,
+    expected_size: int,
+    trailing_nul_bytes: int,
+) -> _ValidatedDomainText | None:
+    """Return a narrow one-byte codec contract for proven shell fixtures."""
+
+    if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+        return None
+    stream.seek(0)
+    raw = stream.read(expected_size + 1)
+    if len(raw) != expected_size:
+        raise OSError(
+            f"domain input changed size while reading {path}: "
+            f"expected {expected_size}, read {len(raw)}"
+        )
+    payload = raw[: expected_size - trailing_nul_bytes]
+    source_encoding = "iso-8859-1"
+    accepted = _dialog_8bit_shell_fixture_is_byte_preserving(
+        payload,
+        path=path,
+    )
+    if not accepted and _shift_jis_expected_output_heredoc_is_byte_preserving(
+        payload,
+        path=path,
+    ):
+        accepted = True
+        source_encoding = "mixed-utf-8-shift-jis-byte-preserving"
+    if not accepted:
+        return None
+    text = payload.decode("latin-1", errors="strict")
+    if text.encode("latin-1", errors="strict") != payload:
+        raise ValueError(f"byte-preserving domain input did not round-trip: {path}")
+    return _ValidatedDomainText(
+        codec="latin-1",
+        source_encoding=source_encoding,
+        bom=b"",
+        signature_text=text[:DOMAIN_SIGNATURE_READ_BYTES],
+        trailing_nul_bytes=trailing_nul_bytes,
+    )
 
 
 def _validate_domain_stream(
@@ -515,6 +665,14 @@ def _validate_domain_stream(
                 trailing_nul_bytes=trailing_nul_bytes,
             )
         except UnicodeDecodeError as cp1252_exc:
+            byte_preserving = _validate_byte_preserving_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+            if byte_preserving is not None:
+                return byte_preserving
             raise ValueError(
                 f"invalid UTF-8 or Windows-1252 domain input {path}: "
                 f"utf-8={utf8_exc}; windows-1252={cp1252_exc}"
@@ -796,9 +954,15 @@ def _decodable_prefix_at_or_before(
         return _utf8_boundary_at_or_before(data, cut)
     if codec in {"cp1252", "latin-1"}:
         return cut
-    if codec not in {"utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"}:
+    if codec not in {
+        "utf-16-le",
+        "utf-16-be",
+        "utf-32-le",
+        "utf-32-be",
+        "shift_jis",
+    }:
         raise ValueError(f"unsupported domain source codec {codec!r}")
-    step = 4 if codec.startswith("utf-32") else 2
+    step = 4 if codec.startswith("utf-32") else 2 if codec.startswith("utf-16") else 1
     cut -= cut % step
     while cut > 0:
         try:
@@ -1812,7 +1976,13 @@ def discover_project_domain_files(
                 try:
                     prefix_text = decode_domain_prefix(prefix, path=path)
                 except ValueError:
-                    continue
+                    if (
+                        _is_dialog_8bit_fixture_path(path)
+                        and prefix.startswith(b"#!/bin/sh\n")
+                    ):
+                        prefix_text = "#!/bin/sh\n"
+                    else:
+                        continue
                 prefix_adapter = resolve_domain_parser(path, prefix_text)
                 implicit_typed = prefix_adapter.name != "raw-output"
                 if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES and not implicit_typed:
