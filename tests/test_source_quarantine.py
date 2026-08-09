@@ -31,6 +31,9 @@ CERTIFICATE_PAIR_PREFIX = "vectors/certpairs/"
 RELATIVE_GENERATED_BLOB = "ports_module/example_build/module_code.c"
 RELATIVE_EXECUTABLE_ARCHIVE = "bin/self-executing-tool"
 RELATIVE_NUL_FF_BLOB = "unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
+RELATIVE_WINDOWS_NUL_FF_BLOB = (
+    "windows_10_shared_source_kit/unknown_version_2/Source/drivers/spb/spbcx/sys/driver.h"
+)
 RELATIVE_TRUNCATED_UTF32BE_BOM = "Tests/RunCMake/Syntax/Broken-BOM-UTF-32-BE.cmake"
 RELATIVE_BIG5_SHELL_HEREDOC = (
     "external/gpl2/gettext/dist/gettext-tools/tests/msgconv-1"
@@ -1017,6 +1020,47 @@ def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> 
     )
     assert collection["classification"] == "mislabeled_non_cpp"
     assert collection["detected_format"] == "asn1_der_x509_certificate_pair"
+
+    security_collection = next(
+        item
+        for item in manifest["collections"]
+        if item["project_id"] == "xemu-project/xemu"
+        and item["relative_path_prefix"]
+        == (
+            "roms/edk2/SecurityPkg/DeviceSecurity/SpdmLib/libspdm/os_stub/"
+            "openssllib/openssl/pyca-cryptography/vectors/"
+            "cryptography_vectors/x509/PKITS_data/certpairs/"
+        )
+    )
+    assert security_collection["relative_path_suffix"] == ".cp"
+    assert security_collection["expected_file_count"] == 348
+    assert security_collection["content_set_sha256"] == (
+        "f109a9ffd7ad27256039925e3222ccd21fba5c6e734b2a12f0b243122e36701e"
+    )
+    assert security_collection["classification"] == "mislabeled_non_cpp"
+    assert security_collection["detected_format"] == "asn1_der_x509_certificate_pair"
+
+
+def test_checked_in_windows_nul_ff_manifest_matches_archive_receipt() -> None:
+    manifest = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "configs/source_quarantine_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item["project_id"] == "corpus.local/windows_10_shared_source_kit"
+    )
+
+    assert entry["relative_path"] == RELATIVE_WINDOWS_NUL_FF_BLOB
+    assert entry["size_bytes"] == 773
+    assert entry["sha256"] == (
+        "38f8873ec81398a0a0e025690b3e2baa55c5c1221441d68ca0144b0b557fcb4b"
+    )
+    assert entry["classification"] == "mislabeled_non_cpp"
+    assert entry["detected_format"] == "nul_ff_binary_blob"
 
 
 def test_checked_in_threadx_generated_blob_manifest_matches_frozen_receipt() -> None:

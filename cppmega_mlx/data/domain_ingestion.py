@@ -343,21 +343,28 @@ def _trailing_nul_bytes(
 _MULE_INTERNAL_SIGNATURE = b"-- MULE \x92"
 
 
-def _path_declared_codec(
-    path: Path,
-    *,
-    source_prefix: bytes = b"",
-) -> tuple[str, str] | None:
-    if tuple(part.casefold() for part in path.parts[-5:]) == (
+def _is_postgres_mule_internal_path(path: Path) -> bool:
+    """True for the pinned postgres multibyte mule_internal SQL fixture path."""
+    return tuple(part.casefold() for part in path.parts[-5:]) == (
         "src",
         "test",
         "mb",
         "sql",
         "mule_internal.sql",
-    ):
-        if source_prefix.startswith(_MULE_INTERNAL_SIGNATURE):
-            return "latin-1", "mule-internal"
-        return None
+    )
+
+
+def _path_declared_codec(
+    path: Path,
+    *,
+    source_prefix: bytes = b"",
+) -> tuple[str, str] | None:
+    # The archive pin is identified by path, not by an optional banner. Its
+    # raw 8-bit values include cp1252-undefined bytes such as 0x81, so latin-1
+    # is the only strict byte-preserving codec for this fixture.
+    del source_prefix
+    if _is_postgres_mule_internal_path(path):
+        return "latin-1", "mule-internal"
     if path.suffix.casefold() in {".bat", ".cmd"} and any(
         part.casefold() == "jpn" for part in path.parts
     ):
