@@ -1039,6 +1039,10 @@ class DedupStore:
         stage_db_path: str | None = None,
     ) -> None:
         if stage_db_path is not None:
+            if Path(db_path).expanduser().resolve() == Path(stage_db_path).expanduser().resolve():
+                raise ValueError(
+                    "stage_db_path must identify a disposable DB distinct from db_path"
+                )
             # A local stage DB contains only provisional claims. Its producer
             # can be force-stopped after a semantic-stall timeout, and its
             # MEMORY journal / synchronous=OFF settings intentionally make it

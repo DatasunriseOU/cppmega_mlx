@@ -30,6 +30,21 @@ def test_discard_local_stage_removes_malformed_stage_without_touching_global(
         assert not Path(f"{stage_db}{suffix}").exists()
 
 
+def test_discard_local_stage_rejects_global_db_path(tmp_path: Path) -> None:
+    global_db = tmp_path / "global.sqlite"
+    DedupStore(str(global_db), near=False).close()
+    original = global_db.read_bytes()
+
+    with pytest.raises(ValueError, match="distinct from db_path"):
+        DedupStore.discard_stage(
+            str(global_db),
+            "code:misconfigured",
+            stage_db_path=str(global_db),
+        )
+
+    assert global_db.read_bytes() == original
+
+
 def test_discard_current_local_stage_closes_connections_before_unlink(
     tmp_path: Path,
 ) -> None:
