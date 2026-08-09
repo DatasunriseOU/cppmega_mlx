@@ -1025,13 +1025,20 @@ def test_checked_in_xemu_certificate_pair_manifest_matches_archive_receipt() -> 
         item
         for item in manifest["collections"]
         if item["project_id"] == "xemu-project/xemu"
-        and item["relative_path_prefix"].startswith("roms/edk2/SecurityPkg/")
+        and item["relative_path_prefix"]
+        == (
+            "roms/edk2/SecurityPkg/DeviceSecurity/SpdmLib/libspdm/os_stub/"
+            "openssllib/openssl/pyca-cryptography/vectors/"
+            "cryptography_vectors/x509/PKITS_data/certpairs/"
+        )
     )
     assert security_collection["relative_path_suffix"] == ".cp"
     assert security_collection["expected_file_count"] == 348
     assert security_collection["content_set_sha256"] == (
         "f109a9ffd7ad27256039925e3222ccd21fba5c6e734b2a12f0b243122e36701e"
     )
+    assert security_collection["classification"] == "mislabeled_non_cpp"
+    assert security_collection["detected_format"] == "asn1_der_x509_certificate_pair"
 
 
 def test_checked_in_windows_nul_ff_manifest_matches_archive_receipt() -> None:
