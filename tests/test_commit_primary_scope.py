@@ -281,6 +281,8 @@ def test_extractor_ignores_gitlink_changes_without_reading_submodule_blob(
         change["new_filepath"] or change["old_filepath"] for change in changes
     }
     assert {change["new_filepath"] for change in changes} == {"main.cpp"}
+    diffs = get_commit_diffs(str(repo), commit_hash) or []
+    assert {item["filepath"] for item in diffs} == {"main.cpp"}
 
     (repo / "main.cpp").write_text(
         "int final_value() { return 111222; }\n" * 3,
@@ -314,6 +316,8 @@ def test_extractor_ignores_gitlink_changes_without_reading_submodule_blob(
         for change in delete_changes
     }
     assert {change["new_filepath"] for change in delete_changes} == {"main.cpp"}
+    delete_diffs = get_commit_diffs(str(repo), delete_commit_hash) or []
+    assert {item["filepath"] for item in delete_diffs} == {"main.cpp"}
 
 
 def test_sql_commit_uses_domain_sidecars_without_libclang(tmp_path: Path) -> None:
