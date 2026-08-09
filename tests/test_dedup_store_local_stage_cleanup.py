@@ -58,3 +58,25 @@ def test_discard_current_local_stage_closes_connections_before_unlink(
         store.stage_conn.execute("SELECT 1")
     store.close()
     assert not stage_db.exists()
+
+
+def test_discard_current_local_stage_after_close_unlinks_stage_family(
+    tmp_path: Path,
+) -> None:
+    global_db = tmp_path / "global.sqlite"
+    DedupStore(str(global_db), near=False).close()
+    stage_db = tmp_path / "closed-stage.sqlite"
+    store = DedupStore(
+        str(global_db),
+        near=False,
+        stage_id="code:closed-repository",
+        stage_db_path=str(stage_db),
+    )
+    store.close()
+    for suffix in ("-journal", "-wal", "-shm"):
+        Path(f"{stage_db}{suffix}").write_bytes(b"discardable sidecar")
+
+    store.discard_current_stage()
+
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        assert not Path(f"{stage_db}{suffix}").exists()

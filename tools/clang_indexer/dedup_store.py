@@ -1020,8 +1020,6 @@ class DedupStore:
     def discard_current_stage(self) -> None:
         if self.stage_id is None:
             raise ValueError("discard_current_stage requires a staged DedupStore")
-        if self._closed:
-            return
         # A local stage is disposable. Close its owned connection before
         # unlinking the stage family so a caller cannot keep writing an
         # unlinked SQLite inode after discard.
