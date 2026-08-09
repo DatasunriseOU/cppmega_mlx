@@ -832,3 +832,63 @@ def test_header_macro_emission_preserves_mixed_legacy_bytes(
     assert len(docs) == 1
     assert docs[0]["text"].encode("latin-1") == raw
     assert "\ufffd" not in docs[0]["text"]
+
+
+def test_gnu_c_standard_header_keeps_consistent_language_family(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    header = tmp_path / "KeychainSyncAccountUpdater.h"
+    header.write_text(
+        "#import <UAUPlugin/UAUSession.h>\n\n"
+        "@interface KeychainSyncAccountUpdater : NSObject "
+        "<UserAccountUpdaterProtocol>\n\n"
+        "@end\n",
+        encoding="utf-8",
+    )
+
+    adapted = index_project._adapt_args_for_file(
+        ["-std=gnu2x", "-fblocks", "-fsyntax-only", "-Wno-everything"],
+        str(header),
+    )
+
+    assert adapted[:3] == ["-x", "c-header", "-std=gnu2x"]
+    assert index_project._is_sane_compile_args(adapted)
+    translation_unit = index_project._load_translation_unit(
+        str(header),
+        index_project.Index.create(),
+        adapted,
+    )
+    assert translation_unit.spelling == str(header)
+
+
+@pytest.mark.parametrize(
+    ("standard_args", "expected_language", "expected_standard"),
+    [
+        (["--std=c11", "--std=gnu2x"], "c-header", "--std=gnu2x"),
+        (["-cl-std=CL1.2", "-cl-std=CL3.0"], "cl", "-cl-std=CL3.0"),
+    ],
+)
+def test_header_adaptation_keeps_only_last_standard_alias(
+    tmp_path: Path,
+    standard_args: list[str],
+    expected_language: str,
+    expected_standard: str,
+) -> None:
+    index_project = _load_indexer()
+    header = tmp_path / "dialect.h"
+    header.write_text("int dialect_fixture;\n", encoding="utf-8")
+
+    adapted = index_project._adapt_args_for_file(
+        [*standard_args, "-fsyntax-only", "-Wno-everything"],
+        str(header),
+    )
+
+    standard_flags = [
+        arg
+        for arg in adapted
+        if arg.startswith(("-std=", "--std=", "-cl-std="))
+    ]
+    assert adapted[:2] == ["-x", expected_language]
+    assert standard_flags == [expected_standard]
+    assert index_project._is_sane_compile_args(adapted)
