@@ -186,6 +186,7 @@ class DedupStore:
         self.stage_id = str(stage_id) if stage_id is not None else None
         self._pending = 0
         self._local_stage = self.stage_db_path is not None
+        self._closed = False
 
         # FAIL LOUD: sqlite open failure raises (no in-memory fallback). In
         # local-stage mode the child process must not acquire a global writer
@@ -1019,6 +1020,10 @@ class DedupStore:
     def discard_current_stage(self) -> None:
         if self.stage_id is None:
             raise ValueError("discard_current_stage requires a staged DedupStore")
+        # A local stage is disposable. Close its owned connection before
+        # unlinking the stage family so a caller cannot keep writing an
+        # unlinked SQLite inode after discard.
+        self._close_connections()
         self.discard_stage(
             self.db_path,
             self.stage_id,
@@ -1034,33 +1039,22 @@ class DedupStore:
         stage_db_path: str | None = None,
     ) -> None:
         if stage_db_path is not None:
-            if not os.path.exists(stage_db_path):
-                return
-            conn = sqlite3.connect(
-                stage_db_path,
-                timeout=cls.SQLITE_TIMEOUT_SECONDS,
-            )
-            try:
-                conn.execute(f"PRAGMA busy_timeout={cls.SQLITE_BUSY_TIMEOUT_MS}")
-                for table in (
-                    "lsh_stage",
-                    "minhash_stage",
-                    "exact_stage",
-                    "chunk_claims_stage",
-                    "dedup_stages",
-                ):
-                    try:
-                        conn.execute(
-                            f"DELETE FROM {table} WHERE stage_id=?",
-                            (stage_id,),
-                        )
-                    except sqlite3.OperationalError as exc:
-                        if "no such table" in str(exc).lower():
-                            continue
-                        raise
-                conn.commit()
-            finally:
-                conn.close()
+            if Path(db_path).expanduser().resolve() == Path(stage_db_path).expanduser().resolve():
+                raise ValueError(
+                    "stage_db_path must identify a disposable DB distinct from db_path"
+                )
+            # A local stage DB contains only provisional claims. Its producer
+            # can be force-stopped after a semantic-stall timeout, and its
+            # MEMORY journal / synchronous=OFF settings intentionally make it
+            # non-durable. Cleanup must therefore never reopen it: an
+            # interrupted stage can be malformed, but it is safe to discard.
+            # The global DB is read-only to the stage producer and is not
+            # touched on this path.
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                try:
+                    Path(f"{stage_db_path}{suffix}").unlink()
+                except FileNotFoundError:
+                    pass
             return
         store = cls(db_path, near=False)
         try:
@@ -1075,13 +1069,23 @@ class DedupStore:
             self.conn.commit()
         self._pending = 0
 
+    def _close_connections(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self.stage_conn is not self.conn:
+                self.stage_conn.close()
+        finally:
+            self.conn.close()
+            self._closed = True
+
     def close(self) -> None:
+        if self._closed:
+            return
         try:
             self.commit()
         finally:
-            if self.stage_conn is not self.conn:
-                self.stage_conn.close()
-            self.conn.close()
+            self._close_connections()
 
     def __enter__(self):
         return self
